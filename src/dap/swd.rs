@@ -67,7 +67,11 @@ impl SwdLink {
         // 5. SWD 线复位 + JTAG-to-SWD 切换
         self.swd_line_reset()?;
 
-        // 6. 读取 DPIDR
+        // 6. 先尝试写 DP SELECT=0 初始化端口，再读 DPIDR
+        let init_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
+        let _ = self.dap.execute_transfer(self.usb(), &[init_req]);
+
+        // 7. 读取 DPIDR
         let dpidr = self.read_dpidr()?;
         info!("DPIDR = 0x{:08X}", dpidr);
 
@@ -108,36 +112,45 @@ impl SwdLink {
     /// 硬件复位目标 MCU (通过 DAP-Link 的 nRESET 引脚)
     fn hardware_reset(&self) -> Result<()> {
         info!("脉冲复位目标 MCU...");
-        // nRESET 引脚 = bit 2
-        // 1. 拉低 nRESET (mask=bit2, value=0) + 等待 10ms
-        let cmd = self.dap.build_pins_request(0x04, 0x00, 10000);
-        self.usb.write(&cmd)?;
         let mut buf = [0u8; 64];
-        self.usb.read(&mut buf)?;
-
-        // 2. 拉高 nRESET (mask=bit2, value=bit2) + 等待 10ms
-        let cmd = self.dap.build_pins_request(0x04, 0x04, 10000);
+        // nRESET = bit 2, 拉低 100ms 再释放
+        let cmd = self.dap.build_pins_request(0x04, 0x00, 100_000); // nRESET低 100ms
         self.usb.write(&cmd)?;
         self.usb.read(&mut buf)?;
-
+        let cmd = self.dap.build_pins_request(0x04, 0x04, 100_000); // nRESET高 100ms
+        self.usb.write(&cmd)?;
+        self.usb.read(&mut buf)?;
         info!("复位完成");
         Ok(())
     }
 
-    /// SWD 线复位 (对 SW-DP 目标只需 Line Reset, 无需 JTAG-to-SWD 切换)
+    /// SWD 线复位 + JTAG-to-SWD 切换
     fn swd_line_reset(&self) -> Result<()> {
-        info!("发送 SWD Line Reset...");
-
-        // 对原生 SW-DP 目标，发送 50+ 个 TCK 时钟的 TMS=1
-        // 使 SW-DP 进入 Line Reset 状态
-        let seq = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 56 bits
-                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]; // 56 bits (总共 112 bits)
-        let cmd = self.dap.build_swj_sequence_request(seq);
-        self.usb.write(&cmd)?;
+        info!("发送 SWD 初始化序列...");
         let mut buf = [0u8; 64];
+
+        // Line Reset: 56 bits TMS=1
+        let cmd1 = self.dap.build_swj_sequence_request(&[0xFF; 7]);
+        self.usb.write(&cmd1)?;
         self.usb.read(&mut buf)?;
 
-        info!("SWD 线复位完成");
+        // JTAG-to-SWD: 16 bits (LSB-first 时 0x9E,0xE7 = MSB-first 时 0x79,0xE7)
+        // 两个顺序都试过: 先用原始 design.html 的值
+        let cmd2 = self.dap.build_swj_sequence_request(&[0x9E, 0xE7]);
+        self.usb.write(&cmd2)?;
+        self.usb.read(&mut buf)?;
+
+        // Line Reset: 56 bits TMS=1
+        let cmd3 = self.dap.build_swj_sequence_request(&[0xFF; 7]);
+        self.usb.write(&cmd3)?;
+        self.usb.read(&mut buf)?;
+
+        // Idle: 8 bits TMS=0
+        let cmd4 = self.dap.build_swj_sequence_request(&[0x00]);
+        self.usb.write(&cmd4)?;
+        self.usb.read(&mut buf)?;
+
+        info!("SWD 序列完成");
         Ok(())
     }
 

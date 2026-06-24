@@ -58,7 +58,7 @@ impl RingBuffer {
     pub fn pop_batch(&self, buf: &mut [Sample]) -> usize {
         let t = self.tail.load(Ordering::Relaxed);
         let h = self.head.load(Ordering::Acquire);
-        let available = h.wrapping_sub(t);
+        let available = h.wrapping_sub(t).min(self.capacity);
         let count = available.min(buf.len());
 
         // SAFETY: 只有主线程调用 pop_batch，读取范围 tail..head 与 push 不重叠
@@ -78,7 +78,7 @@ impl RingBuffer {
     pub fn available(&self) -> usize {
         let t = self.tail.load(Ordering::Relaxed);
         let h = self.head.load(Ordering::Acquire);
-        h.wrapping_sub(t)
+        h.wrapping_sub(t).min(self.capacity)
     }
 
     /// 查询总写入数（即最新的 head 值，对应总采样序号）

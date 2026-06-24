@@ -1,11 +1,6 @@
 use clap::{Parser, Subcommand};
 
-mod error;
-mod usb;
-mod dap;
-mod pipeline;
-
-use dap::swd::SwdLink;
+use dap_sampler::dap::swd::SwdLink;
 
 #[derive(Parser)]
 #[command(name = "dap-sampler", about = "CMSIS-DAP v2 High-Speed Variable Sampler")]
@@ -85,7 +80,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_list() -> anyhow::Result<()> {
-    let devices = usb::device::list_devices()?;
+    let devices = dap_sampler::usb::device::list_devices()?;
     if devices.is_empty() {
         println!("⚠️  未找到 CMSIS-DAP v2 设备");
         println!("  请确保 DAP-Link 已通过 USB 连接");
@@ -210,7 +205,7 @@ fn cmd_sample(
     output_path: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    use pipeline::engine::PipelineEngine;
+    use dap_sampler::pipeline::engine::PipelineEngine;
 
     // 解析地址列表
     let addresses: Vec<u32> = address_strs
@@ -262,8 +257,8 @@ fn cmd_sample(
 
     let max_samples = count.unwrap_or(u64::MAX);
     let mut total_collected: u64 = 0;
-    let mut sample_buf: Vec<pipeline::sample::Sample> = (0..1024)
-        .map(|_| pipeline::sample::Sample { seq: 0, values: vec![] })
+    let mut sample_buf: Vec<dap_sampler::pipeline::sample::Sample> = (0..1024)
+        .map(|_| dap_sampler::pipeline::sample::Sample { seq: 0, values: vec![] })
         .collect();
 
     let mut last_progress = 0u64;

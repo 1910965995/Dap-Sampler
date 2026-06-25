@@ -25,6 +25,8 @@ pub struct ControlPanel {
     pub sample_rate: u32,
     pub total_samples: u64,
     pub target_count: Option<u64>,
+    /// 实际达到的采样率（由外部计算后更新）
+    pub actual_rate_hz: f64,
 }
 
 impl ControlPanel {
@@ -34,6 +36,7 @@ impl ControlPanel {
             sample_rate,
             total_samples: 0,
             target_count,
+            actual_rate_hz: 0.0,
         }
     }
 
@@ -94,6 +97,15 @@ impl ControlPanel {
 
             let duration = self.total_samples as f64 / self.sample_rate as f64;
             ui.label(format!("Samples: {} ({:.1}s)", self.total_samples, duration));
+
+            // 运行中显示实际采样率
+            if self.state == AcquisitionState::Running && self.actual_rate_hz > 0.0 {
+                let pct = self.actual_rate_hz / self.sample_rate as f64 * 100.0;
+                ui.label(format!(
+                    "Actual: {:.0} Hz ({:.0}%)",
+                    self.actual_rate_hz, pct
+                ));
+            }
 
             if let Some(target) = self.target_count {
                 let pct = (self.total_samples as f64 / target as f64 * 100.0).min(100.0);

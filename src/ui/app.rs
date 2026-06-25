@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use crate::pipeline::sample::Sample;
 use crate::pipeline::sample::ValueType;
 use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
@@ -39,6 +40,8 @@ pub struct DapSamplerApp {
     active_usb: Option<Arc<BulkTransfer>>,
     /// 手工模式地址（通过 --addresses 传入）
     manual_addresses: Vec<u32>,
+    /// 采集开始时间（用于计算实际采样率）
+    acquisition_start: Option<Instant>,
     display_buf: DisplayBuffer,
     waveform: WaveformPanel,
     controls: ControlPanel,
@@ -106,6 +109,7 @@ impl DapSamplerApp {
             pipeline: None,
             active_usb: None,  // USB 连接推迟到 Start 时建立
             manual_addresses,
+            acquisition_start: None,
             display_buf: DisplayBuffer::new(200_000),
             waveform,
             controls: ControlPanel::new(rate_hz, target_count),
@@ -207,6 +211,7 @@ impl DapSamplerApp {
             Ok(handle) => {
                 self.pipeline = Some(handle);
                 self.controls.set_running();
+                self.acquisition_start = Some(Instant::now());
             }
             Err(e) => log::error!("启动采集失败: {}", e),
         }
@@ -216,6 +221,8 @@ impl DapSamplerApp {
         if let Some(handle) = self.pipeline.take() {
             handle.stop();
         }
+        self.acquisition_start = None;
+        self.controls.actual_rate_hz = 0.0;
     }
 
     fn stop_acquisition(&mut self) {
@@ -320,6 +327,14 @@ impl DapSamplerApp {
 impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_pipeline();
+
+        // 计算实际采样率
+        if let Some(start) = self.acquisition_start {
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed > 0.1 {
+                self.controls.actual_rate_hz = self.controls.total_samples as f64 / elapsed;
+            }
+        }
 
         if let Some(target) = self.controls.target_count {
             if self.controls.total_samples >= target && self.pipeline.is_some() {

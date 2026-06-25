@@ -75,8 +75,24 @@ impl ControlPanel {
             };
             ui.label(format!("State: {}", state_text));
 
+            // 采样率：仅在 Idle 时可修改
+            let is_idle = self.state == AcquisitionState::Idle;
+            let current_rate = self.sample_rate;
+            ui.add_enabled_ui(is_idle, |ui| {
+                egui::ComboBox::from_label("Rate")
+                    .selected_text(format!("{} Hz", current_rate))
+                    .show_ui(ui, |ui| {
+                        for &rate in &[100u32, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000] {
+                            ui.selectable_value(
+                                &mut self.sample_rate,
+                                rate,
+                                format!("{} Hz", rate),
+                            );
+                        }
+                    });
+            });
+
             let duration = self.total_samples as f64 / self.sample_rate as f64;
-            ui.label(format!("Rate: {} Hz", self.sample_rate));
             ui.label(format!("Samples: {} ({:.1}s)", self.total_samples, duration));
 
             if let Some(target) = self.target_count {

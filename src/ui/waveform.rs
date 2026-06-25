@@ -305,4 +305,10 @@ impl WaveformPanel {
     pub fn value_types(&self) -> &[ValueType] {
         &self.value_types
     }
+
+    /// 更新采样间隔（采样率变化时调用）
+    pub fn set_interval(&mut self, interval_us: f64) {
+        self.interval_us = interval_us;
+        self.cache_buffer_len = 0; // 强制重建缓存
+    }
 }

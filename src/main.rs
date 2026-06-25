@@ -1,12 +1,13 @@
 use clap::{Parser, Subcommand};
 
 use dap_sampler::dap::swd::SwdLink;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "dap-sampler", about = "CMSIS-DAP v2 High-Speed Variable Sampler")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -59,7 +60,7 @@ enum Command {
         #[arg(long)]
         output: Option<String>,
     },
-    /// 启动 GUI 波形显示（P3）
+    /// 启动 GUI 波形显示（P3/P4）
     Gui {
         /// 内存地址列表（十六进制，逗号分隔）
         #[arg(long, value_delimiter = ',')]
@@ -79,6 +80,10 @@ enum Command {
         /// 支持: float, int32, uint32, int16, uint16, int8, uint8
         #[arg(long, value_delimiter = ',')]
         r#type: Option<Vec<String>>,
+
+        /// ELF 固件文件路径（P4: 启用变量浏览器）
+        #[arg(long)]
+        elf: Option<String>,
     },
 }
 
@@ -89,7 +94,13 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.unwrap_or(Command::Gui {
+        addresses: vec![],
+        rate: 20000,
+        count: None,
+        r#type: None,
+        elf: None,
+    }) {
         Command::List => cmd_list(),
         Command::Info => cmd_info(),
         Command::Read { address, float } => cmd_read(&address, float),
@@ -97,8 +108,8 @@ fn main() -> anyhow::Result<()> {
         Command::Sample { addresses, rate, count, float, output } => {
             cmd_sample(&addresses, rate, count, float, output.as_deref())
         }
-        Command::Gui { addresses, rate, count, r#type } => {
-            cmd_gui(&addresses, rate, count, r#type.as_deref())
+        Command::Gui { addresses, rate, count, r#type, elf } => {
+            cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref())
         }
     }
 }
@@ -263,6 +274,7 @@ fn cmd_sample(
     }
 
     // 创建引擎并启动
+    let usb = Arc::new(usb);
     let engine = PipelineEngine::new(usb, dap, addresses.clone(), rate);
     let handle = engine.start()?;
 
@@ -346,39 +358,19 @@ fn cmd_gui(
     rate: u32,
     count: Option<u64>,
     type_strs: Option<&[String]>,
+    elf_path: Option<&str>,
 ) -> anyhow::Result<()> {
     use dap_sampler::pipeline::engine::PipelineEngine;
     use dap_sampler::ui::app::DapSamplerApp;
     use dap_sampler::pipeline::sample::ValueType;
+    use dap_sampler::elf::ElfParser;
 
-    // 解析地址列表
-    let addresses: Vec<u32> = address_strs
-        .iter()
-        .map(|s| parse_address(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    if addresses.is_empty() {
-        anyhow::bail!("至少需要指定一个内存地址");
-    }
-    if addresses.len() > 8 {
-        anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
-    }
-
-    // 解析变量类型列表
-    let value_types: Vec<ValueType> = if let Some(type_strs) = type_strs {
-        if type_strs.len() != addresses.len() {
-            anyhow::bail!(
-                "类型数量 ({}) 与地址数量 ({}) 不一致",
-                type_strs.len(),
-                addresses.len()
-            );
-        }
-        type_strs
-            .iter()
-            .map(|s| ValueType::parse(s).map_err(anyhow::Error::msg))
-            .collect::<anyhow::Result<Vec<_>>>()?
+    // 加载 ELF（如果提供）
+    let elf_ctx = if let Some(path) = elf_path {
+        println!("📦 正在加载 ELF: {}", path);
+        Some(ElfParser::load(path).map_err(|e| anyhow::anyhow!("ELF 加载失败: {}", e))?)
     } else {
-        vec![ValueType::Float; addresses.len()]
+        None
     };
 
     // 连接并初始化 SWD
@@ -386,17 +378,55 @@ fn cmd_gui(
     let mut swd = SwdLink::new()?;
     swd.init()?;
     let (usb, dap) = swd.into_parts();
+    let usb = Arc::new(usb);
 
-    // 创建流水线引擎（不立即启动，由 GUI 的开始按钮触发）
-    let engine = PipelineEngine::new(usb, dap, addresses, rate);
+    // 手工地址模式（--addresses）
+    let engine = if !address_strs.is_empty() {
+        let addresses: Vec<u32> = address_strs
+            .iter()
+            .map(|s| parse_address(s))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        if addresses.len() > 8 {
+            anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
+        }
+
+        let _value_types: Vec<ValueType> = if let Some(type_strs) = type_strs {
+            if type_strs.len() != addresses.len() {
+                anyhow::bail!(
+                    "类型数量 ({}) 与地址数量 ({}) 不一致",
+                    type_strs.len(),
+                    addresses.len()
+                );
+            }
+            type_strs
+                .iter()
+                .map(|s| ValueType::parse(s).map_err(anyhow::Error::msg))
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            vec![ValueType::Float; addresses.len()]
+        };
+
+        // 预创建引擎（传统模式）
+        Some(PipelineEngine::new(
+            Arc::clone(&usb),
+            dap,
+            addresses,
+            rate,
+        ))
+    } else {
+        None
+    };
 
     // 启动 egui 窗口
     let app = DapSamplerApp::new(
         engine,
+        usb,
+        dap,
         address_strs.to_vec(),
         rate,
         count,
-        value_types,
+        elf_ctx,
     );
 
     let options = eframe::NativeOptions {
@@ -408,8 +438,48 @@ fn cmd_gui(
     eframe::run_native(
         "DAP Sampler",
         options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            setup_cjk_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     ).map_err(|e| anyhow::anyhow!("GUI failed: {}", e))?;
 
     Ok(())
+}
+
+/// Load a CJK-compatible font from the Windows system so Chinese text renders correctly.
+fn setup_cjk_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Try common Windows CJK fonts in order of preference.
+    let candidates: &[(&str, u32)] = &[
+        ("C:\\Windows\\Fonts\\msyh.ttc", 0),   // Microsoft YaHei (collection)
+        ("C:\\Windows\\Fonts\\simhei.ttf", 0), // SimHei
+        ("C:\\Windows\\Fonts\\simsun.ttc", 0),  // SimSun (collection)
+        ("C:\\Windows\\Fonts\\Deng.ttf", 0),    // DengXian
+    ];
+
+    for (path, index) in candidates {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                std::sync::Arc::new(egui::FontData {
+                    font: std::borrow::Cow::Owned(data),
+                    index: *index,
+                    tweak: Default::default(),
+                }),
+            );
+            // Prepend CJK font so it takes priority for CJK glyphs,
+            // while the default Latin font still handles ASCII.
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(font_list) = fonts.families.get_mut(&family) {
+                    font_list.push("cjk".to_owned());
+                }
+            }
+            log::info!("Loaded CJK font from {}", path);
+            break;
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }

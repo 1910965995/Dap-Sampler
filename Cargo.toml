@@ -17,3 +17,10 @@ spin_sleep = "1"
 eframe = "0.31"
 egui = "0.31"
 egui_plot = "0.31"
+
+# P4: ELF/DWARF 解析
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+gimli = { version = "0.31", default-features = false, features = ["read", "std"] }
+
+# P4: 文件对话框
+rfd = "0.15"

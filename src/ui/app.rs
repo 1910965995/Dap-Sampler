@@ -1,10 +1,16 @@
+use std::sync::Arc;
 use crate::pipeline::sample::Sample;
 use crate::pipeline::sample::ValueType;
 use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
+use crate::usb::transfer::BulkTransfer;
+use crate::dap::protocol::DapProtocol;
+use crate::elf::{ElfContext, ElfParser};
 use super::display_buffer::DisplayBuffer;
 use super::waveform::WaveformPanel;
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
 use super::cursor::CursorState;
+use super::variable_browser::VariableBrowser;
+use super::channel_panel::ChannelPanel;
 
 /// 默认颜色调色板（8 种颜色，支持最多 8 通道）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
@@ -18,79 +24,163 @@ const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(255, 150, 150), // 粉
 ];
 
+/// 侧边栏标签页
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarTab {
+    Channels,
+    Variables,
+}
+
 /// DAP Sampler 主应用
-///
-/// 实现 eframe::App trait，是 egui 窗口的核心。
 pub struct DapSamplerApp {
-    /// 流水线句柄（启动后 Some，停止后 None）
     pipeline: Option<PipelineHandle>,
-    /// 流水线引擎（启动前持有，启动时消费）
     engine: Option<PipelineEngine>,
-    /// 显示缓冲区
+    usb: Arc<BulkTransfer>,
+    dap: DapProtocol,
     display_buf: DisplayBuffer,
-    /// 波形面板
     waveform: WaveformPanel,
-    /// 控制面板
     controls: ControlPanel,
-    /// 光标状态
     cursor: CursorState,
-    /// 临时采样缓冲区（每帧复用，避免重复分配）
     temp_buf: Vec<Sample>,
-    /// 采样间隔（微秒）
     interval_us: f64,
-    /// 标记本帧是否有新数据到达（用于波形缓存判断）
     has_new_data: bool,
+
+    // P4: ELF / 变量浏览器
+    elf_ctx: Option<ElfContext>,
+    variable_browser: VariableBrowser,
+    channel_panel: ChannelPanel,
+    active_tab: SidebarTab,
+    #[allow(dead_code)]
+    manual_channel_names: Vec<String>,
+    #[allow(dead_code)]
+    manual_value_types: Vec<ValueType>,
+    rate_hz: u32,
+    #[allow(dead_code)]
+    target_count: Option<u64>,
 }
 
 impl DapSamplerApp {
-    /// 创建应用（传入已初始化的 PipelineEngine）
     pub fn new(
-        engine: PipelineEngine,
+        engine: Option<PipelineEngine>,
+        usb: Arc<BulkTransfer>,
+        dap: DapProtocol,
         addresses: Vec<String>,
         rate_hz: u32,
         target_count: Option<u64>,
-        value_types: Vec<ValueType>,
+        elf_ctx: Option<ElfContext>,
     ) -> Self {
-        let num_channels = addresses.len();
-        let channel_names: Vec<String> = addresses
+        let interval_us = 1_000_000.0 / rate_hz as f64;
+
+        let manual_channel_names: Vec<String> = addresses
             .iter()
             .enumerate()
             .map(|(i, a)| format!("CH{} {}", i + 1, a))
             .collect();
+        let manual_value_types: Vec<ValueType> = vec![ValueType::Float; addresses.len()];
+
+        let num_channels = manual_channel_names.len();
         let channel_colors: Vec<egui::Color32> = (0..num_channels)
             .map(|i| CHANNEL_COLORS[i % CHANNEL_COLORS.len()])
             .collect();
-        let interval_us = 1_000_000.0 / rate_hz as f64;
+
+        let waveform = if !manual_channel_names.is_empty() {
+            WaveformPanel::new(
+                manual_channel_names.clone(),
+                channel_colors,
+                interval_us,
+                manual_value_types.clone(),
+            )
+        } else {
+            WaveformPanel::new(vec![], vec![], interval_us, vec![])
+        };
+
+        let mut channel_panel = ChannelPanel::new();
+        if elf_ctx.is_none() {
+            for (i, name) in manual_channel_names.iter().enumerate() {
+                let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+                channel_panel.add_channel(name.clone(), color, ValueType::Float);
+            }
+        }
 
         Self {
             pipeline: None,
-            engine: Some(engine),
-            display_buf: DisplayBuffer::new(200_000), // 10 秒 @ 20kHz
-            waveform: WaveformPanel::new(channel_names, channel_colors, interval_us, value_types),
+            engine,
+            usb,
+            dap,
+            display_buf: DisplayBuffer::new(200_000),
+            waveform,
             controls: ControlPanel::new(rate_hz, target_count),
             cursor: CursorState::new(),
             temp_buf: (0..1024).map(|_| Sample { seq: 0, values: vec![] }).collect(),
             interval_us,
             has_new_data: false,
+            elf_ctx,
+            variable_browser: VariableBrowser::new(),
+            channel_panel,
+            active_tab: SidebarTab::Channels,
+            manual_channel_names,
+            manual_value_types,
+            rate_hz,
+            target_count,
         }
     }
 
-    /// 启动采集（可重复调用）
     fn start_acquisition(&mut self) {
+        // 手工模式：使用预创建引擎
         if let Some(ref engine) = self.engine {
             match engine.start() {
                 Ok(handle) => {
                     self.pipeline = Some(handle);
                     self.controls.set_running();
                 }
-                Err(e) => {
-                    log::error!("Failed to start acquisition: {}", e);
-                }
+                Err(e) => log::error!("Failed to start acquisition: {}", e),
             }
+            return;
+        }
+
+        // ELF 模式：从 channel_panel 动态构建引擎
+        let channels = &self.channel_panel.channels;
+        if channels.is_empty() {
+            return;
+        }
+
+        let addresses: Vec<u32> = channels
+            .iter()
+            .filter_map(|ch| {
+                self.elf_ctx.as_ref().and_then(|ctx| {
+                    ctx.variables.iter()
+                        .find(|v| v.path == ch.name || v.name == ch.name)
+                        .map(|v| v.address)
+                })
+            })
+            .collect();
+
+        let types: Vec<ValueType> = channels.iter().map(|c| c.value_type).collect();
+
+        if addresses.is_empty() {
+            return;
+        }
+
+        let engine = PipelineEngine::new(
+            Arc::clone(&self.usb),
+            self.dap,
+            addresses,
+            self.rate_hz,
+        );
+
+        let channel_names: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
+        let channel_colors: Vec<egui::Color32> = channels.iter().map(|c| c.color).collect();
+        self.waveform = WaveformPanel::new(channel_names, channel_colors, self.interval_us, types);
+
+        match engine.start() {
+            Ok(handle) => {
+                self.pipeline = Some(handle);
+                self.controls.set_running();
+            }
+            Err(e) => log::error!("Failed to start acquisition: {}", e),
         }
     }
 
-    /// 停止采集
     fn stop_acquisition(&mut self) {
         if let Some(handle) = self.pipeline.take() {
             handle.stop();
@@ -98,37 +188,101 @@ impl DapSamplerApp {
         self.controls.set_stopped();
     }
 
-    /// 暂停采集
     fn pause_acquisition(&mut self) {
-        // 暂停 = 停止流水线但保留显示数据
         self.stop_acquisition();
         self.controls.set_paused();
     }
 
-    /// 消费环形缓冲区数据到显示缓冲区
     fn drain_pipeline(&mut self) {
-        // 先从 pipeline 读取数据到 temp_buf
         let n = if let Some(ref handle) = self.pipeline {
             handle.drain_samples(&mut self.temp_buf)
         } else {
             0
         };
-
-        // 然后追加到显示缓冲区（避免同时借用 pipeline 和 display_buf）
         if n > 0 {
             self.display_buf.push_batch(&self.temp_buf[..n]);
             self.controls.update_count(self.display_buf.next_seq());
             self.has_new_data = true;
         }
     }
+
+    fn apply_variable_changes(&mut self, changes: Vec<(String, bool)>) {
+        for (path, is_checked) in changes {
+            if is_checked {
+                if !self.channel_panel.has_channel(&path) {
+                    let ch_count = self.channel_panel.channel_count();
+                    if ch_count >= 8 {
+                        continue;
+                    }
+                    let color = CHANNEL_COLORS[ch_count % CHANNEL_COLORS.len()];
+                    let value_type = self.elf_ctx.as_ref()
+                        .and_then(|ctx| ctx.variables.iter().find(|v| v.path == path))
+                        .map(|v| v.value_type)
+                        .unwrap_or(ValueType::Float);
+                    self.channel_panel.add_channel(path, color, value_type);
+                }
+            } else {
+                self.channel_panel.remove_by_name(&path);
+            }
+        }
+    }
+
+    fn sync_channel_visibility(&mut self) {
+        let vis = self.channel_panel.visibility();
+        for (i, visible) in vis.iter().enumerate() {
+            self.waveform.set_channel_visible(i, *visible);
+        }
+    }
+
+    fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Cursor");
+        ui.label("Click: Cursor 1 | Click again: Cursor 2");
+        let interval_us = self.interval_us;
+        let types = self.waveform.value_types().to_vec();
+        if let Some(r) = self.cursor.get_result(
+            self.display_buf.all(),
+            self.display_buf.oldest_seq(),
+            interval_us,
+            &types,
+        ) {
+            ui.label(format!("T: {:.6}s", r.time_sec));
+            for (i, v) in r.values.iter().enumerate() {
+                let name = self.waveform.channel_names().get(i).copied().unwrap_or("?");
+                ui.label(format!("  {}: {:.4}", name, v));
+            }
+            if self.cursor.cursor2.is_some() {
+                if let Some((dt, dv)) = self.cursor.delta(
+                    self.display_buf.all(),
+                    self.display_buf.oldest_seq(),
+                    interval_us,
+                    &types,
+                ) {
+                    ui.separator();
+                    ui.label(format!("dT: {:.6}s", dt));
+                    for (i, v) in dv.iter().enumerate() {
+                        ui.label(format!("  dCH{}: {:.4}", i + 1, v));
+                    }
+                }
+            }
+        } else {
+            ui.label("(no cursor placed)");
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Clear Cursor").clicked() {
+                self.cursor.clear();
+            }
+            if ui.button("Auto Fit Y").clicked() {
+                self.waveform.request_auto_fit_y();
+            }
+        });
+    }
 }
 
 impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 每帧消费新数据
         self.drain_pipeline();
 
-        // 检查是否达到目标采样数
         if let Some(target) = self.controls.target_count {
             if self.controls.total_samples >= target && self.pipeline.is_some() {
                 self.stop_acquisition();
@@ -140,92 +294,109 @@ impl eframe::App for DapSamplerApp {
             ui.horizontal(|ui| {
                 ui.heading("DAP Sampler");
                 ui.separator();
+
+                // Open ELF 按钮（P4）
+                if ui.button("\u{1f4c1} Open ELF").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ELF", &["elf", "axf", "out", ""])
+                        .pick_file()
+                    {
+                        match ElfParser::load(&path) {
+                            Ok(ctx) => {
+                                log::info!("ELF loaded: {} variables", ctx.variables.len());
+                                self.elf_ctx = Some(ctx);
+                                self.active_tab = SidebarTab::Variables;
+                            }
+                            Err(e) => log::error!("ELF load failed: {}", e),
+                        }
+                    }
+                }
+
+                ui.separator();
+
                 if let Some(cmd) = self.controls.show(ui) {
                     match cmd {
                         AcquisitionCommand::Start => {
-                            if self.controls.state == AcquisitionState::Idle {
+                            if self.controls.state == AcquisitionState::Idle
+                                || self.controls.state == AcquisitionState::Paused
+                            {
                                 self.start_acquisition();
-                            } else if self.controls.state == AcquisitionState::Paused {
-                                // 暂停后重新开始：需要重新创建 engine
-                                // 简化处理：不支持暂停恢复，仅支持停止后重新开始
                             }
                         }
                         AcquisitionCommand::Pause => self.pause_acquisition(),
                         AcquisitionCommand::Stop => self.stop_acquisition(),
                     }
                 }
+
+                // 检测采样率变化（ComboBox 仅在 Idle 时可编辑）
+                if self.controls.sample_rate != self.rate_hz {
+                    self.rate_hz = self.controls.sample_rate;
+                    self.interval_us = 1_000_000.0 / self.rate_hz as f64;
+                    self.waveform.set_interval(self.interval_us);
+                    // 手工模式：用新采样率重建引擎
+                    if let Some(engine) = self.engine.take() {
+                        self.engine = Some(engine.with_rate(self.rate_hz));
+                    }
+                    log::info!("采样率已变更为 {} Hz", self.rate_hz);
+                }
             });
         });
 
-        // ---- 图例（通道开关 + 光标信息） ----
-        egui::SidePanel::left("legend_panel")
-            .resizable(false)
-            .default_width(180.0)
+        // ---- 左侧竖排标签栏 ----
+        let has_elf = self.elf_ctx.is_some();
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(280.0)
+            .width_range(220.0..=400.0)
             .show(ctx, |ui| {
-                ui.heading("Channels");
-                ui.separator();
-                for i in 0..self.waveform.channel_count() {
-                    let names = self.waveform.channel_names();
-                    let name = names[i].to_string();
-                    let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-                    let mut visible = self.waveform.is_channel_visible(i);
-                    ui.horizontal(|ui| {
-                        ui.colored_label(color, "●");
-                        if ui.checkbox(&mut visible, &name).changed() {
-                            self.waveform.set_channel_visible(i, visible);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(36.0);
+                        render_tab_button(
+                            ui, "\u{901a}\u{9053}", &mut self.active_tab, SidebarTab::Channels,
+                            self.channel_panel.channel_count(),
+                        );
+                        if has_elf {
+                            render_tab_button(
+                                ui, "\u{53d8}\u{91cf}", &mut self.active_tab, SidebarTab::Variables,
+                                self.elf_ctx.as_ref().map_or(0, |e| e.variables.len()),
+                            );
                         }
                     });
-                }
-                ui.separator();
 
-                // 光标信息
-                ui.heading("Cursor");
-                ui.label("Click: Cursor 1 | Click again: Cursor 2");
-                ui.label("Click 3rd time: reset Cursor 1");
-                let interval_us = self.interval_us;
-                let types = self.waveform.value_types().to_vec();
-                if let Some(r) = self.cursor.get_result(
-                    self.display_buf.all(),
-                    self.display_buf.oldest_seq(),
-                    interval_us,
-                    &types,
-                ) {
-                    ui.label(format!("T: {:.6}s", r.time_sec));
-                    for (i, v) in r.values.iter().enumerate() {
-                        ui.label(format!("  CH{}: {:.4}", i + 1, v));
-                    }
+                    ui.separator();
 
-                    // 双光标差值
-                    if self.cursor.cursor2.is_some() {
-                        if let Some((dt, dv)) = self.cursor.delta(
-                            self.display_buf.all(),
-                            self.display_buf.oldest_seq(),
-                            interval_us,
-                            &types,
-                        ) {
-                            ui.separator();
-                            ui.label(format!("dT: {:.6}s", dt));
-                            for (i, v) in dv.iter().enumerate() {
-                                ui.label(format!("  dCH{}: {:.4}", i + 1, v));
+                    ui.vertical(|ui| {
+                        match self.active_tab {
+                            SidebarTab::Channels => {
+                                ui.heading("\u{901a}\u{9053}");
+                                ui.separator();
+                                if let Some(remove_idx) = self.channel_panel.show(ui) {
+                                    let name = self.channel_panel.channels[remove_idx].name.clone();
+                                    self.variable_browser.checked_paths.remove(&name);
+                                    self.channel_panel.remove_channel(remove_idx);
+                                }
+                                ui.separator();
+                                self.show_cursor_info(ui);
+                            }
+                            SidebarTab::Variables => {
+                                ui.heading("\u{53d8}\u{91cf}\u{6d4f}\u{89c8}\u{5668}");
+                                ui.separator();
+                                let changes = self.variable_browser.show(
+                                    ui,
+                                    self.elf_ctx.as_ref(),
+                                );
+                                if !changes.is_empty() {
+                                    self.apply_variable_changes(changes);
+                                }
                             }
                         }
-                    }
-                } else {
-                    ui.label("(no cursor placed)");
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Clear Cursor").clicked() {
-                        self.cursor.clear();
-                    }
-                    if ui.button("Auto Fit Y").clicked() {
-                        self.waveform.request_auto_fit_y();
-                    }
+                    });
                 });
             });
 
         // ---- 中央波形区域 ----
+        self.sync_channel_visibility();
         let has_new_data = self.has_new_data;
         self.has_new_data = false;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -240,12 +411,77 @@ impl eframe::App for DapSamplerApp {
             }
         });
 
-        // 请求持续刷新（60fps）
         ctx.request_repaint();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // 窗口关闭时停止采集
         self.stop_acquisition();
+    }
+}
+
+fn render_tab_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active_tab: &mut SidebarTab,
+    this_tab: SidebarTab,
+    badge_count: usize,
+) {
+    let is_active = *active_tab == this_tab;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::new(36.0, 44.0),
+        egui::Sense::click(),
+    );
+
+    let bg_color = if is_active {
+        egui::Color32::from_rgba_premultiplied(40, 40, 50, 200)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 0.0, bg_color);
+
+    if is_active {
+        let indicator = egui::Rect::from_min_size(
+            rect.left_top(),
+            egui::Vec2::new(2.0, rect.height()),
+        );
+        ui.painter().rect_filled(indicator, 0.0, egui::Color32::from_rgb(233, 69, 96));
+    }
+
+    let text_color = if is_active {
+        egui::Color32::from_rgb(233, 69, 96)
+    } else {
+        egui::Color32::from_rgb(110, 118, 129)
+    };
+
+    let char_spacing = 14.0;
+    let chars: Vec<char> = label.chars().collect();
+    let total_height = chars.len() as f32 * char_spacing;
+    let start_y = rect.center().y - total_height / 2.0 + char_spacing / 2.0;
+
+    for (i, ch) in chars.iter().enumerate() {
+        let pos = egui::Pos2::new(rect.center().x, start_y + i as f32 * char_spacing);
+        ui.painter().text(
+            pos,
+            egui::Align2::CENTER_CENTER,
+            *ch,
+            egui::FontId::proportional(12.0),
+            text_color,
+        );
+    }
+
+    if badge_count > 0 {
+        let badge_pos = egui::Pos2::new(rect.right() - 4.0, rect.top() + 6.0);
+        ui.painter().text(
+            badge_pos,
+            egui::Align2::RIGHT_CENTER,
+            badge_count.to_string(),
+            egui::FontId::proportional(9.0),
+            egui::Color32::from_rgb(180, 180, 180),
+        );
+    }
+
+    if response.clicked() {
+        *active_tab = this_tab;
     }
 }

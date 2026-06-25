@@ -32,19 +32,31 @@ impl PipelineEngine {
     /// `addresses` 是一组目标内存地址（1-8 个）。
     /// `rate_hz` 是目标采样率。
     pub fn new(
-        usb: BulkTransfer,
+        usb: Arc<BulkTransfer>,
         dap: DapProtocol,
         addresses: Vec<u32>,
         rate_hz: u32,
     ) -> Self {
         let interval_us = (1_000_000.0 / rate_hz as f64) as u64;
         Self {
-            usb: Arc::new(usb),
+            usb,
             dap,
             addresses,
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// 使用新采样率重建引擎（保持相同 USB/DAP/地址配置）
+    ///
+    /// 采样率在 UI 中修改后调用，返回新引擎替换旧的。
+    pub fn with_rate(&self, rate_hz: u32) -> Self {
+        Self::new(
+            Arc::clone(&self.usb),
+            self.dap,
+            self.addresses.clone(),
+            rate_hz,
+        )
     }
 
     /// 启动流水线，返回控制句柄

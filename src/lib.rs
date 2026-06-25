@@ -6,4 +6,5 @@ pub mod error;
 pub mod usb;
 pub mod dap;
 pub mod pipeline;
+pub mod elf;
 pub mod ui;

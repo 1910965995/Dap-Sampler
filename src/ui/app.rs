@@ -4,6 +4,7 @@ use crate::pipeline::sample::ValueType;
 use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
+use crate::dap::swd::SwdLink;
 use crate::elf::{ElfContext, ElfParser};
 use super::display_buffer::DisplayBuffer;
 use super::waveform::WaveformPanel;
@@ -34,9 +35,10 @@ enum SidebarTab {
 /// DAP Sampler 主应用
 pub struct DapSamplerApp {
     pipeline: Option<PipelineHandle>,
-    engine: Option<PipelineEngine>,
-    usb: Arc<BulkTransfer>,
-    dap: DapProtocol,
+    /// 活跃的 USB 连接（Idle 时为 None，Start 时建立，Stop 时释放）
+    active_usb: Option<Arc<BulkTransfer>>,
+    /// 手工模式地址（通过 --addresses 传入）
+    manual_addresses: Vec<u32>,
     display_buf: DisplayBuffer,
     waveform: WaveformPanel,
     controls: ControlPanel,
@@ -61,9 +63,7 @@ pub struct DapSamplerApp {
 
 impl DapSamplerApp {
     pub fn new(
-        engine: Option<PipelineEngine>,
-        usb: Arc<BulkTransfer>,
-        dap: DapProtocol,
+        manual_addresses: Vec<u32>,
         addresses: Vec<String>,
         rate_hz: u32,
         target_count: Option<u64>,
@@ -104,9 +104,8 @@ impl DapSamplerApp {
 
         Self {
             pipeline: None,
-            engine,
-            usb,
-            dap,
+            active_usb: None,  // USB 连接推迟到 Start 时建立
+            manual_addresses,
             display_buf: DisplayBuffer::new(200_000),
             waveform,
             controls: ControlPanel::new(rate_hz, target_count),
@@ -126,71 +125,110 @@ impl DapSamplerApp {
     }
 
     fn start_acquisition(&mut self) {
-        // 手工模式：使用预创建引擎
-        if let Some(ref engine) = self.engine {
-            match engine.start() {
-                Ok(handle) => {
-                    self.pipeline = Some(handle);
-                    self.controls.set_running();
+        // 1. 确定要采集的地址和通道信息
+        let (addresses, channel_names, channel_colors, types) =
+            if !self.manual_addresses.is_empty() {
+                // 手工模式：使用预解析的地址
+                let names: Vec<String> = self.manual_channel_names.clone();
+                let colors: Vec<egui::Color32> = (0..names.len())
+                    .map(|i| CHANNEL_COLORS[i % CHANNEL_COLORS.len()])
+                    .collect();
+                let types = vec![ValueType::Float; names.len()];
+                (self.manual_addresses.clone(), names, colors, types)
+            } else {
+                // ELF 模式：从 channel_panel 动态获取
+                let channels = &self.channel_panel.channels;
+                if channels.is_empty() {
+                    return;
                 }
-                Err(e) => log::error!("Failed to start acquisition: {}", e),
-            }
-            return;
-        }
 
-        // ELF 模式：从 channel_panel 动态构建引擎
-        let channels = &self.channel_panel.channels;
-        if channels.is_empty() {
-            return;
-        }
+                let addresses: Vec<u32> = channels
+                    .iter()
+                    .filter_map(|ch| {
+                        self.elf_ctx.as_ref().and_then(|ctx| {
+                            ctx.variables
+                                .iter()
+                                .find(|v| v.path == ch.name || v.name == ch.name)
+                                .map(|v| v.address)
+                        })
+                    })
+                    .collect();
 
-        let addresses: Vec<u32> = channels
-            .iter()
-            .filter_map(|ch| {
-                self.elf_ctx.as_ref().and_then(|ctx| {
-                    ctx.variables.iter()
-                        .find(|v| v.path == ch.name || v.name == ch.name)
-                        .map(|v| v.address)
-                })
-            })
-            .collect();
+                if addresses.is_empty() {
+                    return;
+                }
 
-        let types: Vec<ValueType> = channels.iter().map(|c| c.value_type).collect();
+                let names: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
+                let colors: Vec<egui::Color32> = channels.iter().map(|c| c.color).collect();
+                let types: Vec<ValueType> = channels.iter().map(|c| c.value_type).collect();
+                (addresses, names, colors, types)
+            };
 
         if addresses.is_empty() {
             return;
         }
 
+        // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
+        if self.active_usb.is_none() {
+            let mut swd = match SwdLink::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("连接 DAP-Link 失败: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = swd.init() {
+                log::error!("SWD 初始化失败: {}", e);
+                return;
+            }
+            let (usb, _) = swd.into_parts();
+            self.active_usb = Some(Arc::new(usb));
+        }
+
+        // 3. 创建 PipelineEngine
         let engine = PipelineEngine::new(
-            Arc::clone(&self.usb),
-            self.dap,
+            Arc::clone(self.active_usb.as_ref().unwrap()),
+            DapProtocol::new(),
             addresses,
             self.rate_hz,
         );
 
-        let channel_names: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
-        let channel_colors: Vec<egui::Color32> = channels.iter().map(|c| c.color).collect();
-        self.waveform = WaveformPanel::new(channel_names, channel_colors, self.interval_us, types);
+        // 4. 更新波形面板（通道名和类型）
+        self.waveform =
+            WaveformPanel::new(channel_names, channel_colors, self.interval_us, types);
 
+        // 5. 清空旧数据，从头开始采集
+        self.display_buf = DisplayBuffer::new(200_000);
+        self.cursor.clear();
+        self.controls.update_count(0);
+
+        // 6. 启动采集
         match engine.start() {
             Ok(handle) => {
                 self.pipeline = Some(handle);
                 self.controls.set_running();
             }
-            Err(e) => log::error!("Failed to start acquisition: {}", e),
+            Err(e) => log::error!("启动采集失败: {}", e),
+        }
+    }
+
+    fn stop_pipeline(&mut self) {
+        if let Some(handle) = self.pipeline.take() {
+            handle.stop();
         }
     }
 
     fn stop_acquisition(&mut self) {
-        if let Some(handle) = self.pipeline.take() {
-            handle.stop();
-        }
+        self.stop_pipeline();
         self.controls.set_stopped();
+        // 释放 USB 设备，让其他工具（如 Keil）可以使用 DAP-Link
+        self.active_usb = None;
     }
 
     fn pause_acquisition(&mut self) {
-        self.stop_acquisition();
+        self.stop_pipeline();
         self.controls.set_paused();
+        // Pause 时保持 USB 连接，恢复采集更快
     }
 
     fn drain_pipeline(&mut self) {
@@ -333,10 +371,6 @@ impl eframe::App for DapSamplerApp {
                     self.rate_hz = self.controls.sample_rate;
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
-                    // 手工模式：用新采样率重建引擎
-                    if let Some(engine) = self.engine.take() {
-                        self.engine = Some(engine.with_rate(self.rate_hz));
-                    }
                     log::info!("采样率已变更为 {} Hz", self.rate_hz);
                 }
             });

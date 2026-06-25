@@ -357,12 +357,10 @@ fn cmd_gui(
     address_strs: &[String],
     rate: u32,
     count: Option<u64>,
-    type_strs: Option<&[String]>,
+    _type_strs: Option<&[String]>,
     elf_path: Option<&str>,
 ) -> anyhow::Result<()> {
-    use dap_sampler::pipeline::engine::PipelineEngine;
     use dap_sampler::ui::app::DapSamplerApp;
-    use dap_sampler::pipeline::sample::ValueType;
     use dap_sampler::elf::ElfParser;
 
     // 加载 ELF（如果提供）
@@ -373,15 +371,9 @@ fn cmd_gui(
         None
     };
 
-    // 连接并初始化 SWD
-    println!("\u{1f50c} 正在连接 DAP-Link...");
-    let mut swd = SwdLink::new()?;
-    swd.init()?;
-    let (usb, dap) = swd.into_parts();
-    let usb = Arc::new(usb);
-
-    // 手工地址模式（--addresses）
-    let engine = if !address_strs.is_empty() {
+    // 手工地址模式（--addresses）：仅解析地址，不在此处连接 USB
+    // USB 连接推迟到用户在 GUI 中点击 Start 时再进行
+    let manual_addresses: Vec<u32> = if !address_strs.is_empty() {
         let addresses: Vec<u32> = address_strs
             .iter()
             .map(|s| parse_address(s))
@@ -390,39 +382,14 @@ fn cmd_gui(
         if addresses.len() > 8 {
             anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
         }
-
-        let _value_types: Vec<ValueType> = if let Some(type_strs) = type_strs {
-            if type_strs.len() != addresses.len() {
-                anyhow::bail!(
-                    "类型数量 ({}) 与地址数量 ({}) 不一致",
-                    type_strs.len(),
-                    addresses.len()
-                );
-            }
-            type_strs
-                .iter()
-                .map(|s| ValueType::parse(s).map_err(anyhow::Error::msg))
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            vec![ValueType::Float; addresses.len()]
-        };
-
-        // 预创建引擎（传统模式）
-        Some(PipelineEngine::new(
-            Arc::clone(&usb),
-            dap,
-            addresses,
-            rate,
-        ))
+        addresses
     } else {
-        None
+        vec![]
     };
 
-    // 启动 egui 窗口
+    // 启动 egui 窗口（此时不连接 USB 设备）
     let app = DapSamplerApp::new(
-        engine,
-        usb,
-        dap,
+        manual_addresses,
         address_strs.to_vec(),
         rate,
         count,

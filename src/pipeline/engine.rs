@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -67,9 +69,18 @@ impl PipelineEngine {
         self.running.store(true, Ordering::SeqCst);
 
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
+        let start_time = Instant::now();
 
-        let submit = self.spawn_submit_thread()?;
-        let collect = self.spawn_collect_thread(Arc::clone(&ring))?;
+        // 共享时间戳队列：提交线程在每次 USB 写入完成后记录发送时刻，
+        // 接收线程从中取出对应的时间戳作为采样时间戳。
+        // 这消除了 USB 响应到达抖动（28µs~200µs）对时间戳的影响——
+        // 因为我们记录的是命令发送时刻（≈DAP-Link 采样时刻），
+        // 而非 USB 响应到达时刻。
+        let ts_queue: Arc<Mutex<VecDeque<f64>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
+
+        let submit = self.spawn_submit_thread(start_time, Arc::clone(&ts_queue))?;
+        let collect = self.spawn_collect_thread(Arc::clone(&ring), start_time, ts_queue)?;
 
         Ok(PipelineHandle {
             submit_handle: submit,
@@ -80,7 +91,11 @@ impl PipelineEngine {
     }
 
     /// 启动提交线程
-    fn spawn_submit_thread(&self) -> Result<JoinHandle<()>> {
+    fn spawn_submit_thread(
+        &self,
+        start_time: Instant,
+        ts_queue: Arc<Mutex<VecDeque<f64>>>,
+    ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
         let addresses = self.addresses.clone();
@@ -105,7 +120,7 @@ impl PipelineEngine {
             .name("dap-submit".into())
             .spawn(move || {
                 let mut seq: u64 = 0;
-                let start = Instant::now();
+                let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
                     // --- 构造 DAP_Transfer 命令 ---
@@ -118,10 +133,24 @@ impl PipelineEngine {
                         }
                     }
 
-                    // --- 非阻塞发送 ---
+                    // --- 发送命令（write_nonblock 实际为阻塞模式）---
+                    // rusb 中 timeout=0 表示无限等待，所以 write_nonblock 会
+                    // 阻塞直到 DAP-Link 接收完命令。写入返回的时刻非常接近
+                    // DAP-Link 执行 SWD 读操作的时刻。
                     if let Err(e) = usb.write_nonblock(&cmd) {
                         log::error!("提交线程 USB 写失败 (seq={}): {}", seq, e);
                         break;
+                    }
+
+                    // 记录发送时刻作为采样时间戳
+                    let send_ts = start.elapsed().as_secs_f64();
+                    if let Ok(mut q) = ts_queue.lock() {
+                        q.push_back(send_ts);
+                        // 防止队列无限增长（异常情况保护）
+                        let excess = q.len().saturating_sub(10_000);
+                        if excess > 0 {
+                            q.drain(0..excess);
+                        }
                     }
 
                     seq += 1;
@@ -144,7 +173,12 @@ impl PipelineEngine {
     }
 
     /// 启动接收线程
-    fn spawn_collect_thread(&self, ring: Arc<RingBuffer>) -> Result<JoinHandle<()>> {
+    fn spawn_collect_thread(
+        &self,
+        ring: Arc<RingBuffer>,
+        start_time: Instant,
+        ts_queue: Arc<Mutex<VecDeque<f64>>>,
+    ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
         let addresses = self.addresses.clone();
@@ -195,8 +229,19 @@ impl PipelineEngine {
                         continue;
                     }
 
+                    // 从提交线程的时间戳队列中取出对应的发送时间戳。
+                    // 这比使用 USB 响应到达时间更准确，因为消除了 USB IN
+                    // 传输的调度抖动。提交线程和接收线程通过 USB FIFO
+                    // 自然保持同步（每条写入对应一条响应）。
+                    let timestamp_sec = ts_queue
+                        .lock()
+                        .ok()
+                        .and_then(|mut q| q.pop_front())
+                        .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
+
                     let sample = Sample {
                         seq,
+                        timestamp_sec,
                         values: resp.data.clone(),
                     };
 

@@ -101,10 +101,21 @@ impl ControlPanel {
             // 运行中显示实际采样率
             if self.state == AcquisitionState::Running && self.actual_rate_hz > 0.0 {
                 let pct = self.actual_rate_hz / self.sample_rate as f64 * 100.0;
-                ui.label(format!(
+                let rate_label = format!(
                     "Actual: {:.0} Hz ({:.0}%)",
                     self.actual_rate_hz, pct
-                ));
+                );
+                // 实际速率低于目标 90% 时用警告色显示
+                if pct < 90.0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 160, 60),
+                        rate_label,
+                    ).on_hover_text(
+                        "DAP-Link 吞吐量不足，实际采样率低于目标。\n波形时间轴已自动使用真实时间戳，波形形状应正确。\n降低采样率可获得更均匀的采样间隔。"
+                    );
+                } else {
+                    ui.label(rate_label);
+                }
             }
 
             if let Some(target) = self.target_count {

@@ -1,6 +1,26 @@
 use egui_plot::{Line, Legend, Plot, PlotPoint};
 use crate::pipeline::sample::{Sample, ValueType};
 
+/// 在数据跳变点插入阶梯点，使折线图渲染为阶梯波形（适用于数字信号）
+///
+/// 对于 0/1 开关信号，普通折线图会在跳变处绘制斜线，看起来不像方波。
+/// 插入阶梯点后，跳变处变为垂直线，正确呈现数字信号的波形。
+fn insert_step_points(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let mut result = Vec::with_capacity(points.len() * 2);
+    result.push(points[0]);
+    for i in 1..points.len() {
+        // Y 值变化时，在当前 X 位置插入一个旧 Y 值的点，形成垂直阶梯
+        if points[i][1] != points[i - 1][1] {
+            result.push([points[i][0], points[i - 1][1]]);
+        }
+        result.push(points[i]);
+    }
+    result
+}
+
 /// LTTB (Largest Triangle Three Buckets) 降采样
 ///
 /// 将 N 个数据点降采样到 M 个点（M < N），同时保留波形的峰谷特征。
@@ -139,6 +159,7 @@ impl WaveformPanel {
         &mut self,
         ui: &mut egui::Ui,
         buffer: &[Sample],
+        buffer_offset: u64,
         visible_width: f32,
         has_new_data: bool,
     ) -> Option<u64> {
@@ -215,9 +236,28 @@ impl WaveformPanel {
             // 检测点击 → 放置光标
             if plot_ui.response().clicked() {
                 if let Some(coord) = pointer_coord {
-                    // 从 X 坐标（秒）反推采样序号
-                    let seq = (coord.x * 1_000_000.0 / self.interval_us).round() as u64;
-                    clicked_seq = Some(seq);
+                    // 用真实时间戳查找最接近的采样点
+                    let target = coord.x;
+                    if !buffer.is_empty() {
+                        let idx = buffer.binary_search_by(|s| {
+                            s.timestamp_sec.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let local_idx = match idx {
+                            Ok(i) => i,
+                            Err(i) => {
+                                if i == 0 {
+                                    0
+                                } else if i >= buffer.len() {
+                                    buffer.len() - 1
+                                } else {
+                                    let d1 = (buffer[i - 1].timestamp_sec - target).abs();
+                                    let d2 = (buffer[i].timestamp_sec - target).abs();
+                                    if d1 < d2 { i - 1 } else { i }
+                                }
+                            }
+                        };
+                        clicked_seq = Some(buffer_offset + local_idx as u64);
+                    }
                 }
             }
         });
@@ -243,7 +283,7 @@ impl WaveformPanel {
                     let raw = s.values.get(ch_idx).copied().unwrap_or(0);
                     let val = vt.to_f64(raw);
                     if val.is_finite() {
-                        Some([s.timestamp_sec(self.interval_us), val])
+                        Some([s.timestamp_sec, val])
                     } else {
                         None
                     }
@@ -257,8 +297,15 @@ impl WaveformPanel {
                 raw_points
             };
 
+            // 非浮点类型使用阶梯渲染（数字信号），
+            // 在跳变点插入垂直阶梯，使方波正确呈现
+            let final_points = match vt {
+                ValueType::Float => downsampled,
+                _ => insert_step_points(&downsampled),
+            };
+
             // 转换为 PlotPoint 以支持零拷贝借用
-            self.cached_points[ch_idx] = downsampled
+            self.cached_points[ch_idx] = final_points
                 .into_iter()
                 .map(PlotPoint::from)
                 .collect();

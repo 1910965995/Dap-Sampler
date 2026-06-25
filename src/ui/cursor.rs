@@ -50,12 +50,11 @@ impl CursorState {
 
     /// 获取光标处的采样数据
     ///
-    /// `buffer` 是 DisplayBuffer 的切片，`buffer_offset` 是最旧可用序号，`interval_us` 是采样间隔（微秒）。
+    /// `buffer` 是 DisplayBuffer 的切片，`buffer_offset` 是最旧可用序号。
     pub fn get_result(
         &self,
         buffer: &[Sample],
         buffer_offset: u64,
-        interval_us: f64,
         types: &[ValueType],
     ) -> Option<CursorResult> {
         let seq = self.cursor1?;
@@ -63,7 +62,7 @@ impl CursorState {
         let sample = buffer.get(local_idx)?;
         Some(CursorResult {
             seq,
-            time_sec: sample.timestamp_sec(interval_us),
+            time_sec: sample.timestamp_sec,
             values: sample.as_f64s_typed(types),
         })
     }
@@ -75,16 +74,15 @@ impl CursorState {
         &self,
         buffer: &[Sample],
         buffer_offset: u64,
-        interval_us: f64,
         types: &[ValueType],
     ) -> Option<(f64, Vec<f64>)> {
-        let r1 = self.get_result(buffer, buffer_offset, interval_us, types)?;
+        let r1 = self.get_result(buffer, buffer_offset, types)?;
         let seq2 = self.cursor2?;
         let local_idx2 = seq2.checked_sub(buffer_offset)? as usize;
         let sample2 = buffer.get(local_idx2)?;
         let r2 = CursorResult {
             seq: seq2,
-            time_sec: sample2.timestamp_sec(interval_us),
+            time_sec: sample2.timestamp_sec,
             values: sample2.as_f64s_typed(types),
         };
 

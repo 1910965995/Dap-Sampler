@@ -57,7 +57,6 @@ pub struct DapSamplerApp {
     active_tab: SidebarTab,
     #[allow(dead_code)]
     manual_channel_names: Vec<String>,
-    #[allow(dead_code)]
     manual_value_types: Vec<ValueType>,
     rate_hz: u32,
     #[allow(dead_code)]
@@ -71,6 +70,7 @@ impl DapSamplerApp {
         rate_hz: u32,
         target_count: Option<u64>,
         elf_ctx: Option<ElfContext>,
+        manual_types: Vec<ValueType>,
     ) -> Self {
         let interval_us = 1_000_000.0 / rate_hz as f64;
 
@@ -79,7 +79,11 @@ impl DapSamplerApp {
             .enumerate()
             .map(|(i, a)| format!("CH{} {}", i + 1, a))
             .collect();
-        let manual_value_types: Vec<ValueType> = vec![ValueType::Float; addresses.len()];
+        let manual_value_types: Vec<ValueType> = if manual_types.is_empty() {
+            vec![ValueType::Uint32; addresses.len()]
+        } else {
+            manual_types
+        };
 
         let num_channels = manual_channel_names.len();
         let channel_colors: Vec<egui::Color32> = (0..num_channels)
@@ -101,7 +105,8 @@ impl DapSamplerApp {
         if elf_ctx.is_none() {
             for (i, name) in manual_channel_names.iter().enumerate() {
                 let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-                channel_panel.add_channel(name.clone(), color, ValueType::Float);
+                let vt = manual_value_types.get(i).copied().unwrap_or(ValueType::Uint32);
+                channel_panel.add_channel(name.clone(), color, vt);
             }
         }
 
@@ -114,7 +119,7 @@ impl DapSamplerApp {
             waveform,
             controls: ControlPanel::new(rate_hz, target_count),
             cursor: CursorState::new(),
-            temp_buf: (0..1024).map(|_| Sample { seq: 0, values: vec![] }).collect(),
+            temp_buf: (0..1024).map(|_| Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }).collect(),
             interval_us,
             has_new_data: false,
             elf_ctx,
@@ -137,7 +142,7 @@ impl DapSamplerApp {
                 let colors: Vec<egui::Color32> = (0..names.len())
                     .map(|i| CHANNEL_COLORS[i % CHANNEL_COLORS.len()])
                     .collect();
-                let types = vec![ValueType::Float; names.len()];
+                let types = self.manual_value_types.clone();
                 (self.manual_addresses.clone(), names, colors, types)
             } else {
                 // ELF 模式：从 channel_panel 动态获取
@@ -282,12 +287,10 @@ impl DapSamplerApp {
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
         ui.heading("Cursor");
         ui.label("Click: Cursor 1 | Click again: Cursor 2");
-        let interval_us = self.interval_us;
         let types = self.waveform.value_types().to_vec();
         if let Some(r) = self.cursor.get_result(
             self.display_buf.all(),
             self.display_buf.oldest_seq(),
-            interval_us,
             &types,
         ) {
             ui.label(format!("T: {:.6}s", r.time_sec));
@@ -299,7 +302,6 @@ impl DapSamplerApp {
                 if let Some((dt, dv)) = self.cursor.delta(
                     self.display_buf.all(),
                     self.display_buf.oldest_seq(),
-                    interval_us,
                     &types,
                 ) {
                     ui.separator();
@@ -450,9 +452,11 @@ impl eframe::App for DapSamplerApp {
         self.has_new_data = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_width = ui.available_width();
+            let buffer_offset = self.display_buf.oldest_seq();
             if let Some(seq) = self.waveform.show(
                 ui,
                 self.display_buf.all(),
+                buffer_offset,
                 available_width,
                 has_new_data,
             ) {

@@ -53,7 +53,7 @@ fn lttb_threshold_too_small() {
 // ============================================================
 
 fn make_sample(seq: u64, val: u32) -> Sample {
-    Sample { seq, values: vec![val] }
+    Sample { seq, timestamp_sec: seq as f64 * 0.001, values: vec![val] }
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn display_buffer_push_batch_exact_overflow() {
 
 /// 创建一个 Sample，值以 f32 bit pattern 存储
 fn make_float_sample(seq: u64, val: f32) -> Sample {
-    Sample { seq, values: vec![val.to_bits()] }
+    Sample { seq, timestamp_sec: seq as f64 * 0.001, values: vec![val.to_bits()] }
 }
 
 #[test]
@@ -170,14 +170,14 @@ fn cursor_get_result() {
     let types = vec![ValueType::Float];
 
     let c = CursorState { cursor1: Some(5), cursor2: None };
-    let r = c.get_result(&samples, 0, 1000.0, &types).unwrap();
+    let r = c.get_result(&samples, 0, &types).unwrap();
     assert_eq!(r.seq, 5);
-    assert!((r.time_sec - 0.005).abs() < 1e-9); // seq=5, 1000μs → 5ms
+    assert!((r.time_sec - 0.005).abs() < 1e-9); // timestamp_sec=0.005
     assert!((r.values[0] - 50.0).abs() < 0.1);   // 5 * 10.0 = 50.0
 
     // 超出范围
     let c2 = CursorState { cursor1: Some(100), cursor2: None };
-    assert!(c2.get_result(&samples, 0, 1000.0, &types).is_none());
+    assert!(c2.get_result(&samples, 0, &types).is_none());
 }
 
 #[test]
@@ -186,8 +186,8 @@ fn cursor_delta() {
     let types = vec![ValueType::Float];
 
     let c = CursorState { cursor1: Some(2), cursor2: Some(8) };
-    let (dt, dv) = c.delta(&samples, 0, 1000.0, &types).unwrap();
-    assert!((dt - 0.006).abs() < 1e-9); // (8-2) × 1ms = 6ms
+    let (dt, dv) = c.delta(&samples, 0, &types).unwrap();
+    assert!((dt - 0.006).abs() < 1e-9); // 0.008 - 0.002 = 0.006
     assert!((dv[0] - 60.0).abs() < 0.1);  // 80-20=60
 }
 
@@ -199,9 +199,9 @@ fn cursor_get_result_with_offset() {
 
     // buffer_offset = 50
     let c = CursorState { cursor1: Some(55), cursor2: None };
-    let r = c.get_result(&samples, 50, 1000.0, &types).unwrap();
+    let r = c.get_result(&samples, 50, &types).unwrap();
     assert_eq!(r.seq, 55);
-    assert!((r.time_sec - 0.055).abs() < 1e-9); // seq=55, 1000μs → 55ms
+    assert!((r.time_sec - 0.055).abs() < 1e-9); // timestamp_sec=0.055
     assert!((r.values[0] - 50.0).abs() < 0.1);
 }
 
@@ -232,7 +232,7 @@ fn sample_as_f64s_typed_float() {
 #[test]
 fn sample_as_f64s_typed_uint32() {
     // u32 值 42 应直接解释为 42.0
-    let s = Sample { seq: 0, values: vec![42u32] };
+    let s = Sample { seq: 0, timestamp_sec: 0.0, values: vec![42u32] };
     let types = vec![ValueType::Uint32];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 42.0).abs() < 0.001);
@@ -241,7 +241,7 @@ fn sample_as_f64s_typed_uint32() {
 #[test]
 fn sample_as_f64s_typed_int32() {
     // int32 负数: 0xFFFFFFFF 应解释为 -1.0
-    let s = Sample { seq: 0, values: vec![0xFFFFFFFF] };
+    let s = Sample { seq: 0, timestamp_sec: 0.0, values: vec![0xFFFFFFFF] };
     let types = vec![ValueType::Int32];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - (-1.0)).abs() < 0.001);
@@ -251,7 +251,7 @@ fn sample_as_f64s_typed_int32() {
 fn sample_as_f64s_typed_int16() {
     // int16: 0xFFFF0000 的低 16 位 = 0x0000 = 0
     // int16: 0x0000FFFF 的低 16 位 = 0xFFFF = -1 (as i16)
-    let s = Sample { seq: 0, values: vec![0x0000FFFF] };
+    let s = Sample { seq: 0, timestamp_sec: 0.0, values: vec![0x0000FFFF] };
     let types = vec![ValueType::Int16];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - (-1.0)).abs() < 0.001);
@@ -260,7 +260,7 @@ fn sample_as_f64s_typed_int16() {
 #[test]
 fn sample_as_f64s_typed_mixed() {
     // 混合类型：float + uint32
-    let s = Sample { seq: 0, values: vec![3.14f32.to_bits(), 100u32] };
+    let s = Sample { seq: 0, timestamp_sec: 0.0, values: vec![3.14f32.to_bits(), 100u32] };
     let types = vec![ValueType::Float, ValueType::Uint32];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 3.14).abs() < 0.001);
@@ -270,7 +270,7 @@ fn sample_as_f64s_typed_mixed() {
 #[test]
 fn sample_as_f64s_typed_default_float() {
     // 类型列表短于 values 时，缺失位置默认 float
-    let s = Sample { seq: 0, values: vec![3.14f32.to_bits(), 100u32] };
+    let s = Sample { seq: 0, timestamp_sec: 0.0, values: vec![3.14f32.to_bits(), 100u32] };
     let types = vec![ValueType::Float]; // 只有 1 个类型，但 values 有 2 个
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 3.14).abs() < 0.001);

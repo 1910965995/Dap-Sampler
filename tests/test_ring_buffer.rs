@@ -3,7 +3,7 @@ use dap_sampler::pipeline::ring_buffer::RingBuffer;
 use dap_sampler::pipeline::sample::Sample;
 
 fn make_sample(seq: u64, val: u32) -> Sample {
-    Sample { seq, values: vec![val] }
+    Sample { seq, timestamp_sec: seq as f64 * 0.001, values: vec![val] }
 }
 
 // ================================================================
@@ -216,7 +216,7 @@ fn stress_large_volume() {
 #[test]
 fn multi_value_sample_roundtrip() {
     let rb = RingBuffer::new(8);
-    let sample = Sample { seq: 42, values: vec![0x11111111, 0x22222222, 0x33333333, 0x44444444] };
+    let sample = Sample { seq: 42, timestamp_sec: 0.042, values: vec![0x11111111, 0x22222222, 0x33333333, 0x44444444] };
     rb.push(sample);
 
     let mut buf = vec![make_sample(0, 0); 4];

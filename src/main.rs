@@ -294,7 +294,7 @@ fn cmd_sample(
     let max_samples = count.unwrap_or(u64::MAX);
     let mut total_collected: u64 = 0;
     let mut sample_buf: Vec<dap_sampler::pipeline::sample::Sample> = (0..1024)
-        .map(|_| dap_sampler::pipeline::sample::Sample { seq: 0, values: vec![] })
+        .map(|_| dap_sampler::pipeline::sample::Sample { seq: 0, timestamp_sec: 0.0, values: vec![] })
         .collect();
 
     let mut last_progress = 0u64;
@@ -308,7 +308,7 @@ fn cmd_sample(
         }
 
         for sample in &sample_buf[..n] {
-            let time_ms = sample.timestamp_sec(interval_us) * 1000.0;
+            let time_ms = sample.timestamp_sec * 1000.0;
             write!(writer, "{},{}", sample.seq, time_ms)?;
             if as_float {
                 let floats = sample.as_floats();
@@ -357,7 +357,7 @@ fn cmd_gui(
     address_strs: &[String],
     rate: u32,
     count: Option<u64>,
-    _type_strs: Option<&[String]>,
+    type_strs: Option<&[String]>,
     elf_path: Option<&str>,
 ) -> anyhow::Result<()> {
     use dap_sampler::ui::app::DapSamplerApp;
@@ -387,6 +387,21 @@ fn cmd_gui(
         vec![]
     };
 
+    // 解析变量类型列表
+    // 未指定 --type 时，手工模式默认 Uint32（原始内存值）
+    let manual_types: Vec<dap_sampler::pipeline::sample::ValueType> = if !manual_addresses.is_empty() {
+        if let Some(types) = type_strs {
+            types
+                .iter()
+                .map(|s| dap_sampler::pipeline::sample::ValueType::parse(s).unwrap_or(dap_sampler::pipeline::sample::ValueType::Uint32))
+                .collect()
+        } else {
+            vec![dap_sampler::pipeline::sample::ValueType::Uint32; manual_addresses.len()]
+        }
+    } else {
+        vec![]
+    };
+
     // 启动 egui 窗口（此时不连接 USB 设备）
     let app = DapSamplerApp::new(
         manual_addresses,
@@ -394,6 +409,7 @@ fn cmd_gui(
         rate,
         count,
         elf_ctx,
+        manual_types,
     );
 
     let options = eframe::NativeOptions {

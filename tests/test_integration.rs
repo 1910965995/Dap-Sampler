@@ -40,13 +40,13 @@ fn e2e_single_variable_read_flow() {
     assert_eq!(resp.data[0], 0x40490FDB);
 
     // Step 3: 包装为 Sample
-    let sample = Sample { seq: 0, values: resp.data };
+    let sample = Sample { seq: 0, timestamp_sec: 0.0, values: resp.data };
     assert_eq!(sample.values[0], 0x40490FDB);
     let floats = sample.as_floats();
     assert!((floats[0] - 3.1415927).abs() < 1e-6);
 
-    // Step 4: 时间戳推算 (20kHz = 50μs interval)
-    assert!((sample.timestamp_sec(50.0) - 0.0).abs() < 1e-9);
+    // Step 4: 时间戳验证
+    assert!((sample.timestamp_sec - 0.0).abs() < 1e-9);
 }
 
 #[test]
@@ -76,9 +76,9 @@ fn e2e_multi_variable_read_flow() {
     assert_eq!(resp.data.len(), 4);
     assert_eq!(resp.data, values.to_vec());
 
-    let sample = Sample { seq: 5, values: resp.data };
-    // 5 * 50μs = 250μs = 0.00025s
-    assert!((sample.timestamp_sec(50.0) - 0.00025).abs() < 1e-9);
+    let sample = Sample { seq: 5, timestamp_sec: 0.00025, values: resp.data };
+    // 验证时间戳字段
+    assert!((sample.timestamp_sec - 0.00025).abs() < 1e-9);
 }
 
 // ================================================================
@@ -93,6 +93,7 @@ fn e2e_ring_buffer_pipeline_simulation() {
     for seq in 0..100u64 {
         let sample = Sample {
             seq,
+            timestamp_sec: seq as f64 * 0.00005,
             values: vec![
                 seq as u32 * 10,
                 seq as u32 * 20,
@@ -104,7 +105,7 @@ fn e2e_ring_buffer_pipeline_simulation() {
     }
 
     // 模拟主线程：批量消费
-    let mut buf = vec![Sample { seq: 0, values: vec![] }; 50];
+    let mut buf = vec![Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }; 50];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 50);
     assert_eq!(buf[0].seq, 0);
@@ -148,11 +149,10 @@ fn e2e_data_length_mismatch() {
 
 #[test]
 fn timestamp_monotonic() {
-    let interval_us = 50.0;
     let mut prev = -1.0;
     for seq in 0..10000u64 {
-        let sample = Sample { seq, values: vec![] };
-        let ts = sample.timestamp_sec(interval_us);
+        let sample = Sample { seq, timestamp_sec: seq as f64 * 0.00005, values: vec![] };
+        let ts = sample.timestamp_sec;
         assert!(ts > prev, "Timestamp not monotonic at seq={}", seq);
         prev = ts;
     }
@@ -206,7 +206,7 @@ fn stress_ring_buffer_200k() {
 
     // Fill beyond capacity
     for i in 0..300_000u64 {
-        rb.push(Sample { seq: i, values: vec![i as u32] });
+        rb.push(Sample { seq: i, timestamp_sec: i as f64 * 0.00005, values: vec![i as u32] });
     }
 
     // After overwriting: only the last capacity items are retained (non-monotonic due to wrap)
@@ -214,7 +214,7 @@ fn stress_ring_buffer_200k() {
     assert_eq!(rb.total_written(), 300_000);
 
     // Pop all available
-    let mut buf = vec![Sample { seq: 0, values: vec![] }; 200_000];
+    let mut buf = vec![Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }; 200_000];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 200_000);
 

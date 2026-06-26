@@ -139,7 +139,10 @@ impl WaveformPanel {
             return None;
         }
 
-        let target_points = (visible_width as usize * 3).min(100_000); // 3 倍像素宽度
+        // 降采样目标点数：至少等于 buffer 长度，避免窗口内的点被降采样
+        // 窗口大小最大 10000 点，现代 GPU 完全可以全量渲染，无需降采样
+        // 只有 buffer 极大时（如未来支持更大窗口）才按像素宽度降采样
+        let target_points = (visible_width as usize * 3).max(buffer.len()).min(100_000);
 
         // 缓存判断：仅在新数据到达或通道可见性变化时重建
         if has_new_data || self.cache_buffer_len != buffer.len() {

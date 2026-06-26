@@ -8,7 +8,7 @@ use crate::dap::protocol::DapProtocol;
 use crate::dap::swd::SwdLink;
 use crate::elf::{ElfContext, ElfParser};
 use super::display_buffer::DisplayBuffer;
-use super::waveform::WaveformPanel;
+use super::waveform::{WaveformPanel, WaveformDisplayMode};
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
 use super::cursor::CursorState;
 use super::variable_browser::VariableBrowser;
@@ -61,6 +61,10 @@ pub struct DapSamplerApp {
     rate_hz: u32,
     #[allow(dead_code)]
     target_count: Option<u64>,
+    /// 波形显示模式
+    display_mode: WaveformDisplayMode,
+    /// 显示窗口大小（采样点数）
+    window_size: usize,
 }
 
 impl DapSamplerApp {
@@ -85,6 +89,8 @@ impl DapSamplerApp {
             manual_types
         };
 
+        let display_mode = WaveformDisplayMode::Line;
+
         let num_channels = manual_channel_names.len();
         let channel_colors: Vec<egui::Color32> = (0..num_channels)
             .map(|i| CHANNEL_COLORS[i % CHANNEL_COLORS.len()])
@@ -96,9 +102,10 @@ impl DapSamplerApp {
                 channel_colors,
                 interval_us,
                 manual_value_types.clone(),
+                display_mode,
             )
         } else {
-            WaveformPanel::new(vec![], vec![], interval_us, vec![])
+            WaveformPanel::new(vec![], vec![], interval_us, vec![], display_mode)
         };
 
         let mut channel_panel = ChannelPanel::new();
@@ -130,6 +137,8 @@ impl DapSamplerApp {
             manual_value_types,
             rate_hz,
             target_count,
+            display_mode,
+            window_size: 2000,
         }
     }
 
@@ -204,10 +213,10 @@ impl DapSamplerApp {
 
         // 4. 更新波形面板（通道名和类型）
         self.waveform =
-            WaveformPanel::new(channel_names, channel_colors, self.interval_us, types);
+            WaveformPanel::new(channel_names, channel_colors, self.interval_us, types, self.display_mode);
 
-        // 5. 清空旧数据，从头开始采集
-        self.display_buf = DisplayBuffer::new(200_000);
+        // 5. 清空旧数据，用当前窗口大小创建新缓冲区
+        self.display_buf = DisplayBuffer::new(self.window_size);
         self.cursor.clear();
         self.controls.update_count(0);
 
@@ -224,7 +233,9 @@ impl DapSamplerApp {
 
     fn stop_pipeline(&mut self) {
         if let Some(handle) = self.pipeline.take() {
+            log::info!("开始停止流水线，等待子线程退出...");
             handle.stop();
+            log::info!("流水线停止完成");
         }
         self.acquisition_start = None;
         self.controls.actual_rate_hz = 0.0;
@@ -233,8 +244,55 @@ impl DapSamplerApp {
     fn stop_acquisition(&mut self) {
         self.stop_pipeline();
         self.controls.set_stopped();
-        // 释放 USB 设备，让其他工具（如 Keil）可以使用 DAP-Link
-        self.active_usb = None;
+        // 释放 USB 设备：发送 DAP_Disconnect + release_interface
+        // 不发送 DAP_Disconnect 会导致 DAP-Link 固件认为调试器仍连接着
+        if let Some(usb) = self.active_usb.take() {
+            match Arc::try_unwrap(usb) {
+                Ok(mut bulk) => {
+                    bulk.release();
+                }
+                Err(arc) => {
+                    if let Some(bulk) = Arc::get_mut(&mut arc.clone()) {
+                        bulk.release();
+                    }
+                    drop(arc);
+                }
+            }
+        }
+    }
+
+    /// 强制释放 DAP-Link USB 设备
+    ///
+    /// 先停止流水线（如果在运行），然后显式调用 release_interface + reset。
+    /// 如果没有活跃的 USB 连接，也尝试直接扫描 USB 总线释放被占用的设备。
+    fn release_daplink(&mut self) {
+        log::info!("用户请求释放 DAP-Link");
+        // 先停止流水线
+        self.stop_pipeline();
+        self.controls.set_stopped();
+
+        if let Some(usb) = self.active_usb.take() {
+            // 有活跃的 USB 连接，显式释放
+            match Arc::try_unwrap(usb) {
+                Ok(mut bulk) => {
+                    bulk.release();
+                    log::info!("DAP-Link 已显式释放");
+                }
+                Err(arc) => {
+                    if let Some(bulk) = Arc::get_mut(&mut arc.clone()) {
+                        bulk.release();
+                        log::info!("DAP-Link 已通过 get_mut 释放");
+                    } else {
+                        log::warn!("USB Arc 仍有活动引用，无法显式释放，依赖 Drop 自动释放");
+                    }
+                    drop(arc);
+                }
+            }
+        } else {
+            // 没有活跃的 USB 连接，尝试直接扫描并释放
+            log::info!("没有活跃的 USB 连接，尝试直接扫描释放 DAP-Link");
+            force_release_all_daplink();
+        }
     }
 
     fn pause_acquisition(&mut self) {
@@ -319,9 +377,6 @@ impl DapSamplerApp {
             if ui.button("Clear Cursor").clicked() {
                 self.cursor.clear();
             }
-            if ui.button("Auto Fit Y").clicked() {
-                self.waveform.request_auto_fit_y();
-            }
         });
     }
 }
@@ -346,50 +401,89 @@ impl eframe::App for DapSamplerApp {
 
         // ---- 顶部控制栏 ----
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("DAP Sampler");
-                ui.separator();
+            ui.vertical(|ui| {
+                // --- 第一行：按钮、状态、数值输入 ---
+                ui.horizontal(|ui| {
+                    ui.heading("DAP Sampler");
+                    ui.separator();
 
-                // Open ELF 按钮（P4）
-                if ui.button("\u{1f4c1} Open ELF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ELF", &["elf", "axf", "out", ""])
-                        .pick_file()
-                    {
-                        match ElfParser::load(&path) {
-                            Ok(ctx) => {
-                                log::info!("ELF loaded: {} variables", ctx.variables.len());
-                                self.elf_ctx = Some(ctx);
-                                self.active_tab = SidebarTab::Variables;
-                            }
-                            Err(e) => log::error!("ELF load failed: {}", e),
-                        }
-                    }
-                }
-
-                ui.separator();
-
-                if let Some(cmd) = self.controls.show(ui) {
-                    match cmd {
-                        AcquisitionCommand::Start => {
-                            if self.controls.state == AcquisitionState::Idle
-                                || self.controls.state == AcquisitionState::Paused
-                            {
-                                self.start_acquisition();
+                    // Open ELF 按钮（P4）
+                    if ui.button("\u{1f4c1} Open ELF").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ELF", &["elf", "axf", "out", ""])
+                            .pick_file()
+                        {
+                            match ElfParser::load(&path) {
+                                Ok(ctx) => {
+                                    log::info!("ELF loaded: {} variables", ctx.variables.len());
+                                    self.elf_ctx = Some(ctx);
+                                    self.active_tab = SidebarTab::Variables;
+                                }
+                                Err(e) => log::error!("ELF load failed: {}", e),
                             }
                         }
-                        AcquisitionCommand::Pause => self.pause_acquisition(),
-                        AcquisitionCommand::Stop => self.stop_acquisition(),
                     }
-                }
 
-                // 检测采样率变化（ComboBox 仅在 Idle 时可编辑）
-                if self.controls.sample_rate != self.rate_hz {
-                    self.rate_hz = self.controls.sample_rate;
-                    self.interval_us = 1_000_000.0 / self.rate_hz as f64;
-                    self.waveform.set_interval(self.interval_us);
-                    log::info!("采样率已变更为 {} Hz", self.rate_hz);
-                }
+                    ui.separator();
+
+                    if let Some(cmd) = self.controls.show(ui) {
+                        match cmd {
+                            AcquisitionCommand::Start => {
+                                if self.controls.state == AcquisitionState::Idle
+                                    || self.controls.state == AcquisitionState::Paused
+                                {
+                                    self.start_acquisition();
+                                }
+                            }
+                            AcquisitionCommand::Pause => self.pause_acquisition(),
+                            AcquisitionCommand::Stop => self.stop_acquisition(),
+                        }
+                    }
+
+                    // 检测采样率变化
+                    if self.controls.sample_rate != self.rate_hz {
+                        self.rate_hz = self.controls.sample_rate;
+                        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
+                        self.waveform.set_interval(self.interval_us);
+                        log::info!("采样率已变更为 {} Hz", self.rate_hz);
+                    }
+
+                    // 检测窗口大小变化
+                    if self.controls.window_size != self.window_size {
+                        self.window_size = self.controls.window_size;
+                        self.display_buf.set_max_samples(self.window_size);
+                        log::info!("显示窗口大小已变更为 {} 个点", self.window_size);
+                    }
+
+                    ui.separator();
+
+                    // 波形显示模式切换
+                    ui.label("Display:");
+                    let mut mode = self.display_mode;
+                    egui::ComboBox::from_id_salt("display_mode")
+                        .selected_text(match mode {
+                            WaveformDisplayMode::Line => "Line",
+                            WaveformDisplayMode::Point => "Point",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut mode, WaveformDisplayMode::Line, "Line");
+                            ui.selectable_value(&mut mode, WaveformDisplayMode::Point, "Point");
+                        });
+                    if mode != self.display_mode {
+                        self.display_mode = mode;
+                        self.waveform.set_display_mode(mode);
+                    }
+
+                    ui.separator();
+
+                    // 释放 DAP-Link 按钮（随时可按）
+                    // 强制释放 USB 设备，让 Keil 等工具可以使用 DAP-Link
+                    if ui.button("\u{1f50c} Release DAP-Link")
+                        .on_hover_text("强制释放 USB 设备，让 Keil 等工具可以使用 DAP-Link")
+                        .clicked() {
+                        self.release_daplink();
+                    }
+                });
             });
         });
 
@@ -478,8 +572,16 @@ impl Drop for DapSamplerApp {
         if let Some(handle) = self.pipeline.take() {
             handle.stop();
         }
-        // 显式释放 USB，确保 Keil 等工具可以立即使用 DAP-Link
-        self.active_usb = None;
+        // 显式释放 USB：发送 DAP_Disconnect + release_interface
+        if let Some(usb) = self.active_usb.take() {
+            match Arc::try_unwrap(usb) {
+                Ok(mut bulk) => { bulk.release(); }
+                Err(arc) => {
+                    if let Some(bulk) = Arc::get_mut(&mut arc.clone()) { bulk.release(); }
+                    drop(arc);
+                }
+            }
+        }
     }
 }
 
@@ -547,5 +649,97 @@ fn render_tab_button(
 
     if response.clicked() {
         *active_tab = this_tab;
+    }
+}
+
+/// 强制扫描并释放所有 CMSIS-DAP 设备
+///
+/// 当程序没有活跃的 USB 连接但设备仍被占用时使用。
+/// 遍历 USB 总线，找到 DAP-Link 设备，打开后 release 所有接口再关闭。
+fn force_release_all_daplink() {
+    use rusb::{Context, UsbContext};
+    use crate::usb::device::KNOWN_DEVICES;
+
+    let context = match Context::new() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("创建 USB Context 失败: {}", e);
+            return;
+        }
+    };
+
+    let devices = match context.devices() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("枚举 USB 设备失败: {}", e);
+            return;
+        }
+    };
+
+    let mut released_count = 0;
+    for device in devices.iter() {
+        let desc = match device.device_descriptor() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let vid = desc.vendor_id();
+        let pid = desc.product_id();
+
+        // 检查是否为已知 DAP-Link 设备
+        let known = KNOWN_DEVICES.iter().any(|&(v, p)| v == vid && p == pid);
+        if !known {
+            // 也检查产品字符串
+            match device.open() {
+                Ok(handle) => {
+                    let is_cmsis = desc.product_string_index()
+                        .and_then(|idx| handle.read_string_descriptor_ascii(idx).ok())
+                        .map(|s| s.to_uppercase().contains("CMSIS-DAP"))
+                        .unwrap_or(false);
+                    if !is_cmsis {
+                        continue;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        log::info!("找到 DAP-Link 设备 VID={:04X} PID={:04X}，尝试释放", vid, pid);
+
+        match device.open() {
+            Ok(handle) => {
+                // 尝试 release 所有接口
+                if let Ok(config) = device.config_descriptor(0) {
+                    for interface in config.interfaces() {
+                        for alt in interface.descriptors() {
+                            let iface_num = alt.interface_number();
+                            log::info!("  release interface {}", iface_num);
+                            match handle.release_interface(iface_num) {
+                                Ok(()) => {
+                                    log::info!("  interface {} 已释放", iface_num);
+                                    released_count += 1;
+                                }
+                                Err(e) => {
+                                    log::warn!("  release interface {} 失败: {}", iface_num, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                // 重置设备
+                log::info!("  reset USB device");
+                if let Err(e) = handle.reset() {
+                    log::warn!("  reset 失败: {}", e);
+                }
+            }
+            Err(e) => {
+                log::warn!("  打开设备失败: {}", e);
+            }
+        }
+    }
+
+    if released_count > 0 {
+        log::info!("共释放 {} 个接口", released_count);
+    } else {
+        log::info!("未找到需要释放的 DAP-Link 设备（可能已释放或未连接）");
     }
 }

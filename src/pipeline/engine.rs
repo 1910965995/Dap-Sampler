@@ -71,11 +71,10 @@ impl PipelineEngine {
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
         let start_time = Instant::now();
 
-        // 共享时间戳队列：提交线程在每次 USB 写入完成后记录发送时刻，
-        // 接收线程从中取出对应的时间戳作为采样时间戳。
-        // 这消除了 USB 响应到达抖动（28µs~200µs）对时间戳的影响——
-        // 因为我们记录的是命令发送时刻（≈DAP-Link 采样时刻），
-        // 而非 USB 响应到达时刻。
+        // 共享时间戳队列：提交线程为每个采样点计算理想网格时间戳
+        // （seq * interval_us），接收线程从中取出对应的时间戳。
+        // 时间戳完全由采样率和序号决定，不受 USB 写入/响应抖动影响，
+        // 保证显示的采样间隔严格一致。
         let ts_queue: Arc<Mutex<VecDeque<f64>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
 
@@ -123,6 +122,19 @@ impl PipelineEngine {
                 let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
+                    // --- 使用理想网格时间作为时间戳 ---
+                    // 时间戳 = seq * interval_us，完全由采样率和序号决定，
+                    // 不受 USB 写入耗时波动影响，保证显示间隔严格一致。
+                    let ideal_ts = (interval_us * seq) as f64 / 1_000_000.0;
+                    if let Ok(mut q) = ts_queue.lock() {
+                        q.push_back(ideal_ts);
+                        // 防止队列无限增长（异常情况保护）
+                        let excess = q.len().saturating_sub(10_000);
+                        if excess > 0 {
+                            q.drain(0..excess);
+                        }
+                    }
+
                     // --- 构造 DAP_Transfer 命令 ---
                     let mut cmd = vec![DAP_TRANSFER, dap_index, request_count];
                     for req in &requests {
@@ -133,24 +145,16 @@ impl PipelineEngine {
                         }
                     }
 
-                    // --- 发送命令（write_nonblock 实际为阻塞模式）---
-                    // rusb 中 timeout=0 表示无限等待，所以 write_nonblock 会
-                    // 阻塞直到 DAP-Link 接收完命令。写入返回的时刻非常接近
-                    // DAP-Link 执行 SWD 读操作的时刻。
+                    // --- 发送命令（200ms 超时）---
+                    // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
                     if let Err(e) = usb.write_nonblock(&cmd) {
+                        if !running.load(Ordering::Relaxed) {
+                            // 停止中遇到的超时/错误，正常退出
+                            log::info!("提交线程收到停止信号，退出");
+                            break;
+                        }
                         log::error!("提交线程 USB 写失败 (seq={}): {}", seq, e);
                         break;
-                    }
-
-                    // 记录发送时刻作为采样时间戳
-                    let send_ts = start.elapsed().as_secs_f64();
-                    if let Ok(mut q) = ts_queue.lock() {
-                        q.push_back(send_ts);
-                        // 防止队列无限增长（异常情况保护）
-                        let excess = q.len().saturating_sub(10_000);
-                        if excess > 0 {
-                            q.drain(0..excess);
-                        }
                     }
 
                     seq += 1;
@@ -229,10 +233,11 @@ impl PipelineEngine {
                         continue;
                     }
 
-                    // 从提交线程的时间戳队列中取出对应的发送时间戳。
-                    // 这比使用 USB 响应到达时间更准确，因为消除了 USB IN
-                    // 传输的调度抖动。提交线程和接收线程通过 USB FIFO
-                    // 自然保持同步（每条写入对应一条响应）。
+                    // 从提交线程的时间戳队列中取出对应的理想网格时间戳。
+                    // 时间戳 = seq * interval_us，完全由采样率决定，
+                    // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
+                    // 提交线程和接收线程通过 USB FIFO 自然保持同步
+                    //（每条写入对应一条响应）。
                     let timestamp_sec = ts_queue
                         .lock()
                         .ok()
@@ -290,9 +295,12 @@ impl PipelineHandle {
     /// 设置停止标志，等待两个子线程退出。
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
-        // 等待线程退出（忽略 join 错误）
+        log::info!("等待提交线程退出...");
         let _ = self.submit_handle.join();
+        log::info!("提交线程已退出");
+        log::info!("等待接收线程退出...");
         let _ = self.collect_handle.join();
+        log::info!("接收线程已退出");
         log::info!("流水线已停止");
     }
 }

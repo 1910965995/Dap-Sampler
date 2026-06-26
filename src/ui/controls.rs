@@ -27,16 +27,27 @@ pub struct ControlPanel {
     pub target_count: Option<u64>,
     /// 实际达到的采样率（由外部计算后更新）
     pub actual_rate_hz: f64,
+    /// 显示窗口大小（采样点数），超过则丢弃旧数据
+    pub window_size: usize,
 }
+
+/// 采样率范围
+pub const RATE_MIN: u32 = 1;
+pub const RATE_MAX: u32 = 30_000;
+/// 窗口大小范围
+pub const WINDOW_MIN: usize = 1;
+pub const WINDOW_MAX: usize = 10_000;
 
 impl ControlPanel {
     pub fn new(sample_rate: u32, target_count: Option<u64>) -> Self {
+        let sample_rate = sample_rate.clamp(RATE_MIN, RATE_MAX);
         Self {
             state: AcquisitionState::Idle,
             sample_rate,
             total_samples: 0,
             target_count,
             actual_rate_hz: 0.0,
+            window_size: 2000,
         }
     }
 
@@ -78,21 +89,29 @@ impl ControlPanel {
             };
             ui.label(format!("State: {}", state_text));
 
-            // 采样率：仅在 Idle 时可修改
+            // 采样率：仅在 Idle 时可修改（点击可输入数字，1-30000 Hz）
             let is_idle = self.state == AcquisitionState::Idle;
-            let current_rate = self.sample_rate;
             ui.add_enabled_ui(is_idle, |ui| {
-                egui::ComboBox::from_label("Rate")
-                    .selected_text(format!("{} Hz", current_rate))
-                    .show_ui(ui, |ui| {
-                        for &rate in &[100u32, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000] {
-                            ui.selectable_value(
-                                &mut self.sample_rate,
-                                rate,
-                                format!("{} Hz", rate),
-                            );
-                        }
-                    });
+                ui.label("Rate:");
+                ui.add(
+                    egui::DragValue::new(&mut self.sample_rate)
+                        .range(RATE_MIN..=RATE_MAX)
+                        .clamp_existing_to_range(true)
+                        .speed(100.0)
+                        .suffix(" Hz")
+                );
+            });
+
+            // 显示窗口大小：仅在 Idle 时可修改（点击可输入数字，1-10000 点）
+            ui.add_enabled_ui(is_idle, |ui| {
+                ui.label("Window:");
+                ui.add(
+                    egui::DragValue::new(&mut self.window_size)
+                        .range(WINDOW_MIN..=WINDOW_MAX)
+                        .clamp_existing_to_range(true)
+                        .speed(10.0)
+                        .suffix(" pts")
+                );
             });
 
             let duration = self.total_samples as f64 / self.sample_rate as f64;

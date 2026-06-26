@@ -1,4 +1,4 @@
-use egui_plot::{Line, Legend, Plot, PlotPoint};
+use egui_plot::{Line, Legend, Plot, PlotBounds, PlotPoint, Points};
 use crate::pipeline::sample::{Sample, ValueType};
 
 /// 在数据跳变点插入阶梯点，使折线图渲染为阶梯波形（适用于数字信号）
@@ -21,82 +21,43 @@ fn insert_step_points(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     result
 }
 
-/// LTTB (Largest Triangle Three Buckets) 降采样
+/// 均匀步进降采样
 ///
-/// 将 N 个数据点降采样到 M 个点（M < N），同时保留波形的峰谷特征。
-/// 适用于将 200K 采样点压缩到屏幕宽度（~1920px × 3 = 5760 点）。
+/// 将 N 个数据点降采样到 threshold 个点，通过等间隔选取原始点实现。
+/// 保证选出的点在 X 轴上严格等间隔分布，适用于需要一致采样间隔显示的场景。
 ///
-/// 算法：
-/// 1. 将数据分成 M-2 个桶（首尾点保留）
-/// 2. 每个桶选一个点，使它与前一个选中点和下一个桶的平均点构成最大三角形面积
+/// 与 LTTB（按三角形面积选点）不同，本算法不依赖波形特征选点，
+/// 因此显示的采样点间隔完全一致，不会因数据量变化或窗口缩放而改变。
+///
+/// 算法：计算步进 stride = (n-1)/(threshold-1)，按 stride 等间隔选取索引。
 ///
 /// 参数:
 /// - `data`: 原始数据切片 [x, y]
 /// - `threshold`: 目标点数
-pub fn lttb_downsample(data: &[[f64; 2]], threshold: usize) -> Vec<[f64; 2]> {
+pub fn uniform_downsample(data: &[[f64; 2]], threshold: usize) -> Vec<[f64; 2]> {
     let n = data.len();
     if n <= threshold || threshold < 3 {
         return data.to_vec();
     }
 
     let mut result = Vec::with_capacity(threshold);
-    result.push(data[0]); // 首点保留
+    let stride = (n - 1) as f64 / (threshold - 1) as f64;
 
-    // 使用整数运算计算桶边界，避免浮点精度问题
-    let denom = threshold - 2;
-    let range = n - 2;
-    let mut prev_selected = 0usize;
-
-    for i in 0..(threshold - 2) {
-        // 当前桶范围 [bucket_start, bucket_end)
-        let bucket_start = i * range / denom + 1;
-        let bucket_end = (((i + 1) * range / denom) + 1).min(n - 1);
-        let bucket_end = bucket_end.max(bucket_start + 1);
-
-        // 下一个桶范围（用于计算平均点）
-        let next_start = bucket_end;
-        let next_end = (((i + 2) * range / denom) + 1).min(n);
-
-        // 下一个桶的平均点
-        let next_len = (next_end - next_start).max(1);
-        let next_avg_x: f64 = data[next_start..next_end]
-            .iter()
-            .map(|p| p[0])
-            .sum::<f64>()
-            / next_len as f64;
-        let next_avg_y: f64 = data[next_start..next_end]
-            .iter()
-            .map(|p| p[1])
-            .sum::<f64>()
-            / next_len as f64;
-
-        // 在当前桶中选三角形面积最大的点
-        let mut max_area = -1.0f64;
-        let mut max_idx = bucket_start;
-
-        for j in bucket_start..bucket_end {
-            let area = triangle_area(
-                data[prev_selected][0], data[prev_selected][1],
-                data[j][0], data[j][1],
-                next_avg_x, next_avg_y,
-            );
-            if area > max_area {
-                max_area = area;
-                max_idx = j;
-            }
-        }
-
-        result.push(data[max_idx]);
-        prev_selected = max_idx;
+    for i in 0..threshold {
+        let idx = (i as f64 * stride).round() as usize;
+        result.push(data[idx.min(n - 1)]);
     }
 
-    result.push(data[n - 1]); // 尾点保留
     result
 }
 
-/// 计算三点构成的三角形面积（绝对值）
-fn triangle_area(x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> f64 {
-    ((x1 - x3) * (y2 - y1) - (x1 - x2) * (y3 - y1)).abs()
+/// 波形显示模式
+#[derive(Clone, Copy, PartialEq)]
+pub enum WaveformDisplayMode {
+    /// 连线模式：将采样点用线段连接起来（默认）
+    Line,
+    /// 散点模式：仅显示采样点，不连接
+    Point,
 }
 
 /// 单通道波形线信息
@@ -123,8 +84,14 @@ pub struct WaveformPanel {
     cache_buffer_len: usize,
     /// 上一帧的可视 X 范围（秒），用于动态 X 轴标签
     last_x_range: Option<f64>,
+    /// 上一帧的 X 轴右边界，用于检测用户拖拽/缩放
+    last_x_max: Option<f64>,
     /// 是否需要自动调整 Y 轴范围
     auto_fit_y: bool,
+    /// 是否自动滚动跟随最新数据
+    auto_scroll: bool,
+    /// 波形显示模式（连线 / 散点）
+    display_mode: WaveformDisplayMode,
 }
 
 impl WaveformPanel {
@@ -133,6 +100,7 @@ impl WaveformPanel {
         channel_colors: Vec<egui::Color32>,
         interval_us: f64,
         value_types: Vec<ValueType>,
+        display_mode: WaveformDisplayMode,
     ) -> Self {
         let n = channel_names.len();
         let channels = channel_names
@@ -147,7 +115,10 @@ impl WaveformPanel {
             cached_points: vec![Vec::new(); n],
             cache_buffer_len: 0,
             last_x_range: None,
-            auto_fit_y: false,
+            last_x_max: None,
+            auto_fit_y: true, // 首次渲染自动调整 Y 轴
+            auto_scroll: true,
+            display_mode,
         }
     }
 
@@ -190,6 +161,30 @@ impl WaveformPanel {
             format!("Value ({})", labels.join("/"))
         };
 
+        // --- 波形工具栏 ---
+        ui.horizontal(|ui| {
+            let follow_text = if self.auto_scroll {
+                "\u{23f8} Follow: ON"
+            } else {
+                "\u{25b6} Follow: OFF"
+            };
+            if ui.button(follow_text).clicked() {
+                self.auto_scroll = !self.auto_scroll;
+            }
+            ui.separator();
+            if ui.button("Auto Fit Y").clicked() {
+                self.auto_fit_y = true;
+            }
+            ui.separator();
+            ui.label(format!(
+                "Window: {} pts ({:.3}s)",
+                buffer.len(),
+                buffer.len() as f64 * self.interval_us / 1_000_000.0
+            ));
+        });
+
+        // 始终允许缩放/拖拽，auto_scroll 只决定 X 轴是否跟随最新数据
+        let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
         let auto_fit = self.auto_fit_y;
         self.auto_fit_y = false; // 一次性触发
@@ -205,16 +200,53 @@ impl WaveformPanel {
             .allow_scroll(true);
 
         if auto_fit {
-            plot = plot.auto_bounds(egui::Vec2b::new(false, true));
+            plot = plot.auto_bounds(egui::Vec2b::new(true, true));
         }
 
+        // 准备自动滚动参数
+        let interval_us = self.interval_us;
+        let buffer_len = buffer.len();
+        let latest_ts = buffer.last().map(|s| s.timestamp_sec).unwrap_or(0.0);
+        // 记录上一帧的 X 轴右边界，用于检测用户是否拖拽/缩放
+        let prev_x_max = self.last_x_max;
+
         let plot_response = plot.show(ui, |plot_ui| {
-            // 捕获鼠标坐标（用于光标点击）
-            let pointer_coord = plot_ui.pointer_coordinate();
+            let cur_bounds = plot_ui.plot_bounds();
+            let cur_x_max = cur_bounds.max()[0];
+
+            // 用户拖拽/缩放检测：如果 X 轴右边界偏离了最新时间戳（超过半个窗口），
+            // 说明用户在手动操作，自动暂停跟随
+            if auto_scroll && buffer_len > 0 {
+                let window_duration = buffer_len as f64 * interval_us / 1_000_000.0;
+                if let Some(prev) = prev_x_max {
+                    // X 右边界变化超过 1% 窗口时长 → 用户在操作
+                    let drift = (cur_x_max - prev).abs();
+                    if drift > window_duration * 0.01 {
+                        self.auto_scroll = false;
+                    }
+                }
+            }
+
+            // 自动滚动：仅在 auto_scroll 开启时设置 X 轴范围
+            // Y 轴范围始终由用户/缩放控制，不覆盖
+            if auto_scroll && buffer_len > 0 {
+                let window_duration = buffer_len as f64 * interval_us / 1_000_000.0;
+                let new_bounds = PlotBounds::from_min_max(
+                    [latest_ts - window_duration, cur_bounds.min()[1]],
+                    [latest_ts, cur_bounds.max()[1]],
+                );
+                plot_ui.set_plot_bounds(new_bounds);
+                self.last_x_max = Some(latest_ts);
+            } else {
+                self.last_x_max = Some(cur_x_max);
+            }
 
             // 记录可视范围（用于下一帧的 X 轴标签）
             let bounds = plot_ui.plot_bounds();
             self.last_x_range = Some(bounds.max()[0] - bounds.min()[0]);
+
+            // 捕获鼠标坐标（用于光标点击）
+            let pointer_coord = plot_ui.pointer_coordinate();
 
             // 渲染各通道波形（零拷贝借用缓存数据）
             for (ch_idx, ch) in self.channels.iter().enumerate() {
@@ -225,12 +257,24 @@ impl WaveformPanel {
                 if points.is_empty() {
                     continue;
                 }
-                plot_ui.line(
-                    Line::new(points.as_slice())
-                        .name(&ch.name)
-                        .color(ch.color)
-                        .width(1.5),
-                );
+                match self.display_mode {
+                    WaveformDisplayMode::Line => {
+                        plot_ui.line(
+                            Line::new(points.as_slice())
+                                .name(&ch.name)
+                                .color(ch.color)
+                                .width(1.5),
+                        );
+                    }
+                    WaveformDisplayMode::Point => {
+                        plot_ui.points(
+                            Points::new(points.as_slice())
+                                .name(&ch.name)
+                                .color(ch.color)
+                                .radius(1.5),
+                        );
+                    }
+                }
             }
 
             // 检测点击 → 放置光标
@@ -290,9 +334,9 @@ impl WaveformPanel {
                 })
                 .collect();
 
-            // 降采样
+            // 降采样（均匀步进，保证显示间隔一致）
             let downsampled = if raw_points.len() > target_points {
-                lttb_downsample(&raw_points, target_points)
+                uniform_downsample(&raw_points, target_points)
             } else {
                 raw_points
             };
@@ -357,5 +401,16 @@ impl WaveformPanel {
     pub fn set_interval(&mut self, interval_us: f64) {
         self.interval_us = interval_us;
         self.cache_buffer_len = 0; // 强制重建缓存
+        self.last_x_max = None; // 重置拖拽检测
+    }
+
+    /// 设置波形显示模式
+    pub fn set_display_mode(&mut self, mode: WaveformDisplayMode) {
+        self.display_mode = mode;
+    }
+
+    /// 获取当前波形显示模式
+    pub fn display_mode(&self) -> WaveformDisplayMode {
+        self.display_mode
     }
 }

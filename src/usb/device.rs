@@ -145,7 +145,10 @@ fn has_cmsis_dap_interface(device: &Device<Context>) -> Result<bool> {
 }
 
 /// 打开并返回第一个 CMSIS-DAP v2 设备
-pub fn open_first_device() -> Result<rusb::DeviceHandle<Context>> {
+/// 打开并返回第一个 CMSIS-DAP v2 设备
+///
+/// 返回 (DeviceHandle, interface_num)，调用方负责在释放时 release_interface。
+pub fn open_first_device() -> Result<(rusb::DeviceHandle<Context>, u8)> {
     let context = Context::new()?;
     let devices = context.devices()?;
 
@@ -179,7 +182,7 @@ pub fn open_first_device() -> Result<rusb::DeviceHandle<Context>> {
         let interface_num = find_cmsis_dap_interface_number(&device)?;
         log::info!("claiming interface {}", interface_num);
         handle.claim_interface(interface_num)?;
-        return Ok(handle);
+        return Ok((handle, interface_num));
     }
 
     Err(Error::DeviceNotFound)

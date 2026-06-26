@@ -97,4 +97,29 @@ impl DisplayBuffer {
     pub fn oldest_seq(&self) -> u64 {
         self.offset
     }
+
+    /// 动态调整窗口大小
+    ///
+    /// 新容量小于当前数据量时，丢弃最旧的数据。
+    /// 新容量大于当前数据量时，仅扩容（不补充历史数据）。
+    pub fn set_max_samples(&mut self, max_samples: usize) {
+        self.max_samples = max_samples;
+        let excess = self.samples.len().saturating_sub(self.max_samples);
+        if excess > 0 {
+            self.samples.drain(..excess);
+            self.offset += excess as u64;
+        }
+        // 收缩 Vec 的容量以释放内存
+        self.samples.shrink_to_fit();
+    }
+
+    /// 获取当前窗口容量
+    pub fn max_samples(&self) -> usize {
+        self.max_samples
+    }
+
+    /// 获取最新一个采样点（如果有）
+    pub fn last(&self) -> Option<&Sample> {
+        self.samples.last()
+    }
 }

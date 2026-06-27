@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Gui {
         addresses: vec![],
-        rate: 20000,
+        rate: 10000,
         count: None,
         r#type: None,
         elf: None,

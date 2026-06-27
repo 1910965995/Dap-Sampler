@@ -77,6 +77,41 @@ impl ChannelPanel {
         remove_idx
     }
 
+    /// 紧凑渲染（用于侧边栏变量浏览器下方）
+    ///
+    /// 只显示颜色、名称、可见性切换和移除按钮。
+    pub fn show_compact(&mut self, ui: &mut egui::Ui) -> Option<usize> {
+        let mut remove_idx: Option<usize> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("channel_compact_scroll")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for (i, ch) in self.channels.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(ch.color, "●");
+                        ui.label(&ch.name);
+                        ui.label(
+                            egui::RichText::new(format!("[{}]", ch.value_type.label()))
+                                .small()
+                                .color(egui::Color32::from_rgb(100, 180, 255)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                remove_idx = Some(i);
+                            }
+                            let eye = if ch.visible { "👁" } else { "⊘" };
+                            if ui.small_button(eye).clicked() {
+                                ch.visible = !ch.visible;
+                            }
+                        });
+                    });
+                }
+            });
+
+        remove_idx
+    }
+
     /// 通道数量
     pub fn channel_count(&self) -> usize {
         self.channels.len()

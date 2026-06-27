@@ -54,93 +54,52 @@ impl ControlPanel {
     /// 渲染控制面板，返回用户操作
     ///
     /// 返回 `Some(AcquisitionCommand)` 表示用户点击了按钮。
+    /// 仅渲染采集控制按钮和参数输入；采样计数/实际率/进度由顶部状态栏显示。
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<AcquisitionCommand> {
         let mut cmd = None;
 
-        ui.horizontal(|ui| {
-            // 开始/暂停按钮
-            match self.state {
-                AcquisitionState::Idle | AcquisitionState::Paused => {
-                    if ui.button("▶ Start").clicked() {
-                        cmd = Some(AcquisitionCommand::Start);
-                    }
-                }
-                AcquisitionState::Running => {
-                    if ui.button("⏸ Pause").clicked() {
-                        cmd = Some(AcquisitionCommand::Pause);
-                    }
+        // --- 采集控制按钮 ---
+        match self.state {
+            AcquisitionState::Idle | AcquisitionState::Paused => {
+                if ui.button("\u{25b6} Start").clicked() {
+                    cmd = Some(AcquisitionCommand::Start);
                 }
             }
-
-            // 停止按钮
-            if self.state != AcquisitionState::Idle {
-                if ui.button("⏹ Stop").clicked() {
-                    cmd = Some(AcquisitionCommand::Stop);
+            AcquisitionState::Running => {
+                if ui.button("\u{23f8} Pause").clicked() {
+                    cmd = Some(AcquisitionCommand::Pause);
                 }
             }
+        }
 
+        if self.state != AcquisitionState::Idle {
+            if ui.button("\u{23f9} Stop").clicked() {
+                cmd = Some(AcquisitionCommand::Stop);
+            }
+        }
+
+        ui.separator();
+
+        // --- 参数输入（仅 Idle 时可修改）---
+        let is_idle = self.state == AcquisitionState::Idle;
+        ui.add_enabled_ui(is_idle, |ui| {
+            ui.label("Rate:");
+            ui.add(
+                egui::DragValue::new(&mut self.sample_rate)
+                    .range(RATE_MIN..=RATE_MAX)
+                    .clamp_existing_to_range(true)
+                    .speed(100.0)
+                    .suffix(" Hz")
+            );
             ui.separator();
-
-            // 状态显示
-            let state_text = match self.state {
-                AcquisitionState::Idle => "Idle",
-                AcquisitionState::Running => "Running",
-                AcquisitionState::Paused => "Paused",
-            };
-            ui.label(format!("State: {}", state_text));
-
-            // 采样率：仅在 Idle 时可修改（点击可输入数字，1-30000 Hz）
-            let is_idle = self.state == AcquisitionState::Idle;
-            ui.add_enabled_ui(is_idle, |ui| {
-                ui.label("Rate:");
-                ui.add(
-                    egui::DragValue::new(&mut self.sample_rate)
-                        .range(RATE_MIN..=RATE_MAX)
-                        .clamp_existing_to_range(true)
-                        .speed(100.0)
-                        .suffix(" Hz")
-                );
-            });
-
-            // 显示窗口大小：仅在 Idle 时可修改（点击可输入数字，1-10000 点）
-            ui.add_enabled_ui(is_idle, |ui| {
-                ui.label("Window:");
-                ui.add(
-                    egui::DragValue::new(&mut self.window_size)
-                        .range(WINDOW_MIN..=WINDOW_MAX)
-                        .clamp_existing_to_range(true)
-                        .speed(10.0)
-                        .suffix(" pts")
-                );
-            });
-
-            let duration = self.total_samples as f64 / self.sample_rate as f64;
-            ui.label(format!("Samples: {} ({:.1}s)", self.total_samples, duration));
-
-            // 运行中显示实际采样率
-            if self.state == AcquisitionState::Running && self.actual_rate_hz > 0.0 {
-                let pct = self.actual_rate_hz / self.sample_rate as f64 * 100.0;
-                let rate_label = format!(
-                    "Actual: {:.0} Hz ({:.0}%)",
-                    self.actual_rate_hz, pct
-                );
-                // 实际速率低于目标 90% 时用警告色显示
-                if pct < 90.0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 160, 60),
-                        rate_label,
-                    ).on_hover_text(
-                        "DAP-Link 吞吐量不足，实际采样率低于目标。\n波形时间轴已自动使用真实时间戳，波形形状应正确。\n降低采样率可获得更均匀的采样间隔。"
-                    );
-                } else {
-                    ui.label(rate_label);
-                }
-            }
-
-            if let Some(target) = self.target_count {
-                let pct = (self.total_samples as f64 / target as f64 * 100.0).min(100.0);
-                ui.label(format!("Progress: {:.0}%", pct));
-            }
+            ui.label("Window:");
+            ui.add(
+                egui::DragValue::new(&mut self.window_size)
+                    .range(WINDOW_MIN..=WINDOW_MAX)
+                    .clamp_existing_to_range(true)
+                    .speed(10.0)
+                    .suffix(" pts")
+            );
         });
 
         cmd

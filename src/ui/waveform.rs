@@ -376,6 +376,12 @@ impl WaveformPanel {
         self.display_mode = mode;
     }
 
+    /// 设置 Follow (auto_scroll) 状态。
+    /// 点击 Stop 时调用 set_follow(false) 让 X 轴停在当前位置,不再跟随最新数据。
+    pub fn set_follow(&mut self, on: bool) {
+        self.auto_scroll = on;
+    }
+
     /// 获取当前波形显示模式
     pub fn display_mode(&self) -> WaveformDisplayMode {
         self.display_mode

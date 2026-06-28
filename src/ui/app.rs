@@ -704,6 +704,11 @@ impl eframe::App for DapSamplerApp {
             }
         });
 
+        // 非 Running 状态时强制关闭 Follow,让 X 轴停在当前位置
+        if self.controls.state != AcquisitionState::Running {
+            self.waveform.set_follow(false);
+        }
+
         ctx.request_repaint();
     }
 

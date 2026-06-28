@@ -116,13 +116,8 @@ impl WaveformPanel {
             None => "Time (s)".to_string(),
         };
 
-        // Y 轴标签带类型信息
-        let y_label = if self.value_types.iter().all(|t| *t == ValueType::Float) {
-            "Value (float)".to_string()
-        } else {
-            let labels: Vec<&str> = self.value_types.iter().map(|t| t.label()).collect();
-            format!("Value ({})", labels.join("/"))
-        };
+        // Y 轴标签
+        let y_label = "Value".to_string();
 
         // --- 波形工具栏 ---
         ui.horizontal(|ui| {

@@ -161,6 +161,17 @@ impl WatchPanel {
 
     /// 渲染 Watch 面板（Excel 风格带边框表格）
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // 顶部标题
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Watch Window")
+                    .font(egui::FontId::proportional(13.0))
+                    .strong()
+                    .color(egui::Color32::from_rgb(45, 48, 55)),
+            );
+        });
+        ui.add_space(2.0);
+
         if self.entries.is_empty() {
             ui.label("No watch variables");
             return;

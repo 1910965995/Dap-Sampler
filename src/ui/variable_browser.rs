@@ -86,7 +86,7 @@ impl VariableBrowser {
                         );
                     }
 
-                    // 单行：Checkbox + 变量名 + 右对齐地址
+                    // 单行：Checkbox + 变量名
                     let indent = if var.parent_path.is_some() { 20.0 } else { 8.0 };
 
                     ui.horizontal(|ui| {
@@ -100,18 +100,6 @@ impl VariableBrowser {
                             }
                             changes.push((var.path.clone(), is_checked));
                         }
-
-                        // 右对齐地址
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("0x{:08X}", var.address))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(140, 140, 140)),
-                                );
-                            },
-                        );
                     });
                 }
             });

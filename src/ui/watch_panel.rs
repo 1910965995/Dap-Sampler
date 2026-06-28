@@ -45,7 +45,7 @@ pub struct WatchEntry {
 }
 
 /// 默认列宽 (px): Name | Address | Type | Value | Refresh (s) | Y Offset | Y Scale | Remark
-const DEFAULT_COL_WIDTHS: [f32; 8] = [130.0, 112.5, 70.0, 130.0, 80.0, 120.0, 120.0, 240.0];
+const DEFAULT_COL_WIDTHS: [f32; 8] = [130.0, 112.5, 100.0, 130.0, 80.0, 120.0, 120.0, 240.0];
 
 /// Watch 面板（示波器下方）
 ///

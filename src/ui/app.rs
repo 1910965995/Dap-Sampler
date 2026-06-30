@@ -731,7 +731,13 @@ impl eframe::App for DapSamplerApp {
             self.waveform.set_follow(false);
         }
 
-        ctx.request_repaint();
+        // 仅在需要持续刷新时请求重绘：
+        // - 采集中：波形需要持续更新
+        // - 有新数据：确保最后一帧数据被绘制
+        // Idle 状态时让 egui 进入低功耗等待模式，避免 CPU 100% 占用
+        if self.controls.state == AcquisitionState::Running || has_new_data {
+            ctx.request_repaint();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

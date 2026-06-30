@@ -84,15 +84,13 @@ impl PipelineEngine {
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
         let start_time = Instant::now();
 
-        // 共享时间戳队列：提交线程为每个采样点计算理想网格时间戳
-        // （seq * interval_us），接收线程从中取出对应的时间戳。
-        // 时间戳完全由采样率和序号决定，不受 USB 写入/响应抖动影响，
-        // 保证显示的采样间隔严格一致。
-        let ts_queue: Arc<Mutex<VecDeque<f64>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
+        // 时间戳完全由接收线程的 seq 计算：
+        //   timestamp = seq * interval_us / 1_000_000
+        // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
+        // 保证显示的采样间隔严格一致。无需跨线程队列传递。
 
-        let submit = self.spawn_submit_thread(start_time, Arc::clone(&ts_queue))?;
-        let collect = self.spawn_collect_thread(Arc::clone(&ring), start_time, ts_queue)?;
+        let submit = self.spawn_submit_thread(start_time)?;
+        let collect = self.spawn_collect_thread(Arc::clone(&ring))?;
 
         Ok(PipelineHandle {
             submit_handle: submit,
@@ -107,7 +105,6 @@ impl PipelineEngine {
     fn spawn_submit_thread(
         &self,
         start_time: Instant,
-        ts_queue: Arc<Mutex<VecDeque<f64>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
@@ -136,19 +133,6 @@ impl PipelineEngine {
                 let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
-                    // --- 使用理想网格时间作为时间戳 ---
-                    // 时间戳 = seq * interval_us，完全由采样率和序号决定，
-                    // 不受 USB 写入耗时波动影响，保证显示间隔严格一致。
-                    let ideal_ts = (interval_us * seq) as f64 / 1_000_000.0;
-                    if let Ok(mut q) = ts_queue.lock() {
-                        q.push_back(ideal_ts);
-                        // 防止队列无限增长（异常情况保护）
-                        let excess = q.len().saturating_sub(10_000);
-                        if excess > 0 {
-                            q.drain(0..excess);
-                        }
-                    }
-
                     // --- 构造 DAP_Transfer 命令 ---
                     // 检查是否有待写入的请求，有则附加到命令前部。
                     // 限制每轮消耗的写入数，确保 total_requests 不超过
@@ -233,13 +217,12 @@ impl PipelineEngine {
     fn spawn_collect_thread(
         &self,
         ring: Arc<RingBuffer>,
-        start_time: Instant,
-        ts_queue: Arc<Mutex<VecDeque<f64>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
         let addresses = self.addresses.clone();
         let num_vars = addresses.len();
+        let interval_us = self.interval_us;
 
         let handle = thread::Builder::new()
             .name("dap-collect".into())
@@ -287,8 +270,6 @@ impl PipelineEngine {
                             Ok(r) => r,
                             Err(e) => {
                                 log::error!("接收线程解析失败 (seq={}): {}", seq, e);
-                                // 即使解析失败也要 pop 时间戳，保持与提交线程同步
-                                let _ = ts_queue.lock().ok().and_then(|mut q| q.pop_front());
                                 seq += 1;
                                 continue;
                             }
@@ -299,18 +280,13 @@ impl PipelineEngine {
                                 "接收线程收到非 OK 状态 (seq={}): status={}, count={}",
                                 seq, resp.status, resp.count
                             );
-                            // 非正常状态也 pop 时间戳，保持同步
-                            let _ = ts_queue.lock().ok().and_then(|mut q| q.pop_front());
                             seq += 1;
                             continue;
                         }
 
-                        // 从提交线程的时间戳队列中取出对应的理想网格时间戳。
-                        let timestamp_sec = ts_queue
-                            .lock()
-                            .ok()
-                            .and_then(|mut q| q.pop_front())
-                            .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
+                        // 时间戳完全由 seq 计算（理想网格时间戳），
+                        // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
+                        let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
 
                         let sample = Sample {
                             seq,

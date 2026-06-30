@@ -12,6 +12,13 @@ use crate::dap::commands::*;
 use super::sample::Sample;
 use super::ring_buffer::RingBuffer;
 
+/// 单次 DAP_Transfer 命令的最大请求数（保守上限，避免超过 USB 包大小）
+///
+/// CMSIS-DAP v2 单包请求受 packet_size 限制。每个请求 5 字节
+/// （1 字节 request + 4 字节 data），64 个请求 = 320 字节，远小于
+/// 典型 packet_size (512/1024)。同时避免 total_requests as u8 截断。
+const MAX_TRANSFER_REQUESTS: usize = 64;
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -143,11 +150,18 @@ impl PipelineEngine {
                     }
 
                     // --- 构造 DAP_Transfer 命令 ---
-                    // 检查是否有待写入的请求，有则附加到命令前部
-                    let mut pending_writes: Vec<(u32, u32)> = Vec::new();
+                    // 检查是否有待写入的请求，有则附加到命令前部。
+                    // 限制每轮消耗的写入数，确保 total_requests 不超过
+                    // MAX_TRANSFER_REQUESTS（避免 u8 截断 + USB 包超限）。
+                    let max_writes = (MAX_TRANSFER_REQUESTS.saturating_sub(requests.len())) / 2;
+                    let mut pending_writes: Vec<(u32, u32)> = Vec::with_capacity(max_writes);
                     if let Ok(mut wq) = write_queue.lock() {
-                        while let Some((addr, data)) = wq.pop_front() {
-                            pending_writes.push((addr, data));
+                        while pending_writes.len() < max_writes {
+                            if let Some((addr, data)) = wq.pop_front() {
+                                pending_writes.push((addr, data));
+                            } else {
+                                break;
+                            }
                         }
                     }
 
@@ -155,6 +169,8 @@ impl PipelineEngine {
                     // 写入: write TAR + write DRW (2 requests, 无返回数据)
                     // 读取: write TAR + read DRW (2 requests, 1 返回数据)
                     let total_requests = requests.len() + pending_writes.len() * 2;
+                    // 安全断言：total_requests 必须在 u8 范围内
+                    debug_assert!(total_requests <= MAX_TRANSFER_REQUESTS);
                     let mut cmd = vec![DAP_TRANSFER, dap_index, total_requests as u8];
 
                     // 先写入请求

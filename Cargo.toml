@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "dap-sampler"
 version = "0.1.0"
 edition = "2021"
@@ -24,3 +24,7 @@ gimli = { version = "0.31", default-features = false, features = ["read", "std"]
 
 # P4: 文件对话框
 rfd = "0.15"
+
+[build-dependencies]
+# 嵌入 Windows exe 图标
+winres = "0.1"

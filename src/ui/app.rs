@@ -58,6 +58,8 @@ pub struct DapSamplerApp {
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
     rate_hz: u32,
+    /// SWD 时钟频率（MHz），由 ControlPanel 修改后同步到本字段
+    swd_clock_mhz: u32,
     /// 当前采集的通道地址列表（与通道一一对应，用于 Watch 写入）
     current_addresses: Vec<u32>,
     #[allow(dead_code)]
@@ -76,6 +78,7 @@ impl DapSamplerApp {
         target_count: Option<u64>,
         elf_ctx: Option<ElfContext>,
         manual_types: Vec<ValueType>,
+        swd_clock_mhz: u32,
     ) -> Self {
         let interval_us = 1_000_000.0 / rate_hz as f64;
 
@@ -146,6 +149,7 @@ impl DapSamplerApp {
             manual_channel_names,
             manual_value_types,
             rate_hz,
+            swd_clock_mhz,
             current_addresses: Vec::new(),
             target_count,
             display_mode,
@@ -209,7 +213,8 @@ impl DapSamplerApp {
                     return;
                 }
             };
-            if let Err(e) = swd.init() {
+            let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
+            if let Err(e) = swd.init_with_clock(clock_hz) {
                 log::error!("SWD 初始化失败: {}", e);
                 return;
             }
@@ -370,7 +375,8 @@ impl DapSamplerApp {
             // 采集未运行时，直接通过 SwdLink 写入
             match SwdLink::new() {
                 Ok(mut swd) => {
-                    if let Err(e) = swd.init() {
+                    let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
+                    if let Err(e) = swd.init_with_clock(clock_hz) {
                         log::error!("写入前 SWD 初始化失败: {}", e);
                         return;
                     }
@@ -681,6 +687,12 @@ impl eframe::App for DapSamplerApp {
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
                     log::info!("采样率已变更为 {} Hz", self.rate_hz);
+                }
+
+                // 检测 SWD 时钟变化（仅记录日志，下次连接时生效）
+                if self.controls.swd_clock_mhz != self.swd_clock_mhz {
+                    self.swd_clock_mhz = self.controls.swd_clock_mhz;
+                    log::info!("SWD 时钟已变更为 {} MHz（下次连接 DAP-Link 时生效）", self.swd_clock_mhz);
                 }
 
                 // 检测窗口大小变化

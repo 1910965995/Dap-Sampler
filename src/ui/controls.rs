@@ -29,14 +29,19 @@ pub struct ControlPanel {
     pub actual_rate_hz: f64,
     /// 显示窗口大小（采样点数），超过则丢弃旧数据
     pub window_size: usize,
+    /// SWD 时钟频率（MHz）
+    pub swd_clock_mhz: u32,
 }
 
 /// 采样率范围
 pub const RATE_MIN: u32 = 1;
-pub const RATE_MAX: u32 = 15_000;
+pub const RATE_MAX: u32 = 100_000;
 /// 窗口大小范围
 pub const WINDOW_MIN: usize = 1;
-pub const WINDOW_MAX: usize = 10_000;
+pub const WINDOW_MAX: usize = 100_000;
+
+/// SWD 时钟可选档位（MHz）
+pub const SWD_CLOCK_OPTIONS: &[u32] = &[1, 2, 5, 10, 20, 30, 50];
 
 impl ControlPanel {
     pub fn new(sample_rate: u32, target_count: Option<u64>) -> Self {
@@ -48,6 +53,7 @@ impl ControlPanel {
             target_count,
             actual_rate_hz: 0.0,
             window_size: 2000,
+            swd_clock_mhz: 10,
         }
     }
 
@@ -100,6 +106,15 @@ impl ControlPanel {
                     .speed(10.0)
                     .suffix(" pts")
             );
+            ui.separator();
+            ui.label("SWD Clock:");
+            egui::ComboBox::from_id_salt("swd_clock_combo")
+                .selected_text(format!("{} MHz", self.swd_clock_mhz))
+                .show_ui(ui, |ui| {
+                    for &mhz in SWD_CLOCK_OPTIONS {
+                        ui.selectable_value(&mut self.swd_clock_mhz, mhz, format!("{} MHz", mhz));
+                    }
+                });
         });
 
         cmd

@@ -15,7 +15,11 @@ enum Command {
     /// 列出所有连接的 CMSIS-DAP 设备
     List,
     /// 连接设备并显示调试信息
-    Info,
+    Info {
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
+    },
     /// 读取指定内存地址的值
     Read {
         /// 内存地址（十六进制，如 0x20000100）
@@ -23,6 +27,23 @@ enum Command {
         /// 解析为 float 类型
         #[arg(long)]
         float: bool,
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
+    },
+    /// 写入指定内存地址的值
+    Write {
+        /// 内存地址（十六进制，如 0x20000100）
+        address: String,
+        /// 要写入的值（u32 十六进制/十进制，或 float 当 --float 时）
+        #[arg(long)]
+        value: String,
+        /// 将值解析为 float 类型
+        #[arg(long)]
+        float: bool,
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
     },
     /// 连续监视内存地址
     Monitor {
@@ -37,6 +58,9 @@ enum Command {
         /// 解析为 float 类型
         #[arg(long)]
         float: bool,
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
     },
     /// 高速流水线采样（P2），支持多变量
     Sample {
@@ -59,6 +83,10 @@ enum Command {
         /// 输出 CSV 文件路径（默认输出到 stdout）
         #[arg(long)]
         output: Option<String>,
+
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
     },
     /// 启动 GUI 波形显示（P3/P4）
     Gui {
@@ -84,6 +112,10 @@ enum Command {
         /// ELF 固件文件路径（P4: 启用变量浏览器）
         #[arg(long)]
         elf: Option<String>,
+
+        /// SWD 时钟频率（MHz，1-50）
+        #[arg(long, default_value = "10")]
+        swd_clock: u32,
     },
 }
 
@@ -100,16 +132,18 @@ fn main() -> anyhow::Result<()> {
         count: None,
         r#type: None,
         elf: None,
+        swd_clock: 10,
     }) {
         Command::List => cmd_list(),
-        Command::Info => cmd_info(),
-        Command::Read { address, float } => cmd_read(&address, float),
-        Command::Monitor { address, rate, count, float } => cmd_monitor(&address, rate, count, float),
-        Command::Sample { addresses, rate, count, float, output } => {
-            cmd_sample(&addresses, rate, count, float, output.as_deref())
+        Command::Info { swd_clock } => cmd_info(swd_clock),
+        Command::Read { address, float, swd_clock } => cmd_read(&address, float, swd_clock),
+        Command::Write { address, value, float, swd_clock } => cmd_write(&address, &value, float, swd_clock),
+        Command::Monitor { address, rate, count, float, swd_clock } => cmd_monitor(&address, rate, count, float, swd_clock),
+        Command::Sample { addresses, rate, count, float, output, swd_clock } => {
+            cmd_sample(&addresses, rate, count, float, output.as_deref(), swd_clock)
         }
-        Command::Gui { addresses, rate, count, r#type, elf } => {
-            cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref())
+        Command::Gui { addresses, rate, count, r#type, elf, swd_clock } => {
+            cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref(), swd_clock)
         }
     }
 }
@@ -135,11 +169,12 @@ fn cmd_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info() -> anyhow::Result<()> {
+fn cmd_info(swd_clock_mhz: u32) -> anyhow::Result<()> {
     println!("🔌 正在连接 DAP-Link...");
     let mut swd = SwdLink::new()?;
-    println!("⚡ 正在初始化 SWD...");
-    let device_info = swd.init()?;
+    println!("⚡ 正在初始化 SWD @ {} MHz ...", swd_clock_mhz);
+    let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
+    let device_info = swd.init_with_clock(clock_hz)?;
 
     println!();
     println!("✅ 连接成功!");
@@ -153,12 +188,13 @@ fn cmd_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_read(address: &str, as_float: bool) -> anyhow::Result<()> {
+fn cmd_read(address: &str, as_float: bool, swd_clock_mhz: u32) -> anyhow::Result<()> {
     let addr = parse_address(address)?;
 
     println!("🔌 正在连接 DAP-Link...");
     let mut swd = SwdLink::new()?;
-    swd.init()?;
+    let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
+    swd.init_with_clock(clock_hz)?;
 
     if as_float {
         let value = swd.read_float(addr)?;
@@ -173,13 +209,38 @@ fn cmd_read(address: &str, as_float: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_monitor(address: &str, rate: u32, count: Option<u32>, as_float: bool) -> anyhow::Result<()> {
+fn cmd_write(address: &str, value: &str, as_float: bool, swd_clock_mhz: u32) -> anyhow::Result<()> {
+    let addr = parse_address(address)?;
+
+    let (raw_value, display) = if as_float {
+        let v: f32 = value
+            .parse()
+            .map_err(|e| anyhow::anyhow!("无效的 float 值 '{}': {}", value, e))?;
+        (v.to_bits(), format!("{} (float)", v))
+    } else {
+        let v = parse_address(value)?;
+        (v, format!("0x{:08X} ({})", v, v))
+    };
+
+    println!("🔌 正在连接 DAP-Link...");
+    let mut swd = SwdLink::new()?;
+    let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
+    swd.init_with_clock(clock_hz)?;
+
+    swd.write_memory(addr, raw_value)?;
+    println!("✅ 已写入: 0x{:08X} = {}", addr, display);
+
+    Ok(())
+}
+
+fn cmd_monitor(address: &str, rate: u32, count: Option<u32>, as_float: bool, swd_clock_mhz: u32) -> anyhow::Result<()> {
     let addr = parse_address(address)?;
     let interval_us = (1_000_000.0 / rate as f64) as u64;
 
     println!("🔌 正在连接 DAP-Link...");
     let mut swd = SwdLink::new()?;
-    swd.init()?;
+    let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
+    swd.init_with_clock(clock_hz)?;
 
     println!("📈 开始监视 0x{:08X} @ {} Hz (间隔 {} us)", addr, rate, interval_us);
     if as_float {
@@ -238,6 +299,7 @@ fn cmd_sample(
     count: Option<u64>,
     as_float: bool,
     output_path: Option<&str>,
+    swd_clock_mhz: u32,
 ) -> anyhow::Result<()> {
     use std::io::Write;
     use dap_sampler::pipeline::engine::PipelineEngine;
@@ -257,7 +319,8 @@ fn cmd_sample(
 
     println!("\u{1f50c} 正在连接 DAP-Link...");
     let mut swd = SwdLink::new()?;
-    swd.init()?;
+    let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
+    swd.init_with_clock(clock_hz)?;
 
     let (usb, dap) = swd.into_parts();
 
@@ -359,6 +422,7 @@ fn cmd_gui(
     count: Option<u64>,
     type_strs: Option<&[String]>,
     elf_path: Option<&str>,
+    swd_clock_mhz: u32,
 ) -> anyhow::Result<()> {
     use dap_sampler::ui::app::DapSamplerApp;
     use dap_sampler::elf::ElfParser;
@@ -410,6 +474,7 @@ fn cmd_gui(
         count,
         elf_ctx,
         manual_types,
+        swd_clock_mhz,
     );
 
     let options = eframe::NativeOptions {

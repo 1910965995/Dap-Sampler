@@ -47,7 +47,9 @@ impl SwdLink {
     // SWD 初始化流程
     // --------------------------------------------------------
     /// 完整的 SWD 初始化序列（精确匹配 Keil USB 抓包流程）
-    pub fn init(&mut self) -> Result<DeviceInfo> {
+    ///
+    /// `swd_clock_hz` 为目标 SWD 时钟频率（Hz），常用值：1M/2M/5M/10M/20M/30M/50M。
+    pub fn init_with_clock(&mut self, swd_clock_hz: u32) -> Result<DeviceInfo> {
         info!("=== SWD 初始化开始 ===");
 
         // 0. 先断开之前可能残留的连接（清理 DAP-Link 状态）
@@ -64,8 +66,8 @@ impl SwdLink {
         // 2. SWD 连接
         self.swd_connect()?;
 
-        // 3. 设置 SWD 时钟（10MHz，与 Keil 抓包一致）
-        let clock = 10_000_000u32;
+        // 3. 设置 SWD 时钟（由调用方指定，单位 Hz）
+        let clock = swd_clock_hz;
         let cmd = self.dap.build_clock_request(clock);
         self.usb.write(&cmd)?;
         let n = self.usb.read(&mut buf)?;
@@ -123,6 +125,11 @@ impl SwdLink {
             ap_idr,
             target_info: format!("Cortex-M DPIDR=0x{:08X}", dpidr),
         })
+    }
+
+    /// 使用默认 10 MHz 时钟进行 SWD 初始化（向后兼容包装）
+    pub fn init(&mut self) -> Result<DeviceInfo> {
+        self.init_with_clock(10_000_000)
     }
 
     /// SWD 连接

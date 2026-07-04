@@ -41,7 +41,7 @@
 ## 硬件要求
 
 - **仿真器**：支持 CMSIS-DAP v2（Bulk 传输）的 DAP-Link
-- **目标 MCU**：ARM Cortex-M 系列（STM32 / GD32 / AT32 / AC7840X 等均验证通过）
+- **目标 MCU**：ARM Cortex-M 系列（STM32F103C8T6 / AC7840X 均验证通过）
 - **USB 驱动**：Windows 下需 WinUSB 驱动（可用 [Zadig](https://zadig.akeo.ie/) 安装）
 
 ## 快速开始

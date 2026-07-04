@@ -533,7 +533,8 @@ fn cmd_gui(
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0]),
+            .with_inner_size([1280.0, 720.0])
+            .with_icon(std::sync::Arc::new(load_window_icon())),
         ..Default::default()
     };
 
@@ -547,6 +548,29 @@ fn cmd_gui(
     ).map_err(|e| anyhow::anyhow!("GUI failed: {}", e))?;
 
     Ok(())
+}
+
+/// 加载窗口图标（运行时显示在标题栏/任务栏）。
+///
+/// 图标以 PNG 形式编译期嵌入（include_bytes!），运行时用 image crate 解码为 RGBA。
+/// exe 文件本身的图标由 build.rs + winres 单独嵌入，两者使用同一份源图。
+fn load_window_icon() -> egui::IconData {
+    const ICON_PNG: &[u8] = include_bytes!("../icon/icon_256.png");
+    match image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            }
+        }
+        Err(e) => {
+            log::error!("加载窗口图标失败: {}", e);
+            egui::IconData::default()
+        }
+    }
 }
 
 /// Load a CJK-compatible font from the Windows system so Chinese text renders correctly.

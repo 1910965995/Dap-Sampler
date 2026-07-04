@@ -25,6 +25,9 @@ gimli = { version = "0.31", default-features = false, features = ["read", "std"]
 # P4: 文件对话框
 rfd = "0.15"
 
+# 运行时加载窗口图标（PNG -> RGBA），eframe 已间接依赖 image
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [build-dependencies]
 # 嵌入 Windows exe 图标
 winres = "0.1"

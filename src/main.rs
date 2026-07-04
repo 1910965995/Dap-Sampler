@@ -1,3 +1,7 @@
+// 在 release 模式下使用 GUI 子系统，双击运行不弹控制台窗口。
+// CLI 命令通过 attach_parent_console() 重新挂回父进程控制台以恢复输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use clap::{Parser, Subcommand};
 
 use dap_sampler::dap::swd::SwdLink;
@@ -120,6 +124,11 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // GUI 子系统下，尝试挂回父进程控制台（从 cmd/PowerShell 运行 CLI 命令时恢复输出）。
+    // 双击运行时无父控制台，AttachConsole 失败，静默跳过——GUI 不受影响。
+    #[cfg(windows)]
+    attach_parent_console();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
@@ -144,6 +153,51 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Gui { addresses, rate, count, r#type, elf, swd_clock } => {
             cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref(), swd_clock)
+        }
+    }
+}
+
+/// 在 GUI 子系统下尝试挂回父进程的控制台。
+///
+/// - 从 cmd/PowerShell 运行 CLI 命令时，`AttachConsole` 成功，
+///   随后重定向 stdin/stdout/stderr 到该控制台，CLI 输出恢复正常。
+/// - 双击运行时无父控制台，`AttachConsole` 失败，直接返回——GUI 不受影响。
+#[cfg(windows)]
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+    const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;  // (DWORD)-10
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5; // (DWORD)-11
+    const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4;  // (DWORD)-12
+
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+    }
+    unsafe extern "C" {
+        fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+        fn _dup2(fd1: i32, fd2: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+    }
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return; // 无父控制台（双击运行），静默跳过
+        }
+
+        // 将控制台句柄重定向到 C 运行时的 fd 0/1/2
+        for (std_handle, target_fd) in [
+            (STD_OUTPUT_HANDLE, 1),
+            (STD_ERROR_HANDLE, 2),
+            (STD_INPUT_HANDLE, 0),
+        ] {
+            let h = GetStdHandle(std_handle);
+            if h != -1 && h != 0 {
+                let fd = _open_osfhandle(h, 0);
+                if fd != -1 {
+                    _dup2(fd, target_fd);
+                    _close(fd);
+                }
+            }
         }
     }
 }

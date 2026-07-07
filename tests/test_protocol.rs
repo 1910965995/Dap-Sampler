@@ -264,10 +264,10 @@ fn build_host_status_running_led_on() {
 
 #[test]
 fn build_pins_request() {
-    let cmd = dap().build_pins_request(0x04, 0x04, 100_000);
+    let cmd = dap().build_pins_request(0x80, 0x80, 100_000);
     assert_eq!(cmd[0], DAP_SWJ_PINS);
-    assert_eq!(cmd[1], 0x04); // mask
-    assert_eq!(cmd[2], 0x04); // value
+    assert_eq!(cmd[1], 0x80); // Pin Output: nRESET high
+    assert_eq!(cmd[2], 0x80); // Pin Select: nRESET
     let wait = u32::from_le_bytes([cmd[3], cmd[4], cmd[5], cmd[6]]);
     assert_eq!(wait, 100_000);
 }

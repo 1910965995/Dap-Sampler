@@ -21,8 +21,14 @@ enum Command {
     /// 连接设备并显示调试信息
     Info {
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
+    },
+    /// 诊断 CMSIS-DAP USB 连接、接口、端点和可选 claim
+    Diag {
+        /// 尝试 claim CMSIS-DAP interface 后立即释放（用于检查驱动/权限/占用）
+        #[arg(long)]
+        claim: bool,
     },
     /// 读取指定内存地址的值
     Read {
@@ -32,7 +38,7 @@ enum Command {
         #[arg(long)]
         float: bool,
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
     /// 写入指定内存地址的值
@@ -46,7 +52,7 @@ enum Command {
         #[arg(long)]
         float: bool,
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
     /// 连续监视内存地址
@@ -63,7 +69,7 @@ enum Command {
         #[arg(long)]
         float: bool,
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
     /// 高速流水线采样（P2），支持多变量
@@ -89,7 +95,7 @@ enum Command {
         output: Option<String>,
 
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
     /// 启动 GUI 波形显示（P3/P4）
@@ -118,7 +124,7 @@ enum Command {
         elf: Option<String>,
 
         /// SWD 时钟频率（MHz，1-50）
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
 }
@@ -141,10 +147,11 @@ fn main() -> anyhow::Result<()> {
         count: None,
         r#type: None,
         elf: None,
-        swd_clock: 10,
+        swd_clock: 1,
     }) {
         Command::List => cmd_list(),
         Command::Info { swd_clock } => cmd_info(swd_clock),
+        Command::Diag { claim } => cmd_diag(claim),
         Command::Read { address, float, swd_clock } => cmd_read(&address, float, swd_clock),
         Command::Write { address, value, float, swd_clock } => cmd_write(&address, &value, float, swd_clock),
         Command::Monitor { address, rate, count, float, swd_clock } => cmd_monitor(&address, rate, count, float, swd_clock),
@@ -221,6 +228,91 @@ fn cmd_list() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_diag(claim: bool) -> anyhow::Result<()> {
+    let diagnostics = dap_sampler::usb::device::diagnose_devices(claim)?;
+
+    println!("🔎 CMSIS-DAP USB 诊断");
+    println!("   claim 测试: {}", if claim { "开启" } else { "关闭（使用 --claim 可检查驱动/权限/占用）" });
+    println!();
+
+    if diagnostics.is_empty() {
+        println!("⚠️  未发现 CMSIS-DAP 候选设备");
+        println!("   建议：检查 USB 连接、设备管理器中是否识别到 DAP-Link；");
+        println!("   如果设备是 CMSIS-DAP v1 HID，本工具当前只支持 CMSIS-DAP v2 Bulk。\n");
+        return Ok(());
+    }
+
+    for (i, dev) in diagnostics.iter().enumerate() {
+        println!("[{}] {:04X}:{:04X}  总线={} 地址={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
+        println!("    known VID/PID: {}", yes_no(dev.known_vid_pid));
+        println!("    open:          {}", yes_no(dev.open_ok));
+        if let Some(e) = &dev.open_error {
+            println!("      error: {}", e);
+            println!("      hint:  {}", usb_error_hint(e));
+        }
+        println!("    厂商:          {}", empty_or(&dev.manufacturer));
+        println!("    产品:          {}", empty_or(&dev.product));
+        println!("    序列号:        {}", empty_or(&dev.serial));
+        println!("    product CMSIS: {}", yes_no(dev.product_has_cmsis_dap));
+        println!("    Bulk interface:{}", yes_no(dev.has_bulk_candidate));
+        if let Some(e) = &dev.config_error {
+            println!("      config error: {}", e);
+            println!("      hint:         {}", usb_error_hint(e));
+        }
+        match (dev.interface_number, dev.ep_out, dev.ep_in) {
+            (Some(iface), Some(ep_out), Some(ep_in)) => {
+                println!("      interface: {}", iface);
+                println!("      endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
+            }
+            _ => {
+                println!("      interface: (未找到 CMSIS-DAP v2 Bulk 接口)");
+            }
+        }
+
+        if let Some(ok) = dev.claim_ok {
+            println!("    claim:         {}", yes_no(ok));
+            if let Some(e) = &dev.claim_error {
+                println!("      error: {}", e);
+                println!("      hint:  {}", usb_error_hint(e));
+            }
+        }
+        println!();
+    }
+
+    println!("诊断结论参考：");
+    println!("  - open=false：常见原因是 WinUSB 驱动未安装、权限问题、设备被占用或已断开。");
+    println!("  - Bulk interface=false：可能是 CMSIS-DAP v1 HID，或固件/接口模式不是 CMSIS-DAP v2 Bulk。");
+    println!("  - claim=false：通常是被 Keil/OpenOCD/pyOCD/另一个 dap-sampler 实例占用，或驱动不匹配。");
+    println!("  - USB/claim 正常但 GUI 仍初始化失败：重点检查目标板供电、SWDIO/SWCLK/GND/RESET 接线、芯片读保护、SWD Clock。\n");
+
+    Ok(())
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v { "是" } else { "否" }
+}
+
+fn empty_or(s: &str) -> &str {
+    if s.is_empty() { "(无/无法读取)" } else { s }
+}
+
+fn usb_error_hint(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if lower.contains("access") || lower.contains("权限") || lower.contains("denied") {
+        "检查 Windows 驱动是否为 WinUSB，或是否有权限访问该 USB 接口。"
+    } else if lower.contains("busy") {
+        "设备接口可能被 Keil/OpenOCD/pyOCD/其他程序占用，请关闭后重试。"
+    } else if lower.contains("no device") || lower.contains("not found") {
+        "设备可能已断开、重枚举，或接口/端点不匹配。"
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "设备无响应；检查 USB 线缆、DAP-Link 固件、目标板供电，或尝试重新插拔。"
+    } else if lower.contains("pipe") {
+        "USB 管道错误；可能是端点不匹配、设备固件异常或接口被占用。"
+    } else {
+        "请对比好/坏 DAP-Link 的 diag --claim 输出；重点看 open、Bulk interface、claim 三项。"
+    }
 }
 
 fn cmd_info(swd_clock_mhz: u32) -> anyhow::Result<()> {

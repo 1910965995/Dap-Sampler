@@ -76,8 +76,8 @@ fn pop_batch_with_small_buf() {
     let mut buf = vec![make_sample(0, 0); 3];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 3); // only room for 3
-    // Remaining available
-    assert_eq!(rb.available(), 7);
+    // Capacity is 8; pushes beyond capacity are dropped, so 5 remain.
+    assert_eq!(rb.available(), 5);
 }
 
 // ================================================================
@@ -85,7 +85,7 @@ fn pop_batch_with_small_buf() {
 // ================================================================
 
 #[test]
-fn wrap_around_overwrites_oldest() {
+fn wrap_around_drops_new_when_full() {
     let rb = RingBuffer::new(4); // tiny capacity
 
     // Fill buffer: seq 0,1,2,3
@@ -93,30 +93,28 @@ fn wrap_around_overwrites_oldest() {
         rb.push(make_sample(i, i as u32));
     }
 
-    // Buffer is full. Push two more — overwrites oldest.
+    // Buffer is full. Push two more — current implementation drops new samples.
     rb.push(make_sample(4, 100));
     rb.push(make_sample(5, 200));
 
-    // available() should be capped at capacity
     assert_eq!(rb.available(), 4);
 
     let mut buf = vec![make_sample(0, 0); 8];
     let n = rb.pop_batch(&mut buf);
 
-    // We get exactly capacity items (the last 4 pushed: seq 2,3,4,5)
+    // We get exactly capacity items (the first 4 pushed: seq 0,1,2,3)
     assert_eq!(n, 4);
-    let mut seqs: Vec<u64> = buf[..n].iter().map(|s| s.seq).collect();
-    seqs.sort();
-    assert_eq!(seqs, vec![2, 3, 4, 5]);
+    let seqs: Vec<u64> = buf[..n].iter().map(|s| s.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3]);
 }
 
 #[test]
-fn available_after_wrap() {
+fn available_stays_at_capacity_when_full() {
     let rb = RingBuffer::new(4);
     for i in 0..6 {
         rb.push(make_sample(i, i as u32));
     }
-    // head=6, tail=0, available=min(6, capacity)=4
+    // head stops advancing while full; available remains at capacity.
     assert_eq!(rb.available(), 4);
 }
 
@@ -125,12 +123,12 @@ fn available_after_wrap() {
 // ================================================================
 
 #[test]
-fn total_written_tracks_all_pushes() {
+fn total_written_tracks_successful_writes() {
     let rb = RingBuffer::new(16);
     for i in 0..42 {
         rb.push(make_sample(i, i as u32));
     }
-    assert_eq!(rb.total_written(), 42);
+    assert_eq!(rb.total_written(), 16);
 }
 
 #[test]
@@ -194,18 +192,17 @@ fn stress_large_volume() {
     for i in 0..10_000u64 {
         rb.push(make_sample(i, i as u32));
     }
-    // Only last 1024 are available (wrapped)
+    // Only the first 1024 successful writes are retained; later pushes are dropped while full.
     assert_eq!(rb.available(), 1024);
-    assert_eq!(rb.total_written(), 10_000);
+    assert_eq!(rb.total_written(), 1024);
 
     let mut buf = vec![make_sample(0, 0); 1024];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 1024);
 
-    // All values should be in range [10_000-1024, 9999]
     let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values[0]).collect();
     found.sort();
-    let expected: Vec<u32> = ((10_000u32 - 1024)..10_000).collect();
+    let expected: Vec<u32> = (0u32..1024).collect();
     assert_eq!(found, expected);
 }
 

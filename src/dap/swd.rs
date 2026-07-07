@@ -92,28 +92,42 @@ impl SwdLink {
         let n = self.usb.read(&mut buf)?;
         DapProtocol::parse_host_status_response(&buf[..n])?;
 
-        // 7. 读取 DPIDR（DAP_Connect 已做 JTAG-to-SWD 切换，直接读）
+        // 7. 显式发送 SWJ line reset + JTAG-to-SWD + line reset。
+        // 某些定制 CMSIS-DAP（如 HW-Link_META）不会在 DAP_Connect 后自动完成
+        // 目标侧 SWD 序列初始化，直接读 DPIDR 会返回 DAP_TRANSFER_PROTOCOL_ERROR。
+        self.swd_line_reset()?;
+
+        // 7b. SWD idle 周期：在 SWJ 序列结束后发送 8 个 SWCLK 周期（TMS=0），
+        // 让目标侧 SWD 状态机从复位状态退出到 idle。某些定制 DAP-Link（如 HW-Link_META）
+        // 在缺少这段 idle 时第一个 DAP_Transfer 会返回 protocol error (status=7)。
+        // 此序列通过对齐 Keil USB 抓包验证。
+        self.swd_idle_cycles(8)?;
+
+        // 8. 读取 DPIDR
         let dpidr = self.read_dpidr()?;
         info!("DPIDR = 0x{:08X}", dpidr);
 
-        // 8. 再次读取 DPIDR（确认连接稳定）
+        // 8b. 两次 DPIDR 读取之间也需要 idle（对齐 Keil）
+        self.swd_idle_cycles(8)?;
+
+        // 9. 再次读取 DPIDR（确认连接稳定）
         let _ = self.read_dpidr()?;
 
-        // 9. 调试电源上电（写 CTRL/STAT = CSYSPWRUPREQ | CDBGPWRUPREQ）
+        // 10. 调试电源上电（写 CTRL/STAT = CSYSPWRUPREQ | CDBGPWRUPREQ）
         self.power_up_debug()?;
 
-        // 10. 写 DP SELECT = 0
+        // 11. 写 DP SELECT = 0
         let select_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
         let resp = self.dap.execute_transfer(self.usb(), &[select_req])?;
         if resp.status != TRANSFER_OK {
             return Err(Error::Swd("写 SELECT 失败".into()));
         }
 
-        // 11. 扫描 AP
+        // 12. 扫描 AP
         let ap_idr = self.scan_ap()?;
         info!("AP{} IDR = 0x{:08X}", self.ap_index, ap_idr);
 
-        // 12. 验证内存读取（读向量表地址 0x00000000）
+        // 13. 验证内存读取（读向量表地址 0x00000000）
         match self.read_memory(0x00000000) {
             Ok(v) => info!("验证读取 (0x00000000) = 0x{:08X} ✓", v),
             Err(e) => warn!("验证读取失败: {}", e),
@@ -127,9 +141,9 @@ impl SwdLink {
         })
     }
 
-    /// 使用默认 10 MHz 时钟进行 SWD 初始化（向后兼容包装）
+    /// 使用默认 1 MHz 时钟进行 SWD 初始化（向后兼容包装）
     pub fn init(&mut self) -> Result<DeviceInfo> {
-        self.init_with_clock(10_000_000)
+        self.init_with_clock(1_000_000)
     }
 
     /// SWD 连接
@@ -142,21 +156,6 @@ impl SwdLink {
         info!("DAP_Connect 响应 ({} 字节): {:02X?}", n, &buf[..n]);
         let mode = DapProtocol::parse_connect_response(&buf[..n])?;
         info!("DAP_Connect 返回: {}", mode);
-        Ok(())
-    }
-
-    /// 硬件复位目标 MCU (通过 DAP-Link 的 nRESET 引脚)
-    fn hardware_reset(&self) -> Result<()> {
-        info!("脉冲复位目标 MCU...");
-        let mut buf = [0u8; 64];
-        // nRESET = bit 2, 拉低 100ms 再释放
-        let cmd = self.dap.build_pins_request(0x04, 0x00, 100_000); // nRESET低 100ms
-        self.usb.write(&cmd)?;
-        self.usb.read(&mut buf)?;
-        let cmd = self.dap.build_pins_request(0x04, 0x04, 100_000); // nRESET高 100ms
-        self.usb.write(&cmd)?;
-        self.usb.read(&mut buf)?;
-        info!("复位完成");
         Ok(())
     }
 
@@ -185,6 +184,19 @@ impl SwdLink {
         info!("SWJ Line Reset 2 响应 ({} 字节): {:02X?}", n, &buf[..n]);
 
         info!("SWD 序列完成");
+        Ok(())
+    }
+
+    /// 发送 N 个 SWCLK 周期，TMS/SWDIO 保持低电平（SWD idle 周期）。
+    ///
+    /// ARM SWD 协议要求在 JTAG-to-SWD 切换后至少有 2 个 SWCLK 周期
+    /// 让目标侧 DP 从复位状态进入 idle 状态。某些定制 DAP-Link/HW-Link 需
+    /// 更长的 idle（8 个周期），否则第一次 DAP_Transfer 会返回 protocol error。
+    fn swd_idle_cycles(&self, cycles: u8) -> Result<()> {
+        let cmd = vec![DAP_SWJ_SEQUENCE, cycles, 0x00];
+        self.usb.write(&cmd)?;
+        let mut buf = [0u8; 64];
+        let _ = self.usb.read(&mut buf)?;
         Ok(())
     }
 

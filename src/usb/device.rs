@@ -28,6 +28,29 @@ pub struct DeviceInfo {
     pub address: u8,
 }
 
+/// USB 设备诊断信息（用于定位 CMSIS-DAP 连接失败位置）
+#[derive(Debug, Clone)]
+pub struct UsbDeviceDiagnostic {
+    pub vid: u16,
+    pub pid: u16,
+    pub bus_number: u8,
+    pub address: u8,
+    pub known_vid_pid: bool,
+    pub open_ok: bool,
+    pub open_error: Option<String>,
+    pub manufacturer: String,
+    pub product: String,
+    pub serial: String,
+    pub product_has_cmsis_dap: bool,
+    pub has_bulk_candidate: bool,
+    pub config_error: Option<String>,
+    pub interface_number: Option<u8>,
+    pub ep_out: Option<u8>,
+    pub ep_in: Option<u8>,
+    pub claim_ok: Option<bool>,
+    pub claim_error: Option<String>,
+}
+
 /// 列出所有 CMSIS-DAP v2 设备
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let context = Context::new()?;
@@ -142,6 +165,146 @@ fn has_cmsis_dap_interface(device: &Device<Context>) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn find_cmsis_dap_interface_details(device: &Device<Context>) -> Result<Option<(u8, u8, u8)>> {
+    let config = device.config_descriptor(0)?;
+    for interface in config.interfaces() {
+        for alt in interface.descriptors() {
+            if !is_cmsis_dap_candidate(&alt) {
+                continue;
+            }
+
+            let mut ep_out = 0u8;
+            let mut ep_in = 0u8;
+            for ep in alt.endpoint_descriptors() {
+                if ep.transfer_type() != rusb::TransferType::Bulk {
+                    continue;
+                }
+                match ep.direction() {
+                    rusb::Direction::Out => ep_out = ep.address(),
+                    rusb::Direction::In => ep_in = ep.address(),
+                }
+            }
+
+            if ep_out != 0 && ep_in != 0 {
+                return Ok(Some((alt.interface_number(), ep_out, ep_in)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 诊断 USB 总线上的 CMSIS-DAP 候选设备。
+///
+/// 默认只读取描述符和接口信息；`try_claim=true` 时会短暂 claim 候选接口并立即释放，
+/// 用于定位驱动/权限/占用问题。
+pub fn diagnose_devices(try_claim: bool) -> Result<Vec<UsbDeviceDiagnostic>> {
+    let context = Context::new()?;
+    let devices = context.devices()?;
+    let mut result = Vec::new();
+
+    for device in devices.iter() {
+        let desc = device.device_descriptor()?;
+        let vid = desc.vendor_id();
+        let pid = desc.product_id();
+        let known_vid_pid = is_known_device(vid, pid);
+
+        let mut open_ok = false;
+        let mut open_error = None;
+        let mut manufacturer = String::new();
+        let mut product = String::new();
+        let mut serial = String::new();
+        let mut product_has_cmsis_dap = false;
+        let mut handle = None;
+
+        match device.open() {
+            Ok(h) => {
+                open_ok = true;
+                manufacturer = read_string_descriptor(&h, desc.manufacturer_string_index());
+                product = read_string_descriptor(&h, desc.product_string_index());
+                serial = read_string_descriptor(&h, desc.serial_number_string_index());
+                product_has_cmsis_dap = product.to_uppercase().contains("CMSIS-DAP");
+                handle = Some(h);
+            }
+            Err(e) => {
+                open_error = Some(e.to_string());
+            }
+        }
+
+        let mut has_bulk_candidate = false;
+        let mut config_error = None;
+        let mut interface_number = None;
+        let mut ep_out = None;
+        let mut ep_in = None;
+
+        match find_cmsis_dap_interface_details(&device) {
+            Ok(Some((iface, out, inn))) => {
+                has_bulk_candidate = true;
+                interface_number = Some(iface);
+                ep_out = Some(out);
+                ep_in = Some(inn);
+            }
+            Ok(None) => {}
+            Err(e) => config_error = Some(e.to_string()),
+        }
+
+        // 只保留明确的 CMSIS-DAP 候选，避免把普通 Bulk 设备误报为 DAP。
+        // 未知 VID/PID 的设备需要能读取到包含 CMSIS-DAP 的产品字符串。
+        if !known_vid_pid && !product_has_cmsis_dap {
+            continue;
+        }
+
+        let mut claim_ok = None;
+        let mut claim_error = None;
+        if try_claim {
+            match (handle.as_ref(), interface_number) {
+                (Some(h), Some(iface)) => match h.claim_interface(iface) {
+                    Ok(()) => {
+                        claim_ok = Some(true);
+                        if let Err(e) = h.release_interface(iface) {
+                            claim_error = Some(format!("release interface {} 失败: {}", iface, e));
+                        }
+                    }
+                    Err(e) => {
+                        claim_ok = Some(false);
+                        claim_error = Some(e.to_string());
+                    }
+                },
+                (None, _) => {
+                    claim_ok = Some(false);
+                    claim_error = open_error.clone().or_else(|| Some("设备无法打开，无法 claim interface".to_string()));
+                }
+                (_, None) => {
+                    claim_ok = Some(false);
+                    claim_error = Some("未找到 CMSIS-DAP v2 Bulk interface，无法 claim".to_string());
+                }
+            }
+        }
+
+        result.push(UsbDeviceDiagnostic {
+            vid,
+            pid,
+            bus_number: device.bus_number(),
+            address: device.address(),
+            known_vid_pid,
+            open_ok,
+            open_error,
+            manufacturer,
+            product,
+            serial,
+            product_has_cmsis_dap,
+            has_bulk_candidate,
+            config_error,
+            interface_number,
+            ep_out,
+            ep_in,
+            claim_ok,
+            claim_error,
+        });
+    }
+
+    Ok(result)
 }
 
 /// 打开并返回第一个 CMSIS-DAP v2 设备

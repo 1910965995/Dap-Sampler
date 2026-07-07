@@ -44,7 +44,7 @@ pub const WINDOW_MAX: usize = 100_000;
 pub const SWD_CLOCK_OPTIONS: &[u32] = &[1, 2, 5, 10, 20, 30, 50];
 
 impl ControlPanel {
-    pub fn new(sample_rate: u32, target_count: Option<u64>) -> Self {
+    pub fn new(sample_rate: u32, target_count: Option<u64>, swd_clock_mhz: u32) -> Self {
         let sample_rate = sample_rate.clamp(RATE_MIN, RATE_MAX);
         Self {
             state: AcquisitionState::Idle,
@@ -53,7 +53,7 @@ impl ControlPanel {
             target_count,
             actual_rate_hz: 0.0,
             window_size: 2000,
-            swd_clock_mhz: 10,
+            swd_clock_mhz,
         }
     }
 

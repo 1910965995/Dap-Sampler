@@ -68,6 +68,8 @@ pub struct DapSamplerApp {
     display_mode: WaveformDisplayMode,
     /// 显示窗口大小（采样点数）
     window_size: usize,
+    /// 最近一次操作错误（显示在顶部状态栏）
+    last_error: Option<String>,
 }
 
 impl DapSamplerApp {
@@ -134,7 +136,7 @@ impl DapSamplerApp {
             acquisition_start: None,
             display_buf: DisplayBuffer::new(200_000),
             waveform,
-            controls: ControlPanel::new(rate_hz, target_count),
+            controls: ControlPanel::new(rate_hz, target_count, swd_clock_mhz),
             cursor: CursorState::new(),
             temp_buf: (0..1024).map(|_| Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }).collect(),
             interval_us,
@@ -154,10 +156,18 @@ impl DapSamplerApp {
             target_count,
             display_mode,
             window_size: 2000,
+            last_error: None,
         }
     }
 
+    fn set_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::error!("{}", message);
+        self.last_error = Some(message);
+    }
+
     fn start_acquisition(&mut self) {
+        self.last_error = None;
         // 1. 确定要采集的地址和通道信息
         let (addresses, channel_names, channel_colors, types) =
             if !self.manual_addresses.is_empty() {
@@ -172,6 +182,7 @@ impl DapSamplerApp {
                 // ELF 模式：从 channel_panel 动态获取
                 let channels = &self.channel_panel.channels;
                 if channels.is_empty() {
+                    self.set_error("未选择任何采样通道：请加载 ELF 并勾选变量，或通过 --addresses 指定地址");
                     return;
                 }
 
@@ -188,6 +199,7 @@ impl DapSamplerApp {
                     .collect();
 
                 if addresses.is_empty() {
+                    self.set_error("已选择通道但没有找到对应变量地址：请检查 ELF 符号/调试信息是否匹配");
                     return;
                 }
 
@@ -198,6 +210,7 @@ impl DapSamplerApp {
             };
 
         if addresses.is_empty() {
+            self.set_error("未选择任何采样通道：请加载 ELF 并勾选变量，或通过 --addresses 指定地址");
             return;
         }
 
@@ -209,13 +222,13 @@ impl DapSamplerApp {
             let mut swd = match SwdLink::new() {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("连接 DAP-Link 失败: {}", e);
+                    self.set_error(format!("连接 DAP-Link 失败: {}", e));
                     return;
                 }
             };
             let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
             if let Err(e) = swd.init_with_clock(clock_hz) {
-                log::error!("SWD 初始化失败: {}", e);
+                self.set_error(format!("SWD 初始化失败: {}", e));
                 return;
             }
             let (usb, _) = swd.into_parts();
@@ -249,7 +262,7 @@ impl DapSamplerApp {
                 self.controls.set_running();
                 self.acquisition_start = Some(Instant::now());
             }
-            Err(e) => log::error!("启动采集失败: {}", e),
+            Err(e) => self.set_error(format!("启动采集失败: {}", e)),
         }
     }
 
@@ -535,6 +548,16 @@ impl eframe::App for DapSamplerApp {
                     AcquisitionState::Paused => ("Paused", egui::Color32::from_rgb(0xe8, 0xa4, 0x00)),
                 };
                 ui.colored_label(state_color, format!("● {}", state_text));
+
+                if let Some(err) = &self.last_error {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xff, 0x55, 0x55),
+                        format!("Error: {}", err),
+                    ).on_hover_text(
+                        "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
+                    );
+                }
 
                 ui.separator();
 

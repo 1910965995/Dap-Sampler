@@ -128,11 +128,11 @@ impl DapProtocol {
     // DAP_SWJ_PINS (控制 nRESET/SWCLK/SWDIO 引脚电平)
     // --------------------------------------------------------
     /// 构建 DAP_SWJ_PINS 请求
-    /// mask: 要修改的引脚位 (bit 0=SWCLK, bit 1=SWDIO, bit 2=nRESET)
-    /// value: 引脚电平值 (1=高, 0=低)
+    /// output: 引脚输出值（bit0=SWCLK, bit1=SWDIO/TMS, bit2=TDI, bit3=TDO, bit5=nTRST, bit7=nRESET）
+    /// select: 要修改的引脚位掩码（同 output 位定义）
     /// wait_us: 设置后等待的微秒数
-    pub fn build_pins_request(&self, mask: u8, value: u8, wait_us: u32) -> Vec<u8> {
-        let mut cmd = vec![DAP_SWJ_PINS, mask, value];
+    pub fn build_pins_request(&self, output: u8, select: u8, wait_us: u32) -> Vec<u8> {
+        let mut cmd = vec![DAP_SWJ_PINS, output, select];
         cmd.extend_from_slice(&wait_us.to_le_bytes());
         cmd
     }

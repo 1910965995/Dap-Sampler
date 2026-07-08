@@ -131,7 +131,7 @@ fn collect_flat_entries<'a>(
         let tag = entry.tag();
 
         // 提取通用属性
-        let name = entry_attr_string(entry, DW_AT_name);
+        let name = entry_attr_string(entry, DW_AT_name, dwarf);
         let byte_size = attr_u32(entry, DW_AT_byte_size);
         let type_ref = attr_type_ref(entry);
 
@@ -211,9 +211,8 @@ fn process_raw_dies(raw_dies: &[RawDie], result: &mut DwarfResult) {
 
         match die.tag {
             DW_TAG_variable => {
-                if let (Some(name), Some(address), Some(type_offset)) =
-                    (&die.name, die.address, die.type_ref)
-                {
+                if let (Some(name), Some(address)) = (&die.name, die.address) {
+                    let type_offset = die.type_ref.unwrap_or(0);
                     result.variables.push(DwarfVarInfo {
                         name: name.clone(),
                         address,
@@ -321,19 +320,22 @@ fn extract_address_from_entry<'a>(
         None => return Ok(None),
     };
 
-    match val {
-        gimli::AttributeValue::Exprloc(expr) => {
-            let encoding = unit.encoding();
-            let mut ops = expr.operations(encoding);
-            if let Some(op) = ops.next().map_err(|e| format!("{}", e))? {
-                if let gimli::Operation::Address { address } = op {
-                    return Ok(Some(address as u32));
-                }
-            }
-            Ok(None)
+    // DW_AT_location 可能是 Exprloc (DW_FORM_exprloc) 或 Block (DW_FORM_block1/2/4)。
+    // ARM Keil/ARMCC 常用 Block 格式。
+    let expr = match val {
+        gimli::AttributeValue::Exprloc(e) => e,
+        gimli::AttributeValue::Block(e) => gimli::Expression(e),
+        _ => return Ok(None),
+    };
+
+    let encoding = unit.encoding();
+    let mut ops = expr.operations(encoding);
+    if let Some(op) = ops.next().map_err(|e| format!("{}", e))? {
+        if let gimli::Operation::Address { address } = op {
+            return Ok(Some(address as u32));
         }
-        _ => Ok(None),
     }
+    Ok(None)
 }
 
 fn attr_type_ref<'a>(
@@ -341,8 +343,13 @@ fn attr_type_ref<'a>(
 ) -> Option<u64> {
     let val = entry_attr(entry, DW_AT_type)?;
     match val {
+        // DW_FORM_ref1/ref2/ref4 — 同 CU 内引用
         gimli::AttributeValue::UnitRef(offset) => Some(offset.0 as u64),
+        // DW_FORM_ref_addr — 跨 CU 引用
         gimli::AttributeValue::DebugInfoRef(offset) => Some(offset.0 as u64),
+        // DW_FORM_ref_sig8 — DWARF 4 .debug_types 类型签名引用（ARMCC/Keil 常用）
+        // 将 64-bit 签名映射为 offset（后续类型查找按签名匹配即可）
+        gimli::AttributeValue::DebugTypesRef(sig) => Some(sig.0),
         _ => None,
     }
 }
@@ -374,15 +381,14 @@ fn entry_attr<'a>(
 fn entry_attr_string<'a>(
     entry: &gimli::DebuggingInformationEntry<'a, 'a, R<'a>, usize>,
     attr: gimli::DwAt,
+    dwarf: &Dwarf<R<'a>>,
 ) -> Option<String> {
     let val = entry_attr(entry, attr)?;
-    match val {
-        gimli::AttributeValue::String(s) => Some(s.to_string_lossy().into_owned()),
-        _ => None,
-    }
+    dwarf_attr_string(dwarf, val)
 }
 
-fn dwarf_attr_string<'a>(
+/// 从 AttributeValue 中提取字符串（处理 String / DebugStrRef / DebugStrOffsets 等形式）
+fn dwarf_attr_string_val<'a>(
     dwarf: &Dwarf<R<'a>>,
     val: gimli::AttributeValue<R<'a>>,
 ) -> Option<String> {
@@ -394,6 +400,13 @@ fn dwarf_attr_string<'a>(
         }
         _ => None,
     }
+}
+
+fn dwarf_attr_string<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    val: gimli::AttributeValue<R<'a>>,
+) -> Option<String> {
+    dwarf_attr_string_val(dwarf, val)
 }
 
 fn attr_u32<'a>(

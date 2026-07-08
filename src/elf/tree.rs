@@ -18,14 +18,21 @@ pub fn build_from_dwarf(
     elf_symbols: &[ElfSymbolRaw],
     dwarf: &DwarfResult,
 ) -> Result<Vec<ElfVariable>, String> {
-    // 1. 交叉验证：只保留 DWARF 变量中名字也出现在 ELF 符号表的
+    // 1. 交叉验证：只保留 DWARF 变量中名字也出现在 ELF 符号表的。
+    // 如果 ELF 符号表没有任何非零大小变量（常见于 ARMCC/Keil 的 STT_NOTYPE 输出），
+    // 则跳过交叉验证，直接使用 DWARF 变量（避免变量浏览器为空）。
     let elf_names: HashSet<&str> = elf_symbols.iter()
         .map(|s| s.name.as_str())
         .collect();
 
-    let valid_dwarf_vars: Vec<&DwarfVarInfo> = dwarf.variables.iter()
-        .filter(|v| elf_names.contains(v.name.as_str()) && v.address != 0)
-        .collect();
+    let valid_dwarf_vars: Vec<&DwarfVarInfo> = if elf_names.is_empty() {
+        log::info!("ELF 符号表无可用 Data/Unknown 变量, 跳过交叉验证, 直接使用 DWARF 变量");
+        dwarf.variables.iter().filter(|v| v.address != 0).collect()
+    } else {
+        dwarf.variables.iter()
+            .filter(|v| elf_names.contains(v.name.as_str()) && v.address != 0)
+            .collect()
+    };
 
     log::info!(
         "交叉验证: ELF符号={}, DWARF变量={}, 通过验证={} (被过滤: 名称不匹配或地址为0)",

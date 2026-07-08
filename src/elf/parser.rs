@@ -132,7 +132,11 @@ impl ElfParser {
 
         for symbol in elf.symbols() {
             total_syms += 1;
-            if symbol.kind() != object::SymbolKind::Data {
+            // 接受 Data (STT_OBJECT) 和 Unknown (STT_NOTYPE)。
+            // ARM Keil/ARMCC 常把全局变量标为 STT_NOTYPE 而非 STT_OBJECT，
+            // 如果只接受 Data 会导致所有变量被过滤，最终变量浏览器为空。
+            let kind = symbol.kind();
+            if kind != object::SymbolKind::Data && kind != object::SymbolKind::Unknown {
                 skipped_kind += 1;
                 continue;
             }

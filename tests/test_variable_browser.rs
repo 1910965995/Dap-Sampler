@@ -183,3 +183,52 @@ fn filter_container_name_shows_all_children() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].children.len(), 2);
 }
+
+fn collect_leaves(n: &TreeNode, out: &mut Vec<String>) {
+    if n.is_leaf {
+        out.push(n.path.clone());
+    }
+    for c in &n.children {
+        collect_leaves(c, out);
+    }
+}
+
+#[test]
+fn leaf_paths_match_original_variables() {
+    let vars = vec![
+        leaf("pid.kp", 1),
+        leaf("buffer[0]", 2),
+        leaf("temperature", 3),
+    ];
+    let roots = build_var_tree(&vars);
+    let mut paths = Vec::new();
+    for r in &roots {
+        collect_leaves(r, &mut paths);
+    }
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "buffer[0]".to_string(),
+            "pid.kp".to_string(),
+            "temperature".to_string()
+        ]
+    );
+}
+
+#[test]
+fn filter_preserves_leaf_checkbox_path() {
+    let vars = vec![
+        leaf("pid.kp", 1),
+        leaf("pid.ki", 2),
+        leaf("buffer[0]", 3),
+        leaf("temperature", 4),
+    ];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "kp");
+    let mut paths = Vec::new();
+    for r in &filtered {
+        collect_leaves(r, &mut paths);
+    }
+    assert_eq!(paths, vec!["pid.kp".to_string()]);
+}

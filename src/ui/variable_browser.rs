@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use crate::elf::{ElfContext, ElfVariable};
 
 /// Split a variable path into display segments.
@@ -216,8 +216,10 @@ fn filter_node(node: &TreeNode, q: &str) -> Option<TreeNode> {
 pub struct VariableBrowser {
     /// 搜索框文字
     search_text: String,
-    /// 已勾选的变量路径（与通道面板联动）
+    /// 已勾选的变量路径（与通道面板联动，仅叶子路径）
     pub checked_paths: HashSet<String>,
+    /// 用户展开的容器路径（搜索强制展开时不写入此集合）
+    expanded: HashSet<String>,
 }
 
 impl VariableBrowser {
@@ -225,12 +227,13 @@ impl VariableBrowser {
         Self {
             search_text: String::new(),
             checked_paths: HashSet::new(),
+            expanded: HashSet::new(),
         }
     }
 
     /// 渲染变量浏览器 UI
     ///
-    /// 返回 `Vec<(path, is_checked)>` 表示本帧用户勾选/取消的变更。
+    /// 返回 `Vec<(path, is_checked)>` 表示本帧用户勾选/取消的变更（仅叶子路径）。
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -258,63 +261,107 @@ impl VariableBrowser {
 
         ui.separator();
 
-        // 构建过滤后的显示列表（仅按变量名搜索）
-        let filtered: Vec<&ElfVariable> = if self.search_text.is_empty() {
-            ctx.variables.iter().collect()
-        } else {
-            let lower = self.search_text.to_lowercase();
-            ctx.variables
-                .iter()
-                .filter(|v| {
-                    v.name.to_lowercase().contains(&lower)
-                        || v.path.to_lowercase().contains(&lower)
-                })
-                .collect()
-        };
+        // 按 source_file 首次出现顺序分组，构建可折叠树
+        let mut group_order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<ElfVariable>> = HashMap::new();
+        for var in &ctx.variables {
+            let g = var
+                .source_file
+                .clone()
+                .unwrap_or_else(|| "Globals".to_string());
+            if !groups.contains_key(&g) {
+                group_order.push(g.clone());
+            }
+            groups.entry(g).or_default().push(var.clone());
+        }
 
-        // 按 source_file 分组显示，ScrollArea 限制最大高度
+        let force_expand = !self.search_text.is_empty();
+
         egui::ScrollArea::vertical()
             .id_salt("variable_scroll")
             .auto_shrink([false, true])
             .max_height(400.0)
             .show(ui, |ui| {
-                let mut current_group: Option<String> = None;
+                for g in &group_order {
+                    let vars = match groups.get(g) {
+                        Some(v) => v,
+                        None => continue,
+                    };
 
-                for var in &filtered {
-                    let group = var
-                        .source_file
-                        .clone()
-                        .unwrap_or_else(|| "Globals".to_string());
-
-                    if current_group.as_deref() != Some(&group) {
-                        current_group = Some(group.clone());
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(&group)
-                                .small()
-                                .color(egui::Color32::from_rgb(110, 118, 129)),
-                        );
+                    let mut roots = build_var_tree(vars);
+                    if !self.search_text.is_empty() {
+                        roots = filter_tree(&roots, &self.search_text);
+                    }
+                    // 过滤后无节点则跳过该分组
+                    if roots.is_empty() {
+                        continue;
                     }
 
-                    // 单行：Checkbox + 变量名
-                    let indent = if var.parent_path.is_some() { 20.0 } else { 8.0 };
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(g)
+                            .small()
+                            .color(egui::Color32::from_rgb(110, 118, 129)),
+                    );
 
-                    ui.horizontal(|ui| {
-                        ui.add_space(indent);
-                        let mut is_checked = self.checked_paths.contains(&var.path);
-                        if ui.checkbox(&mut is_checked, &var.name).changed() {
-                            if is_checked {
-                                self.checked_paths.insert(var.path.clone());
-                            } else {
-                                self.checked_paths.remove(&var.path);
-                            }
-                            changes.push((var.path.clone(), is_checked));
-                        }
-                    });
+                    for node in &roots {
+                        self.render_node(ui, node, force_expand, &mut changes);
+                    }
                 }
             });
 
         changes
+    }
+
+    /// 递归渲染树节点：容器仅展开/折叠；叶子为复选框
+    fn render_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &TreeNode,
+        force_expand: bool,
+        changes: &mut Vec<(String, bool)>,
+    ) {
+        // 有子节点即视为容器（不显示复选框）
+        if !node.children.is_empty() {
+            let mut is_expanded = force_expand || self.expanded.contains(&node.path);
+            let arrow = if is_expanded { "▼" } else { "▶" };
+
+            ui.horizontal(|ui| {
+                let r_arrow = ui.selectable_label(false, arrow);
+                let r_label = ui.selectable_label(false, &node.label);
+                if (r_arrow.clicked() || r_label.clicked()) && !force_expand {
+                    if is_expanded {
+                        self.expanded.remove(&node.path);
+                        is_expanded = false;
+                    } else {
+                        self.expanded.insert(node.path.clone());
+                        is_expanded = true;
+                    }
+                }
+            });
+
+            if is_expanded {
+                let id = ui.make_persistent_id(("var_tree", &node.path));
+                ui.indent(id, |ui| {
+                    for child in &node.children {
+                        self.render_node(ui, child, force_expand, changes);
+                    }
+                });
+            }
+        } else {
+            // 叶子：复选框 + 标签（路径用于勾选状态）
+            ui.horizontal(|ui| {
+                let mut is_checked = self.checked_paths.contains(&node.path);
+                if ui.checkbox(&mut is_checked, &node.label).changed() {
+                    if is_checked {
+                        self.checked_paths.insert(node.path.clone());
+                    } else {
+                        self.checked_paths.remove(&node.path);
+                    }
+                    changes.push((node.path.clone(), is_checked));
+                }
+            });
+        }
     }
 
     /// 获取已勾选的路径集合
@@ -322,8 +369,9 @@ impl VariableBrowser {
         &self.checked_paths
     }
 
-    /// 清空选择
+    /// 清空选择与展开状态
     pub fn clear(&mut self) {
         self.checked_paths.clear();
+        self.expanded.clear();
     }
 }

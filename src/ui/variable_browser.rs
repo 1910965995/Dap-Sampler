@@ -1,6 +1,65 @@
 use std::collections::HashSet;
 use crate::elf::{ElfContext, ElfVariable};
 
+/// Split a variable path into display segments.
+///
+/// Supports `a.b`, `arr[0]`, and `arr[1].field`. On unparseable input,
+/// returns the whole path as a single segment.
+pub fn split_var_path(path: &str) -> Vec<String> {
+    if path.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut segments = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    let mut ident_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'.' => {
+                if let Some(s) = ident_start.take() {
+                    segments.push(path[s..i].to_string());
+                }
+                i += 1;
+            }
+            b'[' => {
+                if let Some(s) = ident_start.take() {
+                    segments.push(path[s..i].to_string());
+                }
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b']' {
+                    i += 1;
+                    segments.push(path[start..i].to_string());
+                } else {
+                    segments.push(path[start..].to_string());
+                    break;
+                }
+            }
+            _ => {
+                if ident_start.is_none() {
+                    ident_start = Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    if let Some(s) = ident_start {
+        segments.push(path[s..].to_string());
+    }
+
+    if segments.is_empty() {
+        vec![path.to_string()]
+    } else {
+        segments
+    }
+}
+
 /// 变量浏览器状态（左侧「变量」标签页的内容）
 pub struct VariableBrowser {
     /// 搜索框文字

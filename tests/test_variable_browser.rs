@@ -1,6 +1,8 @@
 use dap_sampler::elf::ElfVariable;
 use dap_sampler::pipeline::sample::ValueType;
-use dap_sampler::ui::variable_browser::{build_var_tree, split_var_path, TreeNode};
+use dap_sampler::ui::variable_browser::{
+    build_var_tree, filter_tree, split_var_path, TreeNode,
+};
 
 #[test]
 fn split_simple_name() {
@@ -126,4 +128,58 @@ fn build_tree_plain_and_struct_siblings() {
     assert_eq!(roots[0].label, "pid");
     assert_eq!(roots[1].label, "temperature");
     assert!(roots[1].is_leaf);
+}
+
+#[test]
+fn filter_keeps_ancestors_of_match() {
+    let vars = vec![
+        leaf("pid.kp", 0x1),
+        leaf("pid.ki", 0x2),
+        leaf("buffer[0]", 0x3),
+        leaf("temperature", 0x4),
+    ];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "kp");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].label, "pid");
+    assert_eq!(filtered[0].children.len(), 1);
+    assert_eq!(filtered[0].children[0].label, "kp");
+}
+
+#[test]
+fn filter_case_insensitive() {
+    let vars = vec![leaf("pid.Kp", 0x1)];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "kp");
+    assert_eq!(filtered.len(), 1);
+}
+
+#[test]
+fn filter_empty_query_clones_all() {
+    let vars = vec![leaf("a", 0x1), leaf("b", 0x2)];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "");
+    assert_eq!(filtered.len(), roots.len());
+}
+
+#[test]
+fn filter_matches_path_substring() {
+    let vars = vec![leaf("motors[1].speed", 0x1)];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "motors[1]");
+    assert_eq!(filtered.len(), 1);
+    assert!(!filtered[0].children.is_empty());
+}
+
+#[test]
+fn filter_container_name_shows_all_children() {
+    let vars = vec![
+        leaf("pid.kp", 0x1),
+        leaf("pid.ki", 0x2),
+        leaf("other.x", 0x3),
+    ];
+    let roots = build_var_tree(&vars);
+    let filtered = filter_tree(&roots, "pid");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].children.len(), 2);
 }

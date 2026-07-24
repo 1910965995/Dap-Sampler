@@ -161,6 +161,57 @@ pub fn build_var_tree(variables: &[ElfVariable]) -> Vec<TreeNode> {
     roots
 }
 
+/// Return a pruned copy of the tree: keep nodes that match `query` (case-insensitive
+/// against `path` or `label`) or have a matching descendant.
+/// Empty query returns a full clone.
+pub fn filter_tree(nodes: &[TreeNode], query: &str) -> Vec<TreeNode> {
+    if query.is_empty() {
+        return nodes.to_vec();
+    }
+    let q = query.to_lowercase();
+    nodes.iter().filter_map(|n| filter_node(n, &q)).collect()
+}
+
+fn filter_node(node: &TreeNode, q: &str) -> Option<TreeNode> {
+    let self_match =
+        node.path.to_lowercase().contains(q) || node.label.to_lowercase().contains(q);
+
+    if node.children.is_empty() {
+        return if self_match {
+            Some(node.clone())
+        } else {
+            None
+        };
+    }
+
+    let filtered_children: Vec<TreeNode> = node
+        .children
+        .iter()
+        .filter_map(|c| filter_node(c, q))
+        .collect();
+
+    if self_match {
+        // Container name matched: show full children so structure is browsable
+        Some(TreeNode {
+            label: node.label.clone(),
+            path: node.path.clone(),
+            is_leaf: false,
+            variable_index: None,
+            children: node.children.clone(),
+        })
+    } else if !filtered_children.is_empty() {
+        Some(TreeNode {
+            label: node.label.clone(),
+            path: node.path.clone(),
+            is_leaf: false,
+            variable_index: None,
+            children: filtered_children,
+        })
+    } else {
+        None
+    }
+}
+
 /// 变量浏览器状态（左侧「变量」标签页的内容）
 pub struct VariableBrowser {
     /// 搜索框文字

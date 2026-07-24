@@ -76,6 +76,30 @@ fn parse_array_index(label: &str) -> Option<u64> {
     s.parse().ok()
 }
 
+/// Display text for a tree node.
+///
+/// Array index segments (`[0]`) are shown as `array_name[0]` (using the
+/// last identifier before the index in `path`), not bare `[0]`.
+pub fn node_display_label(label: &str, path: &str) -> String {
+    if !label.starts_with('[') {
+        return label.to_string();
+    }
+    if path.ends_with(label) {
+        let prefix = &path[..path.len() - label.len()];
+        if prefix.is_empty() {
+            return label.to_string();
+        }
+        if let Some(dot) = prefix.rfind('.') {
+            format!("{}{}", &prefix[dot + 1..], label)
+        } else {
+            format!("{}{}", prefix, label)
+        }
+    } else {
+        // Fallback: keep path if it already looks right
+        path.to_string()
+    }
+}
+
 fn cmp_tree_label(a: &str, b: &str) -> Ordering {
     match (parse_array_index(a), parse_array_index(b)) {
         (Some(ia), Some(ib)) => ia.cmp(&ib),
@@ -321,15 +345,46 @@ impl VariableBrowser {
         force_expand: bool,
         changes: &mut Vec<(String, bool)>,
     ) {
+        let display = node_display_label(&node.label, &node.path);
+
         // 有子节点即视为容器（不显示复选框）
         if !node.children.is_empty() {
             let mut is_expanded = force_expand || self.expanded.contains(&node.path);
-            let arrow = if is_expanded { "▼" } else { "▶" };
 
             ui.horizontal(|ui| {
-                let r_arrow = ui.selectable_label(false, arrow);
-                let r_label = ui.selectable_label(false, &node.label);
-                if (r_arrow.clicked() || r_label.clicked()) && !force_expand {
+                // 展开按钮与 checkbox 图标同宽，保证名称列对齐
+                let icon_w = ui.spacing().icon_width;
+                let icon_size = egui::vec2(icon_w, icon_w);
+                let (icon_rect, icon_resp) =
+                    ui.allocate_exact_size(icon_size, egui::Sense::click());
+
+                // 小三角（居中画在 icon 方框内）
+                let tri_color = ui.visuals().text_color();
+                let c = icon_rect.center();
+                let s = icon_w * 0.22;
+                let points = if is_expanded {
+                    // ▼
+                    vec![
+                        egui::pos2(c.x - s, c.y - s * 0.6),
+                        egui::pos2(c.x + s, c.y - s * 0.6),
+                        egui::pos2(c.x, c.y + s * 0.8),
+                    ]
+                } else {
+                    // ▶
+                    vec![
+                        egui::pos2(c.x - s * 0.5, c.y - s),
+                        egui::pos2(c.x - s * 0.5, c.y + s),
+                        egui::pos2(c.x + s * 0.9, c.y),
+                    ]
+                };
+                ui.painter().add(egui::Shape::convex_polygon(
+                    points,
+                    tri_color,
+                    egui::Stroke::NONE,
+                ));
+
+                let r_label = ui.selectable_label(false, &display);
+                if (icon_resp.clicked() || r_label.clicked()) && !force_expand {
                     if is_expanded {
                         self.expanded.remove(&node.path);
                         is_expanded = false;
@@ -349,10 +404,10 @@ impl VariableBrowser {
                 });
             }
         } else {
-            // 叶子：复选框 + 标签（路径用于勾选状态）
+            // 叶子：复选框 + 标签（路径用于勾选状态；数组元素显示为 name[i]）
             ui.horizontal(|ui| {
                 let mut is_checked = self.checked_paths.contains(&node.path);
-                if ui.checkbox(&mut is_checked, &node.label).changed() {
+                if ui.checkbox(&mut is_checked, &display).changed() {
                     if is_checked {
                         self.checked_paths.insert(node.path.clone());
                     } else {

@@ -232,3 +232,26 @@ fn filter_preserves_leaf_checkbox_path() {
     }
     assert_eq!(paths, vec!["pid.kp".to_string()]);
 }
+
+use dap_sampler::ui::variable_browser::node_display_label;
+
+#[test]
+fn display_label_plain() {
+    assert_eq!(node_display_label("kp", "pid.kp"), "kp");
+}
+
+#[test]
+fn display_label_array_element() {
+    assert_eq!(node_display_label("[0]", "buffer[0]"), "buffer[0]");
+}
+
+#[test]
+fn display_label_nested_array_element() {
+    assert_eq!(node_display_label("[1]", "motors[1]"), "motors[1]");
+}
+
+#[test]
+fn display_label_array_of_struct_member() {
+    // leaf member still shows member name
+    assert_eq!(node_display_label("speed", "motors[1].speed"), "speed");
+}

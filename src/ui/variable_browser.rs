@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use crate::elf::{ElfContext, ElfVariable};
 
@@ -58,6 +59,106 @@ pub fn split_var_path(path: &str) -> Vec<String> {
     } else {
         segments
     }
+}
+
+/// Node in the collapsible variable tree built from flat ELF variable paths.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub label: String,
+    pub path: String,
+    pub is_leaf: bool,
+    pub variable_index: Option<usize>,
+    pub children: Vec<TreeNode>,
+}
+
+fn parse_array_index(label: &str) -> Option<u64> {
+    let s = label.strip_prefix('[')?.strip_suffix(']')?;
+    s.parse().ok()
+}
+
+fn cmp_tree_label(a: &str, b: &str) -> Ordering {
+    match (parse_array_index(a), parse_array_index(b)) {
+        (Some(ia), Some(ib)) => ia.cmp(&ib),
+        _ => a.cmp(b),
+    }
+}
+
+fn sort_tree_children(nodes: &mut Vec<TreeNode>) {
+    nodes.sort_by(|a, b| cmp_tree_label(&a.label, &b.label));
+    for node in nodes.iter_mut() {
+        sort_tree_children(&mut node.children);
+    }
+}
+
+fn join_path(parent: &str, segment: &str) -> String {
+    if parent.is_empty() {
+        segment.to_string()
+    } else if segment.starts_with('[') {
+        format!("{}{}", parent, segment)
+    } else {
+        format!("{}.{}", parent, segment)
+    }
+}
+
+fn insert_path(
+    nodes: &mut Vec<TreeNode>,
+    segments: &[String],
+    var_index: usize,
+    full_path: &str,
+    parent_path: &str,
+) {
+    let seg = &segments[0];
+    let is_last = segments.len() == 1;
+    let path = join_path(parent_path, seg);
+    let pos = if let Some(p) = nodes.iter().position(|n| n.label == *seg) {
+        p
+    } else {
+        nodes.push(TreeNode {
+            label: seg.clone(),
+            path: if is_last {
+                full_path.to_string()
+            } else {
+                path.clone()
+            },
+            is_leaf: is_last,
+            variable_index: if is_last { Some(var_index) } else { None },
+            children: Vec::new(),
+        });
+        nodes.len() - 1
+    };
+
+    if is_last {
+        nodes[pos].path = full_path.to_string();
+        nodes[pos].variable_index = Some(var_index);
+        if nodes[pos].children.is_empty() {
+            nodes[pos].is_leaf = true;
+        }
+    } else {
+        nodes[pos].is_leaf = false;
+        nodes[pos].variable_index = None;
+        let child_parent = nodes[pos].path.clone();
+        insert_path(
+            &mut nodes[pos].children,
+            &segments[1..],
+            var_index,
+            full_path,
+            &child_parent,
+        );
+    }
+}
+
+/// Build a collapsible tree from flat ELF variable leaves using path segments.
+pub fn build_var_tree(variables: &[ElfVariable]) -> Vec<TreeNode> {
+    let mut roots = Vec::new();
+    for (idx, var) in variables.iter().enumerate() {
+        let segments = split_var_path(&var.path);
+        if segments.is_empty() || segments[0].is_empty() {
+            continue;
+        }
+        insert_path(&mut roots, &segments, idx, &var.path, "");
+    }
+    sort_tree_children(&mut roots);
+    roots
 }
 
 /// 变量浏览器状态（左侧「变量」标签页的内容）

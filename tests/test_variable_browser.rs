@@ -1,4 +1,6 @@
-use dap_sampler::ui::variable_browser::split_var_path;
+use dap_sampler::elf::ElfVariable;
+use dap_sampler::pipeline::sample::ValueType;
+use dap_sampler::ui::variable_browser::{build_var_tree, split_var_path, TreeNode};
 
 #[test]
 fn split_simple_name() {
@@ -32,4 +34,96 @@ fn split_multi_member() {
 fn split_empty_falls_back_to_single_empty() {
     // empty input: return single empty segment (caller may skip)
     assert_eq!(split_var_path(""), vec![""]);
+}
+
+fn leaf(path: &str, address: u32) -> ElfVariable {
+    let segs = dap_sampler::ui::variable_browser::split_var_path(path);
+    let name = segs.last().cloned().unwrap_or_else(|| path.to_string());
+    ElfVariable {
+        name,
+        path: path.to_string(),
+        address,
+        byte_size: 4,
+        value_type: ValueType::Float,
+        parent_path: None,
+        source_file: None,
+    }
+}
+
+fn find_child<'a>(node: &'a TreeNode, label: &str) -> Option<&'a TreeNode> {
+    node.children.iter().find(|c| c.label == label)
+}
+
+#[test]
+fn build_tree_struct_members() {
+    let vars = vec![
+        leaf("pid.kp", 0x20000300),
+        leaf("pid.ki", 0x20000304),
+        leaf("pid.kd", 0x20000308),
+    ];
+    let roots = build_var_tree(&vars);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].label, "pid");
+    assert!(!roots[0].is_leaf);
+    assert_eq!(roots[0].path, "pid");
+    assert_eq!(roots[0].children.len(), 3);
+    assert!(roots[0].children.iter().all(|c| c.is_leaf));
+    let kp = find_child(&roots[0], "kp").unwrap();
+    assert_eq!(kp.path, "pid.kp");
+    assert_eq!(kp.variable_index, Some(0));
+}
+
+#[test]
+fn build_tree_array_elements() {
+    let vars = vec![
+        leaf("buffer[0]", 0x20000400),
+        leaf("buffer[1]", 0x20000404),
+        leaf("buffer[2]", 0x20000408),
+        leaf("buffer[3]", 0x2000040C),
+    ];
+    let roots = build_var_tree(&vars);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].label, "buffer");
+    assert_eq!(roots[0].children.len(), 4);
+    assert_eq!(roots[0].children[0].label, "[0]");
+    assert_eq!(roots[0].children[0].path, "buffer[0]");
+    assert!(roots[0].children[0].is_leaf);
+}
+
+#[test]
+fn build_tree_nested() {
+    let vars = vec![leaf("motors[1].speed", 0x20001000)];
+    let roots = build_var_tree(&vars);
+    assert_eq!(roots[0].label, "motors");
+    let idx = find_child(&roots[0], "[1]").unwrap();
+    assert!(!idx.is_leaf);
+    let speed = find_child(idx, "speed").unwrap();
+    assert!(speed.is_leaf);
+    assert_eq!(speed.path, "motors[1].speed");
+}
+
+#[test]
+fn build_tree_array_index_numeric_sort() {
+    let vars = vec![
+        leaf("buf[10]", 0x10),
+        leaf("buf[2]", 0x2),
+        leaf("buf[1]", 0x1),
+    ];
+    let roots = build_var_tree(&vars);
+    let labels: Vec<_> = roots[0].children.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, vec!["[1]", "[2]", "[10]"]);
+}
+
+#[test]
+fn build_tree_plain_and_struct_siblings() {
+    let vars = vec![
+        leaf("temperature", 0x100),
+        leaf("pid.kp", 0x200),
+    ];
+    let roots = build_var_tree(&vars);
+    // sorted by label: pid, temperature
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].label, "pid");
+    assert_eq!(roots[1].label, "temperature");
+    assert!(roots[1].is_leaf);
 }

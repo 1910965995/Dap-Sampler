@@ -352,16 +352,19 @@ impl VariableBrowser {
             let mut is_expanded = force_expand || self.expanded.contains(&node.path);
 
             ui.horizontal(|ui| {
-                // 展开按钮与 checkbox 图标同宽，保证名称列对齐
-                let icon_w = ui.spacing().icon_width;
-                let icon_size = egui::vec2(icon_w, icon_w);
+                // 占位收窄（约 2.4 个字母宽）保证名称左对齐；
+                // 三角按完整 icon 尺寸绘制，避免跟着占位变小看不清
+                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                let letter_w = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
+                let full_icon_w = ui.spacing().icon_width;
+                let slot_w = (full_icon_w - letter_w * 2.4).max(6.0);
+                let icon_size = egui::vec2(slot_w, full_icon_w);
                 let (icon_rect, icon_resp) =
                     ui.allocate_exact_size(icon_size, egui::Sense::click());
 
-                // 小三角（居中画在 icon 方框内）
                 let tri_color = ui.visuals().text_color();
                 let c = icon_rect.center();
-                let s = icon_w * 0.22;
+                let s = full_icon_w * 0.22 * 1.1;
                 let points = if is_expanded {
                     // ▼
                     vec![

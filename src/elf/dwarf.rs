@@ -130,14 +130,14 @@ fn collect_flat_entries<'a>(
         let offset = entry.offset().0 as u64;
         let tag = entry.tag();
 
-        // 提取通用属性
-        let name = entry_attr_string(entry, DW_AT_name);
+        // 提取通用属性（名称可能是内联 String 或 .debug_str 的 DebugStrRef）
+        let name = entry_attr_string(entry, DW_AT_name, unit, dwarf);
         let byte_size = attr_u32(entry, DW_AT_byte_size);
         let type_ref = attr_type_ref(entry);
 
         // 提取变量地址
         let address = if tag == DW_TAG_variable {
-            extract_address_from_entry(entry, unit)?
+            extract_address_from_entry(entry, unit, dwarf)?
         } else {
             None
         };
@@ -315,6 +315,7 @@ fn process_raw_dies(raw_dies: &[RawDie], result: &mut DwarfResult) {
 fn extract_address_from_entry<'a>(
     entry: &gimli::DebuggingInformationEntry<'a, 'a, R<'a>, usize>,
     unit: &gimli::Unit<R<'a>>,
+    dwarf: &Dwarf<R<'a>>,
 ) -> Result<Option<u32>, String> {
     let val = match entry_attr(entry, DW_AT_location) {
         Some(v) => v,
@@ -325,9 +326,18 @@ fn extract_address_from_entry<'a>(
         gimli::AttributeValue::Exprloc(expr) => {
             let encoding = unit.encoding();
             let mut ops = expr.operations(encoding);
-            if let Some(op) = ops.next().map_err(|e| format!("{}", e))? {
-                if let gimli::Operation::Address { address } = op {
-                    return Ok(Some(address as u32));
+            // 扫描整条 location expression：全局变量通常是 DW_OP_addr / addrx
+            while let Some(op) = ops.next().map_err(|e| format!("{}", e))? {
+                match op {
+                    gimli::Operation::Address { address } => {
+                        return Ok(Some(address as u32));
+                    }
+                    gimli::Operation::AddressIndex { index } => {
+                        if let Ok(address) = dwarf.address(unit, index) {
+                            return Ok(Some(address as u32));
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(None)
@@ -374,12 +384,15 @@ fn entry_attr<'a>(
 fn entry_attr_string<'a>(
     entry: &gimli::DebuggingInformationEntry<'a, 'a, R<'a>, usize>,
     attr: gimli::DwAt,
+    unit: &gimli::Unit<R<'a>>,
+    dwarf: &Dwarf<R<'a>>,
 ) -> Option<String> {
     let val = entry_attr(entry, attr)?;
-    match val {
-        gimli::AttributeValue::String(s) => Some(s.to_string_lossy().into_owned()),
-        _ => None,
-    }
+    // 兼容内联字符串、.debug_str (DW_FORM_strp) 以及 DWARF5 strx 等表单
+    dwarf
+        .attr_string(unit, val)
+        .ok()
+        .map(|s| s.to_string_lossy().into_owned())
 }
 
 fn dwarf_attr_string<'a>(

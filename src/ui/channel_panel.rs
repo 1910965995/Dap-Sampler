@@ -50,14 +50,20 @@ pub struct ChannelEntry {
     pub value_type: ValueType,
 }
 
+/// 通道面板交互结果
+#[derive(Default)]
+pub struct ChannelPanelAction {
+    pub remove: Option<usize>,
+    pub select: Option<usize>,
+}
+
 /// 通道管理面板（左侧「通道」标签页的内容）
 ///
 /// 显示已添加到示波器的变量通道列表，支持：
 /// - 颜色标识
-/// - 名称显示
+/// - 名称显示 / 点击选中（波形高亮）
 /// - 可见性切换
 /// - 移除按钮
-/// - 光标测量数据
 pub struct ChannelPanel {
     /// 通道列表
     pub channels: Vec<ChannelEntry>,
@@ -71,48 +77,70 @@ impl ChannelPanel {
     }
 
     /// 渲染通道面板
-    ///
-    /// 返回 `Option<usize>` 表示用户点击了移除按钮的通道索引。
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<usize> {
-        let mut remove_idx: Option<usize> = None;
+    pub fn show(&mut self, ui: &mut egui::Ui, selected: Option<usize>) -> ChannelPanelAction {
+        let mut action = ChannelPanelAction::default();
 
         if self.channels.is_empty() {
             ui.label("No channels");
-            return None;
+            return action;
         }
 
         egui::ScrollArea::vertical()
             .id_salt("channel_scroll")
             .show(ui, |ui| {
                 for (i, ch) in self.channels.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        // 颜色指示点
-                        ui.colored_label(ch.color, "●");
+                    let is_sel = selected == Some(i);
+                    let frame = if is_sel {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                ch.color.r(),
+                                ch.color.g(),
+                                ch.color.b(),
+                                40,
+                            ))
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin::symmetric(2, 1))
+                    } else {
+                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(2, 1))
+                    };
 
-                        // 通道名
-                        ui.label(&ch.name);
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(ch.color, "●");
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // 移除按钮（灰色圆形 ×）
-                            if icon_button(ui, "×", GREY_FG, GREY_BG, GREY_HOVER) {
-                                remove_idx = Some(i);
+                            let name_text = if is_sel {
+                                egui::RichText::new(&ch.name).strong().color(ch.color)
+                            } else {
+                                egui::RichText::new(&ch.name)
+                            };
+                            let name_resp = ui.add(
+                                egui::Label::new(name_text).sense(egui::Sense::click()),
+                            );
+                            if name_resp.clicked() {
+                                action.select = Some(i);
                             }
-                            // 可见性切换（实心 = 可见，空心 = 隐藏）
-                            let vis_label = if ch.visible { "●" } else { "○" };
-                            if icon_button(ui, vis_label, GREY_FG, GREY_BG, GREY_HOVER) {
-                                ch.visible = !ch.visible;
+                            if name_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icon_button(ui, "×", GREY_FG, GREY_BG, GREY_HOVER) {
+                                    action.remove = Some(i);
+                                }
+                                let vis_label = if ch.visible { "●" } else { "○" };
+                                if icon_button(ui, vis_label, GREY_FG, GREY_BG, GREY_HOVER) {
+                                    ch.visible = !ch.visible;
+                                }
+                            });
                         });
                     });
                 }
             });
 
-        remove_idx
+        action
     }
 
     /// 紧凑渲染（用于侧边栏变量浏览器下方）
-    ///
-    /// 只显示颜色、名称、可见性切换和移除按钮。
     pub fn show_compact(&mut self, ui: &mut egui::Ui) -> Option<usize> {
         let mut remove_idx: Option<usize> = None;
 
@@ -125,11 +153,9 @@ impl ChannelPanel {
                         ui.colored_label(ch.color, "●");
                         ui.label(&ch.name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // 移除按钮（灰色圆形 ×）
                             if icon_button(ui, "×", GREY_FG, GREY_BG, GREY_HOVER) {
                                 remove_idx = Some(i);
                             }
-                            // 可见性切换（实心 = 可见，空心 = 隐藏）
                             let vis_label = if ch.visible { "●" } else { "○" };
                             if icon_button(ui, vis_label, GREY_FG, GREY_BG, GREY_HOVER) {
                                 ch.visible = !ch.visible;

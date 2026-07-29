@@ -160,7 +160,8 @@ impl WatchPanel {
     }
 
     /// 渲染 Watch 面板（Excel 风格带边框表格）
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    /// `channel_colors` 与 entries 一一对应，用于 Name 列色条。
+    pub fn show(&mut self, ui: &mut egui::Ui, channel_colors: &[egui::Color32]) {
         // 顶部标题
         ui.horizontal(|ui| {
             ui.label(
@@ -181,13 +182,14 @@ impl WatchPanel {
         let row_h = 24.0;
         let header_h = 26.0;
         let total_w: f32 = col_widths.iter().sum();
+        let color_bar_w = 4.0;
 
         let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(205, 205, 210));
         let header_bg = egui::Color32::from_rgb(238, 240, 244);
         let stripe_bg = egui::Color32::from_rgb(249, 250, 251);
         let text_dark = egui::Color32::from_rgb(45, 48, 55);
-        let text_blue = egui::Color32::from_rgb(70, 130, 200);
-        let text_amber = egui::Color32::from_rgb(170, 110, 30);
+        let _text_blue = egui::Color32::from_rgb(70, 130, 200);
+        let _text_amber = egui::Color32::from_rgb(170, 110, 30);
 
         // 收集本帧产生的写入请求
         let mut new_writes: Vec<WriteRequest> = Vec::new();
@@ -234,6 +236,17 @@ impl WatchPanel {
                         ui.painter().rect_filled(row_rect, 0.0, stripe_bg);
                     }
 
+                    // 左侧通道色条
+                    let ch_color = channel_colors
+                        .get(row_idx)
+                        .copied()
+                        .unwrap_or(egui::Color32::from_rgb(160, 160, 160));
+                    let bar = egui::Rect::from_min_size(
+                        egui::Pos2::new(row_rect.left(), row_rect.top() + 2.0),
+                        egui::Vec2::new(color_bar_w, row_h - 4.0),
+                    );
+                    ui.painter().rect_filled(bar, 1.5, ch_color);
+
                     let mut x = row_rect.left();
 
                     // Name
@@ -242,7 +255,7 @@ impl WatchPanel {
                         egui::Vec2::new(col_widths[0], row_h),
                     );
                     ui.painter().text(
-                        r.left_center() + egui::Vec2::new(8.0, 0.0),
+                        r.left_center() + egui::Vec2::new(8.0 + color_bar_w, 0.0),
                         egui::Align2::LEFT_CENTER,
                         &entry.name,
                         egui::FontId::proportional(12.0),

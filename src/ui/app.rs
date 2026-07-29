@@ -15,16 +15,16 @@ use super::variable_browser::VariableBrowser;
 use super::channel_panel::ChannelPanel;
 use super::watch_panel::WatchPanel;
 
-/// 默认颜色调色板（8 种颜色，支持最多 8 通道）
+/// 示波器风格通道色板（高明度、色相均分、暗底可读；避免灰与近邻红粉）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
-    egui::Color32::from_rgb(255, 68, 68),   // 红
-    egui::Color32::from_rgb(68, 255, 68),   // 绿
-    egui::Color32::from_rgb(68, 68, 255),   // 蓝
-    egui::Color32::from_rgb(255, 200, 68),  // 橙
-    egui::Color32::from_rgb(255, 68, 255),  // 品红
-    egui::Color32::from_rgb(68, 255, 255),  // 青
-    egui::Color32::from_rgb(180, 180, 180), // 灰
-    egui::Color32::from_rgb(255, 150, 150), // 粉
+    egui::Color32::from_rgb(255, 196, 72),  // 琥珀黄
+    egui::Color32::from_rgb(64, 196, 255),  // 天蓝
+    egui::Color32::from_rgb(255, 112, 168), // 玫红
+    egui::Color32::from_rgb(80, 220, 140),  // 翠绿
+    egui::Color32::from_rgb(200, 140, 255), // 淡紫
+    egui::Color32::from_rgb(255, 148, 64),  // 橙
+    egui::Color32::from_rgb(72, 230, 220),  // 青
+    egui::Color32::from_rgb(180, 200, 255), // 冰蓝
 ];
 
 /// DAP Sampler 主应用
@@ -70,6 +70,8 @@ pub struct DapSamplerApp {
     window_size: usize,
     /// 最近一次操作错误（显示在顶部状态栏）
     last_error: Option<String>,
+    /// 侧栏选中的通道（波形加粗高亮；再次点击取消）
+    selected_channel: Option<usize>,
 }
 
 impl DapSamplerApp {
@@ -157,6 +159,7 @@ impl DapSamplerApp {
             display_mode,
             window_size: 2000,
             last_error: None,
+            selected_channel: None,
         }
     }
 
@@ -473,6 +476,7 @@ impl DapSamplerApp {
                 .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
         );
         let types = self.waveform.value_types().to_vec();
+        let colors: Vec<egui::Color32> = self.channel_panel.channels.iter().map(|c| c.color).collect();
         if let Some(r) = self.cursor.get_result(
             self.display_buf.all(),
             self.display_buf.oldest_seq(),
@@ -486,10 +490,15 @@ impl DapSamplerApp {
             );
             for (i, v) in r.values.iter().enumerate() {
                 let name = self.waveform.channel_names().get(i).copied().unwrap_or("?");
-                ui.label(
-                    egui::RichText::new(format!("  {}: {:.4}", name, v))
-                        .monospace(),
-                );
+                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, "●");
+                    ui.label(
+                        egui::RichText::new(format!("{}: {:.4}", name, v))
+                            .monospace()
+                            .color(color),
+                    );
+                });
             }
             if self.cursor.cursor2.is_some() {
                 if let Some((dt, dv)) = self.cursor.delta(
@@ -504,15 +513,18 @@ impl DapSamplerApp {
                             .color(egui::Color32::from_rgb(0x58, 0xa6, 0xff)),
                     );
                     for (i, v) in dv.iter().enumerate() {
-                        ui.label(
-                            egui::RichText::new(format!("  dCH{}: {:.4}", i + 1, v))
-                                .monospace(),
-                        );
+                        let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(color, "●");
+                            ui.label(
+                                egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v))
+                                    .monospace()
+                                    .color(color),
+                            );
+                        });
                     }
                 }
             }
-        } else {
-            // 未放置光标时不显示任何内容
         }
     }
 }
@@ -645,11 +657,25 @@ impl eframe::App for DapSamplerApp {
                             .default_open(self.channels_open)
                             .id_salt("channels_header")
                             .show(ui, |ui| {
-                                if let Some(remove_idx) = self.channel_panel.show(ui) {
+                                let action = self.channel_panel.show(ui, self.selected_channel);
+                                if let Some(idx) = action.select {
+                                    self.selected_channel = if self.selected_channel == Some(idx) {
+                                        None
+                                    } else {
+                                        Some(idx)
+                                    };
+                                }
+                                if let Some(remove_idx) = action.remove {
                                     let name = self.channel_panel.channels[remove_idx].name.clone();
                                     self.variable_browser.checked_paths.remove(&name);
                                     self.channel_panel.remove_channel(remove_idx);
-                                    // 同步 Watch 面板
+                                    if let Some(sel) = self.selected_channel {
+                                        if sel == remove_idx {
+                                            self.selected_channel = None;
+                                        } else if sel > remove_idx {
+                                            self.selected_channel = Some(sel - 1);
+                                        }
+                                    }
                                     let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
                                     let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
                                     let addresses = self.collect_channel_addresses();
@@ -675,7 +701,9 @@ impl eframe::App for DapSamplerApp {
             .default_height(180.0)
             .min_height(180.0)
             .show(ctx, |ui| {
-                self.watch_panel.show(ui);
+                let colors: Vec<egui::Color32> =
+                    self.channel_panel.channels.iter().map(|c| c.color).collect();
+                self.watch_panel.show(ui, &colors);
             });
 
         // 把本帧 watch 表中提交的 y_offset/y_scale 变更应用到波形图
@@ -756,6 +784,7 @@ impl eframe::App for DapSamplerApp {
                 buffer_offset,
                 available_width,
                 has_new_data,
+                self.selected_channel,
             ) {
                 self.cursor.click(seq);
             }

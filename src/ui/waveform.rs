@@ -98,8 +98,9 @@ impl WaveformPanel {
         ui: &mut egui::Ui,
         buffer: &[Sample],
         buffer_offset: u64,
-        visible_width: f32,
+        _visible_width: f32,
         has_new_data: bool,
+        selected_channel: Option<usize>,
     ) -> Option<u64> {
         if buffer.is_empty() {
             ui.label("Waiting for data...");
@@ -160,7 +161,7 @@ impl WaveformPanel {
         self.auto_fit_y = false; // 一次性触发（首次渲染或用户点击 Auto Fit Y）
 
         let plot = Plot::new("waveform_plot")
-            .legend(Legend::default())
+            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
             .show_grid(true)
             .show_axes(true)
             .x_axis_label(x_label)
@@ -227,7 +228,8 @@ impl WaveformPanel {
             // 捕获鼠标坐标（用于光标点击）
             let pointer_coord = plot_ui.pointer_coordinate();
 
-            // 渲染各通道波形（零拷贝借用缓存数据）
+            // 渲染各通道：选中加粗；有选中时其它通道降透明度
+            let has_selection = selected_channel.is_some();
             for (ch_idx, ch) in self.channels.iter().enumerate() {
                 if !ch.visible {
                     continue;
@@ -236,21 +238,29 @@ impl WaveformPanel {
                 if points.is_empty() {
                     continue;
                 }
+                let is_sel = selected_channel == Some(ch_idx);
+                let color = if has_selection && !is_sel {
+                    dim_color(ch.color, 0.38)
+                } else {
+                    ch.color
+                };
+                let line_w = if is_sel { 2.8 } else { 1.4 };
+                let point_r = if is_sel { 2.4 } else { 1.5 };
                 match self.display_mode {
                     WaveformDisplayMode::Line => {
                         plot_ui.line(
                             Line::new(points.as_slice())
                                 .name(&ch.name)
-                                .color(ch.color)
-                                .width(1.5),
+                                .color(color)
+                                .width(line_w),
                         );
                     }
                     WaveformDisplayMode::Point => {
                         plot_ui.points(
                             Points::new(points.as_slice())
                                 .name(&ch.name)
-                                .color(ch.color)
-                                .radius(1.5),
+                                .color(color)
+                                .radius(point_r),
                         );
                     }
                 }
@@ -440,6 +450,11 @@ impl WaveformPanel {
             self.mark_channel_dirty(idx);
         }
     }
+}
+
+fn dim_color(c: egui::Color32, alpha: f32) -> egui::Color32 {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
 #[cfg(test)]

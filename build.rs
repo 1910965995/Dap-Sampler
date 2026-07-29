@@ -1,7 +1,7 @@
 // build.rs: 嵌入 Windows exe 图标
 //
-// 仅在 Windows 下编译资源脚本，把 icon/icon.ico 作为应用程序图标打入 exe。
-// 图标在资源管理器、任务栏、窗口标题栏等处显示。
+// 仅在 Windows 下编译资源脚本，把 icon/icon.ico（由 dap-sampler.ico 圆角处理后生成）
+// 作为应用程序图标打入 exe。图标在资源管理器、任务栏、窗口标题栏等处显示。
 
 fn main() {
     #[cfg(windows)]

@@ -5,6 +5,7 @@ use super::parser::{ElfSymbolRaw, ElfVariable};
 use crate::pipeline::sample::ValueType;
 
 /// 解析后的类型（沿 typedef/const/volatile 链找到最终类型）
+#[derive(Debug)]
 enum ResolvedType {
     Base(String, u32),
     Struct(u64),

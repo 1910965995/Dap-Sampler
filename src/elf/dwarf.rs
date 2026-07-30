@@ -27,6 +27,7 @@ pub struct DwarfVarInfo {
     pub source_line: Option<u32>,
 }
 
+#[derive(Debug)]
 pub enum DwarfTypeInfo {
     Base { name: String, byte_size: u32 },
     Alias { name: String, target_offset: u64 },
@@ -35,6 +36,7 @@ pub enum DwarfTypeInfo {
     Pointer { byte_size: u32 },
 }
 
+#[derive(Debug)]
 pub struct StructMember {
     pub name: String,
     pub type_offset: u64,
@@ -125,15 +127,22 @@ fn collect_flat_entries<'a>(
     // 第一遍：收集所有 raw DIE（需要跟踪 depth）
     let mut raw_dies: Vec<RawDie> = Vec::new();
 
+    // 计算本 unit 在 .debug_info 中的基地址，用于把 UnitRef 转为全局 offset
+    let unit_base = match unit.header.offset() {
+        gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0 as u64,
+        _ => 0u64,
+    };
+
     let mut entries = unit.entries();
     while let Some((delta, entry)) = entries.next_dfs().map_err(|e| format!("遍历 DIE 失败: {}", e))? {
-        let offset = entry.offset().0 as u64;
+        // 统一使用 .debug_info 全局 offset 作为 key，避免跨 unit 的 DebugInfoRef 无法匹配
+        let offset = unit_base + entry.offset().0 as u64;
         let tag = entry.tag();
 
         // 提取通用属性（名称可能是内联 String 或 .debug_str 的 DebugStrRef）
         let name = entry_attr_string(entry, DW_AT_name, unit, dwarf);
         let byte_size = attr_u32(entry, DW_AT_byte_size);
-        let type_ref = attr_type_ref(entry);
+        let type_ref = attr_type_ref(entry, unit_base);
 
         // 提取变量地址
         let address = if tag == DW_TAG_variable {
@@ -142,9 +151,9 @@ fn collect_flat_entries<'a>(
             None
         };
 
-        // 提取 struct member 偏移
+        // 提取 struct member 偏移（支持 data1/2/4/udata 和 exprloc 形式）
         let member_offset = if tag == gimli::DW_TAG_member {
-            attr_u32(entry, DW_AT_data_member_location)
+            attr_member_offset(entry, unit.encoding())
         } else {
             None
         };
@@ -348,10 +357,13 @@ fn extract_address_from_entry<'a>(
 
 fn attr_type_ref<'a>(
     entry: &gimli::DebuggingInformationEntry<'a, 'a, R<'a>, usize>,
+    unit_base: u64,
 ) -> Option<u64> {
     let val = entry_attr(entry, DW_AT_type)?;
     match val {
-        gimli::AttributeValue::UnitRef(offset) => Some(offset.0 as u64),
+        // UnitRef 是 unit 内相对 offset，需要加上 unit 基地址得到全局 offset
+        gimli::AttributeValue::UnitRef(offset) => Some(unit_base + offset.0 as u64),
+        // DebugInfoRef 已经是 .debug_info 全局 offset
         gimli::AttributeValue::DebugInfoRef(offset) => Some(offset.0 as u64),
         _ => None,
     }
@@ -419,6 +431,34 @@ fn attr_u32<'a>(
         gimli::AttributeValue::Data1(s) => Some(s as u32),
         gimli::AttributeValue::Data2(s) => Some(s as u32),
         gimli::AttributeValue::Data4(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// 提取结构体成员的偏移量。
+///
+/// DW_AT_data_member_location 可能是简单整数（data1/2/4/udata），
+/// 也可能是 exprloc（常见为 DW_OP_plus_uconst <offset>）。
+fn attr_member_offset<'a>(
+    entry: &gimli::DebuggingInformationEntry<'a, 'a, R<'a>, usize>,
+    encoding: gimli::Encoding,
+) -> Option<u32> {
+    let val = entry_attr(entry, DW_AT_data_member_location)?;
+    match val {
+        gimli::AttributeValue::Udata(s) => Some(s as u32),
+        gimli::AttributeValue::Data1(s) => Some(s as u32),
+        gimli::AttributeValue::Data2(s) => Some(s as u32),
+        gimli::AttributeValue::Data4(s) => Some(s),
+        gimli::AttributeValue::Exprloc(expr) => {
+            let mut ops = expr.operations(encoding);
+            while let Some(op) = ops.next().ok()? {
+                // 结构体成员偏移通常编码为 DW_OP_plus_uconst
+                if let gimli::Operation::PlusConstant { value } = op {
+                    return Some(value as u32);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }

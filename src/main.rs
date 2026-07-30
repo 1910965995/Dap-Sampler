@@ -18,6 +18,11 @@ struct Cli {
 enum Command {
     /// 列出所有连接的 CMSIS-DAP 设备
     List,
+    /// 解析 ELF 文件并打印变量树（调试用）
+    Dump {
+        /// ELF 文件路径
+        elf: String,
+    },
     /// 连接设备并显示调试信息
     Info {
         /// SWD 时钟频率（MHz，1-50）
@@ -150,6 +155,7 @@ fn main() -> anyhow::Result<()> {
         swd_clock: 1,
     }) {
         Command::List => cmd_list(),
+        Command::Dump { elf } => cmd_dump(&elf),
         Command::Info { swd_clock } => cmd_info(swd_clock),
         Command::Diag { claim } => cmd_diag(claim),
         Command::Read { address, float, swd_clock } => cmd_read(&address, float, swd_clock),
@@ -207,6 +213,23 @@ fn attach_parent_console() {
             }
         }
     }
+}
+
+fn cmd_dump(elf_path: &str) -> anyhow::Result<()> {
+    use dap_sampler::elf::ElfParser;
+
+    println!("📦 解析 ELF: {}", elf_path);
+    let ctx = ElfParser::load(elf_path)
+        .map_err(|e| anyhow::anyhow!("ELF 加载失败: {}", e))?;
+
+    println!("变量总数: {}", ctx.variables.len());
+    for var in &ctx.variables {
+        println!(
+            "  {:<40} addr=0x{:08X} size={:<4} type={:?}  src={:?}",
+            var.path, var.address, var.byte_size, var.value_type, var.source_file
+        );
+    }
+    Ok(())
 }
 
 fn cmd_list() -> anyhow::Result<()> {

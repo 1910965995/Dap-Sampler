@@ -174,7 +174,6 @@ impl DapSamplerApp {
     }
 
     /// 新建工程：清空当前全部配置，参数回默认值
-    #[allow(dead_code)]
     fn new_project(&mut self) {
         self.last_error = None;
         self.stop_acquisition();
@@ -210,7 +209,6 @@ impl DapSamplerApp {
     }
 
     /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
-    #[allow(dead_code)]
     fn save_project(&mut self) {
         let file = ProjectFile {
             version: PROJECT_VERSION,
@@ -264,7 +262,6 @@ impl DapSamplerApp {
     }
 
     /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
-    #[allow(dead_code)]
     fn open_project(&mut self, path: &std::path::Path) {
         self.last_error = None;
         self.stop_acquisition();
@@ -777,6 +774,35 @@ impl eframe::App for DapSamplerApp {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("DAP Sampler");
+                ui.separator();
+
+                // 工程操作：新建 / 打开 / 保存
+                if ui.button("\u{1f4c2} 新建工程").clicked() {
+                    self.new_project();
+                }
+                if ui.button("\u{1f4c2} 打开工程").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("DAP Sampler Project", &["dapsproj"])
+                        .pick_file()
+                    {
+                        self.open_project(&path);
+                    }
+                }
+                if ui.button("\u{1f4be} 保存工程").clicked() {
+                    self.save_project();
+                }
+                let proj_name = self
+                    .project_path
+                    .as_ref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "(未保存)".to_string());
+                ui.label(
+                    egui::RichText::new(format!("project: {}", proj_name))
+                        .small()
+                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                );
+
                 ui.separator();
 
                 // 状态指示（带颜色圆点）

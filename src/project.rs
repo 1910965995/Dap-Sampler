@@ -48,8 +48,20 @@ pub struct ProjectVariable {
 
 impl ProjectFile {
     /// 序列化为 pretty JSON（字段按声明顺序输出，便于 diff）
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("ProjectFile 序列化不应失败")
+    ///
+    /// 浮点字段（y_offset / y_scale / refresh_period_s）可能来自用户输入，
+    /// 非有限浮点数（NaN/Infinity）先主动拒绝，避免写出损坏文件，而不是 panic。
+    pub fn to_json(&self) -> Result<String> {
+        for v in &self.variables {
+            if !v.y_offset.is_finite() || !v.y_scale.is_finite() || !v.refresh_period_s.is_finite() {
+                return Err(Error::Other(format!(
+                    "工程文件序列化失败: 变量 \"{}\" 含非有限浮点数（NaN/Infinity）",
+                    v.name
+                )));
+            }
+        }
+        serde_json::to_string_pretty(self)
+            .map_err(|e| Error::Other(format!("工程文件序列化失败: {}", e)))
     }
 
     /// 从 JSON 字符串反序列化，并校验版本号
@@ -84,8 +96,6 @@ impl ProjectVariable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::sample::ValueType;
-    use crate::ui::waveform::WaveformDisplayMode;
 
     fn sample_file() -> ProjectFile {
         ProjectFile {
@@ -121,7 +131,7 @@ mod tests {
     #[test]
     fn round_trip_preserves_all_fields() {
         let file = sample_file();
-        let json = file.to_json();
+        let json = file.to_json().unwrap();
         let restored = ProjectFile::from_json(&json).expect("round-trip 不应失败");
         assert_eq!(restored, file);
         // 中文 remark 完好
@@ -135,7 +145,7 @@ mod tests {
         let mut file = sample_file();
         file.elf_path = None;
         file.variables = vec![];
-        let restored = ProjectFile::from_json(&file.to_json()).unwrap();
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
         assert_eq!(restored, file);
         assert!(restored.elf_path.is_none());
         assert!(restored.variables.is_empty());
@@ -151,7 +161,7 @@ mod tests {
     fn unsupported_version_returns_err() {
         let mut file = sample_file();
         file.version = 99;
-        let json = file.to_json();
+        let json = file.to_json().unwrap();
         let err = ProjectFile::from_json(&json).unwrap_err();
         assert!(err.to_string().contains("版本不支持"), "错误应说明版本不支持: {}", err);
     }
@@ -160,7 +170,7 @@ mod tests {
     fn invalid_value_type_falls_back_to_uint32() {
         let mut file = sample_file();
         file.variables[0].value_type = "banana".to_string();
-        let restored = ProjectFile::from_json(&file.to_json()).unwrap();
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
         assert_eq!(restored.variables[0].value_type(), ValueType::Uint32);
     }
 
@@ -168,8 +178,23 @@ mod tests {
     fn invalid_display_mode_falls_back_to_line() {
         let mut file = sample_file();
         file.display_mode = "3d".to_string();
-        let restored = ProjectFile::from_json(&file.to_json()).unwrap();
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
         assert_eq!(restored.display_mode(), WaveformDisplayMode::Line);
+    }
+
+    #[test]
+    fn display_mode_uppercase_parses() {
+        let mut file = sample_file();
+        file.display_mode = "POINT".to_string();
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
+        assert_eq!(restored.display_mode(), WaveformDisplayMode::Point);
+    }
+
+    #[test]
+    fn nan_value_serialization_returns_err() {
+        let mut file = sample_file();
+        file.variables[0].y_scale = f32::NAN;
+        assert!(file.to_json().is_err());
     }
 
     #[test]

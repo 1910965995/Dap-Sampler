@@ -10,6 +10,16 @@ pub enum WaveformDisplayMode {
     Point,
 }
 
+impl WaveformDisplayMode {
+    /// 小写字符串（与 ProjectFile::display_mode() 的解析互逆）
+    pub fn label(&self) -> &'static str {
+        match self {
+            WaveformDisplayMode::Line => "line",
+            WaveformDisplayMode::Point => "point",
+        }
+    }
+}
+
 /// 单通道波形线信息
 pub struct ChannelInfo {
     pub name: String,

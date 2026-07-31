@@ -303,16 +303,47 @@ impl DapSamplerApp {
 
         // 3. 恢复通道与 Watch 列表
         if elf_loaded {
-            // ELF 模式：勾选全部工程变量 → 复用 apply_variable_changes 重建通道
+            // ELF 模式：勾选工程变量 → 复用 apply_variable_changes 重建通道
             self.manual_addresses.clear();
             self.manual_channel_names.clear();
             self.manual_value_types.clear();
             self.variable_browser.clear();
+            // 只恢复 ELF 中真实存在的变量（固件符号可能已变化），缺失者警告跳过
+            let mut missing: Vec<String> = Vec::new();
             for v in &file.variables {
-                self.variable_browser.checked_paths.insert(v.name.clone());
+                let exists = self.elf_ctx.as_ref().is_some_and(|ctx| {
+                    ctx.variables.iter().any(|ev| ev.path == v.name || ev.name == v.name)
+                });
+                if exists {
+                    self.variable_browser.checked_paths.insert(v.name.clone());
+                } else {
+                    missing.push(v.name.clone());
+                }
             }
-            let changes: Vec<(String, bool)> =
-                file.variables.iter().map(|v| (v.name.clone(), true)).collect();
+            if !missing.is_empty() {
+                self.set_error(format!(
+                    "工程中 {} 个变量在 ELF 中不存在，已跳过: {}",
+                    missing.len(),
+                    missing.join(", ")
+                ));
+            }
+            // 先移除不在工程内的旧通道，再添加工程变量通道
+            let project_names: std::collections::HashSet<&str> =
+                file.variables.iter().map(|v| v.name.as_str()).collect();
+            let mut changes: Vec<(String, bool)> = self
+                .channel_panel
+                .channels
+                .iter()
+                .filter(|c| !project_names.contains(c.name.as_str()))
+                .map(|c| (c.name.clone(), false))
+                .collect();
+            changes.extend(
+                file
+                    .variables
+                    .iter()
+                    .filter(|v| !missing.contains(&v.name))
+                    .map(|v| (v.name.clone(), true)),
+            );
             self.apply_variable_changes(changes);
         } else {
             // 手工模式（或 ELF 加载失败降级）：用工程里的地址/类型直接恢复
@@ -367,8 +398,8 @@ impl DapSamplerApp {
         self.rate_hz = self.controls.sample_rate;
         self.interval_us = 1_000_000.0 / self.rate_hz as f64;
         self.waveform.set_interval(self.interval_us);
-        self.controls.swd_clock_mhz = file.swd_clock_mhz;
-        self.swd_clock_mhz = file.swd_clock_mhz;
+        self.controls.swd_clock_mhz = file.swd_clock_mhz.clamp(1, 50);
+        self.swd_clock_mhz = self.controls.swd_clock_mhz;
         self.controls.window_size = file.window_size
             .clamp(crate::ui::controls::WINDOW_MIN, crate::ui::controls::WINDOW_MAX);
         self.window_size = self.controls.window_size;
@@ -381,6 +412,7 @@ impl DapSamplerApp {
         self.cursor.clear();
         self.controls.update_count(0);
         self.selected_channel = None;
+        self.controls.target_count = None;
 
         // 7. 记录工程路径
         self.project_path = Some(path.display().to_string());
@@ -777,7 +809,7 @@ impl eframe::App for DapSamplerApp {
                 ui.separator();
 
                 // 工程操作：新建 / 打开 / 保存
-                if ui.button("\u{1f4c2} 新建工程").clicked() {
+                if ui.button("\u{1f4c1} 新建工程").clicked() {
                     self.new_project();
                 }
                 if ui.button("\u{1f4c2} 打开工程").clicked() {

@@ -74,7 +74,6 @@ pub struct DapSamplerApp {
     /// 侧栏选中的通道（波形加粗高亮；再次点击取消）
     selected_channel: Option<usize>,
     /// 当前工程文件路径（None = 未保存过；保存时已有路径则直接覆盖）
-    #[allow(dead_code)]
     project_path: Option<String>,
 }
 
@@ -177,9 +176,8 @@ impl DapSamplerApp {
     /// 新建工程：清空当前全部配置，参数回默认值
     #[allow(dead_code)]
     fn new_project(&mut self) {
-        if self.pipeline.is_some() {
-            self.stop_acquisition();
-        }
+        self.last_error = None;
+        self.stop_acquisition();
         // 清空 ELF / 通道 / Watch / 手工模式
         self.elf_ctx = None;
         self.variable_browser.clear();
@@ -206,6 +204,7 @@ impl DapSamplerApp {
         self.controls.update_count(0);
         self.controls.set_stopped();
         self.selected_channel = None;
+        self.controls.target_count = None;
         self.project_path = None;
         log::info!("已新建工程（清空配置）");
     }
@@ -267,9 +266,8 @@ impl DapSamplerApp {
     /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
     #[allow(dead_code)]
     fn open_project(&mut self, path: &std::path::Path) {
-        if self.pipeline.is_some() {
-            self.stop_acquisition();
-        }
+        self.last_error = None;
+        self.stop_acquisition();
 
         // 1. 读取并解析（失败不动当前状态）
         let text = match std::fs::read_to_string(path) {
@@ -309,6 +307,9 @@ impl DapSamplerApp {
         // 3. 恢复通道与 Watch 列表
         if elf_loaded {
             // ELF 模式：勾选全部工程变量 → 复用 apply_variable_changes 重建通道
+            self.manual_addresses.clear();
+            self.manual_channel_names.clear();
+            self.manual_value_types.clear();
             self.variable_browser.clear();
             for v in &file.variables {
                 self.variable_browser.checked_paths.insert(v.name.clone());
@@ -322,6 +323,7 @@ impl DapSamplerApp {
             self.manual_value_types =
                 file.variables.iter().map(|v| v.value_type()).collect();
             self.manual_channel_names = file.variables.iter().map(|v| v.name.clone()).collect();
+            self.variable_browser.clear();
             self.channel_panel.channels.clear();
             for (i, v) in file.variables.iter().enumerate() {
                 let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
@@ -345,6 +347,13 @@ impl DapSamplerApp {
         }
 
         // 4. 覆盖 Watch 配置字段（y_offset/y_scale/refresh/remark 以工程为准）
+        if self.watch_panel.entries.len() != file.variables.len() {
+            log::warn!(
+                "工程变量数与通道数不一致（{} vs {}），多余变量被忽略",
+                file.variables.len(),
+                self.watch_panel.entries.len()
+            );
+        }
         for (entry, pv) in self.watch_panel.entries.iter_mut().zip(&file.variables) {
             entry.name = pv.name.clone();
             entry.address = pv.address;
@@ -356,14 +365,16 @@ impl DapSamplerApp {
         }
 
         // 5. 恢复全局参数（controls 与 app 字段、waveform 三方同步）
-        self.controls.sample_rate = file.sample_rate_hz;
-        self.rate_hz = file.sample_rate_hz;
+        self.controls.sample_rate = file.sample_rate_hz
+            .clamp(crate::ui::controls::RATE_MIN, crate::ui::controls::RATE_MAX);
+        self.rate_hz = self.controls.sample_rate;
         self.interval_us = 1_000_000.0 / self.rate_hz as f64;
         self.waveform.set_interval(self.interval_us);
         self.controls.swd_clock_mhz = file.swd_clock_mhz;
         self.swd_clock_mhz = file.swd_clock_mhz;
-        self.controls.window_size = file.window_size;
-        self.window_size = file.window_size;
+        self.controls.window_size = file.window_size
+            .clamp(crate::ui::controls::WINDOW_MIN, crate::ui::controls::WINDOW_MAX);
+        self.window_size = self.controls.window_size;
         let mode = file.display_mode();
         self.waveform.set_display_mode(mode);
         self.display_mode = mode;

@@ -14,6 +14,7 @@ use super::cursor::CursorState;
 use super::variable_browser::VariableBrowser;
 use super::channel_panel::ChannelPanel;
 use super::watch_panel::WatchPanel;
+use crate::project::{ProjectFile, ProjectVariable, PROJECT_VERSION};
 
 /// 示波器风格通道色板（高明度、色相均分、暗底可读；避免灰与近邻红粉）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
@@ -72,6 +73,9 @@ pub struct DapSamplerApp {
     last_error: Option<String>,
     /// 侧栏选中的通道（波形加粗高亮；再次点击取消）
     selected_channel: Option<usize>,
+    /// 当前工程文件路径（None = 未保存过；保存时已有路径则直接覆盖）
+    #[allow(dead_code)]
+    project_path: Option<String>,
 }
 
 impl DapSamplerApp {
@@ -160,6 +164,7 @@ impl DapSamplerApp {
             window_size: 2000,
             last_error: None,
             selected_channel: None,
+            project_path: None,
         }
     }
 
@@ -167,6 +172,211 @@ impl DapSamplerApp {
         let message = message.into();
         log::error!("{}", message);
         self.last_error = Some(message);
+    }
+
+    /// 新建工程：清空当前全部配置，参数回默认值
+    #[allow(dead_code)]
+    fn new_project(&mut self) {
+        if self.pipeline.is_some() {
+            self.stop_acquisition();
+        }
+        // 清空 ELF / 通道 / Watch / 手工模式
+        self.elf_ctx = None;
+        self.variable_browser.clear();
+        self.channel_panel.channels.clear();
+        self.watch_panel.entries.clear();
+        self.manual_addresses.clear();
+        self.manual_channel_names.clear();
+        self.manual_value_types.clear();
+        self.current_addresses.clear();
+        // 参数回默认（与 DapSamplerApp::new 一致：5000 Hz / 2000 点 / 1 MHz / Line）
+        self.rate_hz = 5000;
+        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
+        self.window_size = 2000;
+        self.controls.sample_rate = self.rate_hz;
+        self.controls.window_size = self.window_size;
+        self.controls.swd_clock_mhz = 1;
+        self.swd_clock_mhz = 1;
+        let mode = WaveformDisplayMode::Line;
+        self.display_mode = mode;
+        self.waveform = WaveformPanel::new(vec![], vec![], self.interval_us, vec![], mode);
+        // 清空运行时状态
+        self.display_buf = DisplayBuffer::new(self.window_size);
+        self.cursor.clear();
+        self.controls.update_count(0);
+        self.controls.set_stopped();
+        self.selected_channel = None;
+        self.project_path = None;
+        log::info!("已新建工程（清空配置）");
+    }
+
+    /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
+    #[allow(dead_code)]
+    fn save_project(&mut self) {
+        let file = ProjectFile {
+            version: PROJECT_VERSION,
+            elf_path: self.elf_ctx.as_ref().map(|c| c.file_path.clone()),
+            sample_rate_hz: self.controls.sample_rate,
+            swd_clock_mhz: self.controls.swd_clock_mhz,
+            window_size: self.controls.window_size,
+            display_mode: self.waveform.display_mode().label().to_string(),
+            variables: self
+                .watch_panel
+                .entries
+                .iter()
+                .map(|e| ProjectVariable {
+                    name: e.name.clone(),
+                    address: e.address,
+                    value_type: e.value_type.label().to_string(),
+                    refresh_period_s: e.refresh_period_s,
+                    y_offset: e.y_offset,
+                    y_scale: e.y_scale,
+                    remark: e.remark.clone(),
+                })
+                .collect(),
+        };
+        let json = match file.to_json() {
+            Ok(j) => j,
+            Err(e) => {
+                self.set_error(e.to_string());
+                return;
+            }
+        };
+
+        // 目标路径：已保存过则直接覆盖；否则弹保存对话框
+        let path = match self.project_path.clone() {
+            Some(p) => Some(std::path::PathBuf::from(p)),
+            None => rfd::FileDialog::new()
+                .add_filter("DAP Sampler Project", &["dapsproj"])
+                .set_file_name("dap-sampler.dapsproj")
+                .save_file(),
+        };
+        let Some(path) = path else {
+            return; // 用户取消对话框
+        };
+
+        match std::fs::write(&path, json) {
+            Ok(()) => {
+                self.project_path = Some(path.display().to_string());
+                log::info!("工程已保存: {}", path.display());
+            }
+            Err(e) => self.set_error(format!("保存工程失败: {}", e)),
+        }
+    }
+
+    /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
+    #[allow(dead_code)]
+    fn open_project(&mut self, path: &std::path::Path) {
+        if self.pipeline.is_some() {
+            self.stop_acquisition();
+        }
+
+        // 1. 读取并解析（失败不动当前状态）
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_error(format!("读取工程文件失败: {}", e));
+                return;
+            }
+        };
+        let file = match ProjectFile::from_json(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                self.set_error(e.to_string());
+                return;
+            }
+        };
+
+        // 2. 加载 ELF（失败仅警告，用保存的地址继续）
+        let elf_loaded = if let Some(elf_path) = &file.elf_path {
+            match ElfParser::load(elf_path) {
+                Ok(ctx) => {
+                    self.elf_ctx = Some(ctx);
+                    log::info!("ELF 已加载: {}", elf_path);
+                    true
+                }
+                Err(e) => {
+                    self.elf_ctx = None;
+                    self.set_error(format!("ELF 加载失败，已用保存的变量地址继续: {}", e));
+                    false
+                }
+            }
+        } else {
+            self.elf_ctx = None;
+            false
+        };
+
+        // 3. 恢复通道与 Watch 列表
+        if elf_loaded {
+            // ELF 模式：勾选全部工程变量 → 复用 apply_variable_changes 重建通道
+            self.variable_browser.clear();
+            for v in &file.variables {
+                self.variable_browser.checked_paths.insert(v.name.clone());
+            }
+            let changes: Vec<(String, bool)> =
+                file.variables.iter().map(|v| (v.name.clone(), true)).collect();
+            self.apply_variable_changes(changes);
+        } else {
+            // 手工模式（或 ELF 加载失败降级）：用工程里的地址/类型直接恢复
+            self.manual_addresses = file.variables.iter().map(|v| v.address).collect();
+            self.manual_value_types =
+                file.variables.iter().map(|v| v.value_type()).collect();
+            self.manual_channel_names = file.variables.iter().map(|v| v.name.clone()).collect();
+            self.channel_panel.channels.clear();
+            for (i, v) in file.variables.iter().enumerate() {
+                let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+                self.channel_panel
+                    .add_channel(v.name.clone(), color, v.value_type());
+            }
+            let names: Vec<String> = self
+                .channel_panel
+                .channels
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let types: Vec<ValueType> = self
+                .channel_panel
+                .channels
+                .iter()
+                .map(|c| c.value_type)
+                .collect();
+            self.watch_panel
+                .sync_from_channels(&names, &types, &self.manual_addresses);
+        }
+
+        // 4. 覆盖 Watch 配置字段（y_offset/y_scale/refresh/remark 以工程为准）
+        for (entry, pv) in self.watch_panel.entries.iter_mut().zip(&file.variables) {
+            entry.name = pv.name.clone();
+            entry.address = pv.address;
+            entry.value_type = pv.value_type();
+            entry.refresh_period_s = pv.refresh_period_s;
+            entry.y_offset = pv.y_offset;
+            entry.y_scale = pv.y_scale;
+            entry.remark = pv.remark.clone();
+        }
+
+        // 5. 恢复全局参数（controls 与 app 字段、waveform 三方同步）
+        self.controls.sample_rate = file.sample_rate_hz;
+        self.rate_hz = file.sample_rate_hz;
+        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
+        self.waveform.set_interval(self.interval_us);
+        self.controls.swd_clock_mhz = file.swd_clock_mhz;
+        self.swd_clock_mhz = file.swd_clock_mhz;
+        self.controls.window_size = file.window_size;
+        self.window_size = file.window_size;
+        let mode = file.display_mode();
+        self.waveform.set_display_mode(mode);
+        self.display_mode = mode;
+
+        // 6. 清空运行时状态，回到 Idle
+        self.display_buf = DisplayBuffer::new(self.window_size);
+        self.cursor.clear();
+        self.controls.update_count(0);
+        self.selected_channel = None;
+
+        // 7. 记录工程路径
+        self.project_path = Some(path.display().to_string());
+        log::info!("已打开工程: {}", path.display());
     }
 
     fn start_acquisition(&mut self) {

@@ -415,6 +415,13 @@ impl PipelineHandle {
         self.ring_buffer.total_written()
     }
 
+    /// 查询环形缓冲累计覆盖（丢弃）的采样点数
+    ///
+    /// 消费端（UI）跟不上采样速度时非零，用于状态栏提示数据丢失。
+    pub fn overwritten_samples(&self) -> u64 {
+        self.ring_buffer.overwritten()
+    }
+
     /// 优雅停止采集
     ///
     /// 设置停止标志，等待两个子线程退出。

@@ -620,6 +620,20 @@ impl eframe::App for DapSamplerApp {
                         let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
                         ui.label(format!("Samples: {} ({:.1}s)", self.controls.total_samples, duration));
                     }
+
+                    // 消费端落后提示：环形缓冲覆盖了旧采样点（数据丢失）
+                    if let Some(ref handle) = self.pipeline {
+                        let overwritten = handle.overwritten_samples();
+                        if overwritten > 0 {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xff, 0xa0, 0x3c),
+                                format!("Overwritten: {}", overwritten),
+                            ).on_hover_text(
+                                "UI 消费速度低于采样速度，环形缓冲区已覆盖旧采样点（数据丢失）。\n通常由窗口拖拽、对话框阻塞或采样率过高引起。"
+                            );
+                        }
+                    }
                 });
             });
         });

@@ -204,23 +204,24 @@ fn stress_ring_buffer_200k() {
         rb.push(Sample::new(i, i as f64 * 0.00005, &[i as u32]));
     }
 
-    // Buffer is full: current implementation drops new samples instead of overwriting old ones.
+    // Overwrite semantics: buffer keeps the NEWEST 200k samples.
     assert_eq!(rb.available(), 200_000);
-    assert_eq!(rb.total_written(), 200_000);
+    assert_eq!(rb.total_written(), 300_000);
+    assert_eq!(rb.overwritten(), 100_000);
 
     // Pop all available
     let mut buf = vec![Sample::default(); 200_000];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 200_000);
 
-    // All retained values should be the first capacity samples [0, 199_999].
+    // All retained values should be the newest range [100_000, 299_999].
     for sample in &buf[..n] {
-        assert!(sample.values()[0] <= 199_999, "value {} too new", sample.values()[0]);
+        assert!(sample.values()[0] >= 100_000, "value {} too old", sample.values()[0]);
     }
 
     // Should contain exactly the expected set of values.
     let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values()[0]).collect();
     found.sort();
-    let expected: Vec<u32> = (0u32..200_000).collect();
+    let expected: Vec<u32> = (100_000u32..300_000).collect();
     assert_eq!(found, expected);
 }

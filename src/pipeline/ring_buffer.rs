@@ -79,8 +79,9 @@ impl RingBuffer {
         let data = unsafe { &*self.data.get() };
         for i in 0..count {
             let idx = (t.wrapping_add(i)) % self.capacity;
-            if let Some(ref sample) = data[idx] {
-                buf[i] = sample.clone();
+            // Sample 为 Copy 类型（定长数组），此处为纯拷贝，零堆分配
+            if let Some(sample) = data[idx] {
+                buf[i] = sample;
             }
         }
 

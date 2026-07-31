@@ -140,7 +140,7 @@ impl DapSamplerApp {
             waveform,
             controls: ControlPanel::new(rate_hz, target_count, swd_clock_mhz),
             cursor: CursorState::new(),
-            temp_buf: (0..1024).map(|_| Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }).collect(),
+            temp_buf: (0..1024).map(|_| Sample::default()).collect(),
             interval_us,
             has_new_data: false,
             elf_ctx,
@@ -349,7 +349,7 @@ impl DapSamplerApp {
         if n > 0 {
             // 更新 Watch 面板的变量值
             for sample in &self.temp_buf[..n] {
-                self.watch_panel.update_values(&sample.values, self.rate_hz);
+                self.watch_panel.update_values(sample.values(), self.rate_hz);
             }
             self.display_buf.push_batch(&self.temp_buf[..n]);
             self.controls.update_count(self.display_buf.next_seq());

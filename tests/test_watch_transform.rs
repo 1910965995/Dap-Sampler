@@ -9,11 +9,7 @@ use dap_sampler::ui::waveform::{WaveformDisplayMode, WaveformPanel};
 use dap_sampler::ui::watch_panel::WatchPanel;
 
 fn make_sample(seq: u64, val: f32) -> Sample {
-    Sample {
-        seq,
-        timestamp_sec: seq as f64 * 0.001,
-        values: vec![val.to_bits()],
-    }
+    Sample::new(seq, seq as f64 * 0.001, &[val.to_bits()])
 }
 
 #[test]
@@ -70,11 +66,11 @@ fn no_samples_dropped_across_realistic_buffer_size() {
 
     let n = 10_000_usize;
     let buffer: Vec<Sample> = (0..n)
-        .map(|i| Sample {
-            seq: i as u64,
-            timestamp_sec: i as f64 * 0.001,
-            values: vec![(i as f32).to_bits(), ((i * 2) as f32).to_bits()],
-        })
+        .map(|i| Sample::new(
+            i as u64,
+            i as f64 * 0.001,
+            &[(i as f32).to_bits(), ((i * 2) as f32).to_bits()],
+        ))
         .collect();
     wfp.rebuild_cache(&buffer);
     assert_eq!(wfp.cached_points[0].len(), n);

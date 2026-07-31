@@ -340,7 +340,7 @@ impl WaveformPanel {
             // 每个原始样本点都转换为 PlotPoint，无降采样、无跳点
             let mut out: Vec<PlotPoint> = Vec::with_capacity(buffer.len());
             for s in buffer {
-                let raw = s.values.get(ch_idx).copied().unwrap_or(0);
+                let raw = s.values().get(ch_idx).copied().unwrap_or(0);
                 let raw_f = vt.to_f64(raw);
                 if !raw_f.is_finite() {
                     continue; // NaN/Inf 不参与 Y 轴 fit,也不绘制
@@ -478,11 +478,7 @@ mod tests {
 
     fn make_buffer(seqs: u64, vals: &[u32]) -> Vec<Sample> {
         (0..seqs)
-            .map(|i| Sample {
-                seq: i,
-                timestamp_sec: i as f64 * 0.001,
-                values: vals.to_vec(),
-            })
+            .map(|i| Sample::new(i, i as f64 * 0.001, vals))
             .collect()
     }
 
@@ -524,11 +520,7 @@ mod tests {
         let n = 5000_usize;
         // 每个样本一个值,值 = i as f32
         let buffer: Vec<Sample> = (0..n)
-            .map(|i| Sample {
-                seq: i as u64,
-                timestamp_sec: i as f64 * 0.001,
-                values: vec![(i as f32).to_bits()],
-            })
+            .map(|i| Sample::new(i as u64, i as f64 * 0.001, &[(i as f32).to_bits()]))
             .collect();
         panel.rebuild_cache(&buffer);
         assert_eq!(panel.cached_points[0].len(), n);

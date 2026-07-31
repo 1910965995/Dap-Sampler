@@ -525,9 +525,8 @@ fn cmd_sample(
 
     let max_samples = count.unwrap_or(u64::MAX);
     let mut total_collected: u64 = 0;
-    let mut sample_buf: Vec<dap_sampler::pipeline::sample::Sample> = (0..1024)
-        .map(|_| dap_sampler::pipeline::sample::Sample { seq: 0, timestamp_sec: 0.0, values: vec![] })
-        .collect();
+    let mut sample_buf: Vec<dap_sampler::pipeline::sample::Sample> =
+        (0..1024).map(|_| dap_sampler::pipeline::sample::Sample::default()).collect();
 
     let mut last_progress = 0u64;
 
@@ -542,13 +541,13 @@ fn cmd_sample(
         for sample in &sample_buf[..n] {
             let time_ms = sample.timestamp_sec * 1000.0;
             write!(writer, "{},{}", sample.seq, time_ms)?;
+            // 直接遍历定长切片，避免 as_floats 的每样本分配
             if as_float {
-                let floats = sample.as_floats();
-                for &v in &floats {
-                    write!(writer, ",{}", v)?;
+                for &v in sample.values() {
+                    write!(writer, ",{}", f32::from_bits(v))?;
                 }
             } else {
-                for &v in &sample.values {
+                for &v in sample.values() {
                     write!(writer, ",0x{:08X}", v)?;
                 }
             }

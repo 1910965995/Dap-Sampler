@@ -17,8 +17,8 @@ fn parse_transfer_ok_single_read() {
     let result = DapProtocol::parse_transfer_response(&resp).unwrap();
     assert_eq!(result.status, TRANSFER_OK);
     assert_eq!(result.count, 1);
-    assert_eq!(result.data.len(), 1);
-    assert_eq!(result.data[0], 0x12345678);
+    assert_eq!(result.values().len(), 1);
+    assert_eq!(result.values()[0], 0x12345678);
 }
 
 #[test]
@@ -33,9 +33,9 @@ fn parse_transfer_ok_multiple_reads() {
     ];
     let result = DapProtocol::parse_transfer_response(&resp).unwrap();
     assert_eq!(result.status, TRANSFER_OK);
-    assert_eq!(result.data.len(), 2);
-    assert_eq!(result.data[0], 0xAAAAAAAA);
-    assert_eq!(result.data[1], 0xBBBBBBBB);
+    assert_eq!(result.values().len(), 2);
+    assert_eq!(result.values()[0], 0xAAAAAAAA);
+    assert_eq!(result.values()[1], 0xBBBBBBBB);
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn parse_transfer_wait_status() {
     let result = DapProtocol::parse_transfer_response(&resp).unwrap();
     assert_eq!(result.status, TRANSFER_WAIT);
     assert_eq!(result.count, 0);
-    assert!(result.data.is_empty());
+    assert!(result.values().is_empty());
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn parse_transfer_zero_data() {
     let result = DapProtocol::parse_transfer_response(&resp).unwrap();
     assert_eq!(result.status, TRANSFER_OK);
     assert_eq!(result.count, 2);
-    assert!(result.data.is_empty());
+    assert!(result.values().is_empty());
 }
 
 // ================================================================

@@ -283,7 +283,7 @@ impl SwdLink {
         let req = TransferRequest::read_ap(AP_REG_IDR);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
 
-        if resp.status != TRANSFER_OK || resp.data.is_empty() {
+        if resp.status != TRANSFER_OK || resp.len == 0 {
             return Err(Error::Swd("AP 扫描失败".into()));
         }
 
@@ -331,7 +331,8 @@ impl SwdLink {
             return Err(Error::TransferFailed(resp.status, resp.count));
         }
 
-        Ok(resp.data)
+        // 返回实际携带的读取值（非热路径，转为 Vec 以保持 API 不变）
+        Ok(resp.data[..resp.len].to_vec())
     }
 
     /// 写入 32 位内存值（单地址）

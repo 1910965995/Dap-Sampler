@@ -145,11 +145,23 @@ impl TransferRequest {
 }
 
 /// Transfer 响应
+///
+/// `data` 使用定长数组（最多 8 个读请求，与采样变量上限一致），
+/// 使 DAP_Transfer 响应解析在采样热路径上零堆分配。
 #[derive(Debug)]
 pub struct TransferResponse {
     pub status: u8,
     pub count: u8,
-    pub data: Vec<u32>,
+    pub data: [u32; crate::pipeline::sample::MAX_VALUES],
+    /// 实际携带的读取值个数
+    pub len: usize,
+}
+
+impl TransferResponse {
+    /// 本次响应实际携带的读取值切片
+    pub fn values(&self) -> &[u32] {
+        &self.data[..self.len]
+    }
 }
 
 /// DAP 设备信息

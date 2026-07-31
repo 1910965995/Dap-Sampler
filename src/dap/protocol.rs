@@ -198,22 +198,20 @@ impl DapProtocol {
 
         // 读返回数据：从 byte 3 开始，每 4 字节一个 u32
         // 只解析 data 中实际存在的完整 u32（调用方已按 resp_len 切片）
+        // 定长数组写入：采样热路径零堆分配
         let data_bytes = &data[3..];
-        let num_values = data_bytes.len() / 4;
-        let mut values = Vec::with_capacity(num_values);
+        let num_values = (data_bytes.len() / 4).min(crate::pipeline::sample::MAX_VALUES);
+        let mut values = [0u32; crate::pipeline::sample::MAX_VALUES];
 
         for i in 0..num_values {
             let offset = i * 4;
-            if offset + 4 > data_bytes.len() {
-                break;
-            }
             let bytes: [u8; 4] = data_bytes[offset..offset + 4]
                 .try_into()
                 .map_err(|_| Error::InvalidResponse("数据解析错误".into()))?;
-            values.push(u32::from_le_bytes(bytes));
+            values[i] = u32::from_le_bytes(bytes);
         }
 
-        Ok(TransferResponse { status, count, data: values })
+        Ok(TransferResponse { status, count, data: values, len: num_values })
     }
 
     /// 便捷方法：执行一次 DAP_Transfer

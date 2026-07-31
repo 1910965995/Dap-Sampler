@@ -36,12 +36,12 @@ fn e2e_single_variable_read_flow() {
 
     let resp = DapProtocol::parse_transfer_response(&fake_response).unwrap();
     assert_eq!(resp.status, TRANSFER_OK);
-    assert_eq!(resp.data.len(), 1);
-    assert_eq!(resp.data[0], 0x40490FDB);
+    assert_eq!(resp.values().len(), 1);
+    assert_eq!(resp.values()[0], 0x40490FDB);
 
     // Step 3: 包装为 Sample
-    let sample = Sample { seq: 0, timestamp_sec: 0.0, values: resp.data };
-    assert_eq!(sample.values[0], 0x40490FDB);
+    let sample = Sample::new(0, 0.0, resp.values());
+    assert_eq!(sample.values()[0], 0x40490FDB);
     let floats = sample.as_floats();
     assert!((floats[0] - 3.1415927).abs() < 1e-6);
 
@@ -73,10 +73,10 @@ fn e2e_multi_variable_read_flow() {
     }
 
     let resp = DapProtocol::parse_transfer_response(&fake_resp).unwrap();
-    assert_eq!(resp.data.len(), 4);
-    assert_eq!(resp.data, values.to_vec());
+    assert_eq!(resp.values().len(), 4);
+    assert_eq!(resp.values(), &values[..]);
 
-    let sample = Sample { seq: 5, timestamp_sec: 0.00025, values: resp.data };
+    let sample = Sample::new(5, 0.00025, resp.values());
     // 验证时间戳字段
     assert!((sample.timestamp_sec - 0.00025).abs() < 1e-9);
 }
@@ -91,21 +91,16 @@ fn e2e_ring_buffer_pipeline_simulation() {
 
     // 模拟接收线程：推送 100 个采样点（每个 4 变量）
     for seq in 0..100u64 {
-        let sample = Sample {
+        let sample = Sample::new(
             seq,
-            timestamp_sec: seq as f64 * 0.00005,
-            values: vec![
-                seq as u32 * 10,
-                seq as u32 * 20,
-                seq as u32 * 30,
-                seq as u32 * 40,
-            ],
-        };
+            seq as f64 * 0.00005,
+            &[seq as u32 * 10, seq as u32 * 20, seq as u32 * 30, seq as u32 * 40],
+        );
         rb.push(sample);
     }
 
     // 模拟主线程：批量消费
-    let mut buf = vec![Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }; 50];
+    let mut buf = vec![Sample::default(); 50];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 50);
     assert_eq!(buf[0].seq, 0);
@@ -140,7 +135,7 @@ fn e2e_data_length_mismatch() {
     // 期望 2 个值，但响应只包含 1 个
     let short_resp = [0x05, 0x04, 0x01, 0xAA, 0xAA, 0xAA, 0xAA]; // only 1 value
     let resp = DapProtocol::parse_transfer_response(&short_resp).unwrap();
-    assert_eq!(resp.data.len(), 1); // parse_transfer_response 不关心期望数量
+    assert_eq!(resp.values().len(), 1); // parse_transfer_response 不关心期望数量
 }
 
 // ================================================================
@@ -151,7 +146,7 @@ fn e2e_data_length_mismatch() {
 fn timestamp_monotonic() {
     let mut prev = -1.0;
     for seq in 0..10000u64 {
-        let sample = Sample { seq, timestamp_sec: seq as f64 * 0.00005, values: vec![] };
+        let sample = Sample::new(seq, seq as f64 * 0.00005, &[]);
         let ts = sample.timestamp_sec;
         assert!(ts > prev, "Timestamp not monotonic at seq={}", seq);
         prev = ts;
@@ -206,7 +201,7 @@ fn stress_ring_buffer_200k() {
 
     // Fill beyond capacity
     for i in 0..300_000u64 {
-        rb.push(Sample { seq: i, timestamp_sec: i as f64 * 0.00005, values: vec![i as u32] });
+        rb.push(Sample::new(i, i as f64 * 0.00005, &[i as u32]));
     }
 
     // Buffer is full: current implementation drops new samples instead of overwriting old ones.
@@ -214,17 +209,17 @@ fn stress_ring_buffer_200k() {
     assert_eq!(rb.total_written(), 200_000);
 
     // Pop all available
-    let mut buf = vec![Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }; 200_000];
+    let mut buf = vec![Sample::default(); 200_000];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 200_000);
 
     // All retained values should be the first capacity samples [0, 199_999].
     for sample in &buf[..n] {
-        assert!(sample.values[0] <= 199_999, "value {} too new", sample.values[0]);
+        assert!(sample.values()[0] <= 199_999, "value {} too new", sample.values()[0]);
     }
 
     // Should contain exactly the expected set of values.
-    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values[0]).collect();
+    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values()[0]).collect();
     found.sort();
     let expected: Vec<u32> = (0u32..200_000).collect();
     assert_eq!(found, expected);

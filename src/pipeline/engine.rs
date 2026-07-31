@@ -126,6 +126,25 @@ impl PipelineEngine {
 
         let dap_index = self.dap.dap_index;
 
+        // 预构建读取请求字节（固定部分，每次采样都一样）
+        // 每变量 = 写 TAR + 读 DRW，共 2 条请求。
+        // 头部第 3 字节（total_requests）在循环内按写入数量重建。
+        let mut read_part: Vec<u8> = Vec::with_capacity(requests.len() * 5 + 3);
+        read_part.push(DAP_TRANSFER);
+        read_part.push(dap_index);
+        read_part.push(requests.len() as u8);
+        for req in &requests {
+            read_part.push(req.request_byte());
+            if !req.rnw {
+                let data = req.write_data.unwrap_or(0);
+                read_part.extend_from_slice(&data.to_le_bytes());
+            }
+        }
+
+        // 循环外复用缓冲区，避免每采样周期堆分配
+        let mut pending_writes: Vec<(u32, u32)> = Vec::with_capacity(24);
+        let mut cmd: Vec<u8> = Vec::with_capacity(read_part.len() + 24 * 10);
+
         let handle = thread::Builder::new()
             .name("dap-submit".into())
             .spawn(move || {
@@ -138,7 +157,7 @@ impl PipelineEngine {
                     // 限制每轮消耗的写入数，确保 total_requests 不超过
                     // MAX_TRANSFER_REQUESTS（避免 u8 截断 + USB 包超限）。
                     let max_writes = (MAX_TRANSFER_REQUESTS.saturating_sub(requests.len())) / 2;
-                    let mut pending_writes: Vec<(u32, u32)> = Vec::with_capacity(max_writes);
+                    pending_writes.clear();
                     if let Ok(mut wq) = write_queue.lock() {
                         while pending_writes.len() < max_writes {
                             if let Some((addr, data)) = wq.pop_front() {
@@ -155,7 +174,12 @@ impl PipelineEngine {
                     let total_requests = requests.len() + pending_writes.len() * 2;
                     // 安全断言：total_requests 必须在 u8 范围内
                     debug_assert!(total_requests <= MAX_TRANSFER_REQUESTS);
-                    let mut cmd = vec![DAP_TRANSFER, dap_index, total_requests as u8];
+
+                    cmd.clear();
+                    // 头部（total_requests 含本次写入）
+                    cmd.push(DAP_TRANSFER);
+                    cmd.push(dap_index);
+                    cmd.push(total_requests as u8);
 
                     // 先写入请求
                     for &(addr, data) in &pending_writes {
@@ -167,14 +191,8 @@ impl PipelineEngine {
                         cmd.extend_from_slice(&data.to_le_bytes());
                     }
 
-                    // 再读取请求
-                    for req in &requests {
-                        cmd.push(req.request_byte());
-                        if !req.rnw {
-                            let data = req.write_data.unwrap_or(0);
-                            cmd.extend_from_slice(&data.to_le_bytes());
-                        }
-                    }
+                    // 再读取请求（复用预构建字节，跳过头部）
+                    cmd.extend_from_slice(&read_part[3..]);
 
                     // --- 发送命令（200ms 超时）---
                     // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
@@ -231,6 +249,8 @@ impl PipelineEngine {
                 // carry-over buffer：保存上次读取的不完整响应尾部，
                 // 下次读取时拼接到开头再解析，避免解析错位。
                 let mut carry: Vec<u8> = Vec::new();
+                // 拼接缓冲：循环外复用，避免每轮堆分配
+                let mut data: Vec<u8> = Vec::with_capacity(4096);
                 let mut seq: u64 = 0;
 
                 // 每个 DAP_Transfer 响应的固定长度：
@@ -252,8 +272,8 @@ impl PipelineEngine {
                     };
 
                     // 拼接 carry + 本次读取的数据到一个连续缓冲区
-                    // （carry 通常为空或仅几字节，分配开销可忽略）
-                    let mut data: Vec<u8> = Vec::with_capacity(carry.len() + n);
+                    // （复用缓冲区，仅重置长度，不重新分配）
+                    data.clear();
                     data.extend_from_slice(&carry);
                     data.extend_from_slice(&buf[..n]);
                     carry.clear();
@@ -288,11 +308,8 @@ impl PipelineEngine {
                         // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
                         let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
 
-                        let sample = Sample {
-                            seq,
-                            timestamp_sec,
-                            values: resp.data.clone(),
-                        };
+                        // 定长数组写入：零堆分配
+                        let sample = Sample::new(seq, timestamp_sec, &resp.data[..resp.len]);
 
                         ring.push(sample);
                         seq += 1;

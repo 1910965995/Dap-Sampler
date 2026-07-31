@@ -38,7 +38,7 @@ impl DisplayBuffer {
             self.offset += drain_count as u64;
         }
 
-        self.samples.extend(batch.iter().cloned());
+        self.samples.extend(batch.iter().copied());
 
         // 极端情况：batch 本身超过容量，截断保留最新部分
         let excess = self.samples.len().saturating_sub(self.max_samples);

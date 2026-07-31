@@ -3,7 +3,7 @@ use dap_sampler::pipeline::ring_buffer::RingBuffer;
 use dap_sampler::pipeline::sample::Sample;
 
 fn make_sample(seq: u64, val: u32) -> Sample {
-    Sample { seq, timestamp_sec: seq as f64 * 0.001, values: vec![val] }
+    Sample::new(seq, seq as f64 * 0.001, &[val])
 }
 
 // ================================================================
@@ -38,7 +38,7 @@ fn push_then_pop_single() {
 
     assert_eq!(n, 1);
     assert_eq!(buf[0].seq, 0);
-    assert_eq!(buf[0].values[0], 0xAA);
+    assert_eq!(buf[0].values()[0], 0xAA);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn push_multiple_pop_all() {
     assert_eq!(n, 5);
     for i in 0..5 {
         assert_eq!(buf[i].seq, i as u64);
-        assert_eq!(buf[i].values[0], i as u32 * 10);
+        assert_eq!(buf[i].values()[0], i as u32 * 10);
     }
 }
 
@@ -200,7 +200,7 @@ fn stress_large_volume() {
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 1024);
 
-    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values[0]).collect();
+    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values()[0]).collect();
     found.sort();
     let expected: Vec<u32> = (0u32..1024).collect();
     assert_eq!(found, expected);
@@ -213,13 +213,13 @@ fn stress_large_volume() {
 #[test]
 fn multi_value_sample_roundtrip() {
     let rb = RingBuffer::new(8);
-    let sample = Sample { seq: 42, timestamp_sec: 0.042, values: vec![0x11111111, 0x22222222, 0x33333333, 0x44444444] };
+    let sample = Sample::new(42, 0.042, &[0x11111111, 0x22222222, 0x33333333, 0x44444444]);
     rb.push(sample);
 
     let mut buf = vec![make_sample(0, 0); 4];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 1);
     assert_eq!(buf[0].seq, 42);
-    assert_eq!(buf[0].values.len(), 4);
-    assert_eq!(buf[0].values, vec![0x11111111, 0x22222222, 0x33333333, 0x44444444]);
+    assert_eq!(buf[0].values().len(), 4);
+    assert_eq!(buf[0].values(), &[0x11111111, 0x22222222, 0x33333333, 0x44444444]);
 }

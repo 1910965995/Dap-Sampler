@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,16 @@ use super::ring_buffer::RingBuffer;
 /// 典型 packet_size (512/1024)。同时避免 total_requests as u8 截断。
 const MAX_TRANSFER_REQUESTS: usize = 64;
 
+/// 在途命令数上限（背压控制）
+///
+/// 提交线程最多领先接收线程 MAX_IN_FLIGHT 条命令。当 DAP-Link 吞吐不足
+/// （SWD 时钟低、变量多、USB 全速带宽受限）时，提交线程自动跳过采样
+/// 周期，实际采样率平滑匹配设备吞吐，避免：
+/// - USB IN 端点无限堆积（停止时要排空数千条残留响应）
+/// - 响应延迟膨胀（Watch 面板显示的值越来越滞后）
+/// 吞吐充足时该值不会成为瓶颈（在途数远小于上限）。
+const MAX_IN_FLIGHT: usize = 4;
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -35,6 +45,9 @@ pub struct PipelineEngine {
     /// 写入请求队列（主线程推送，提交线程消费）
     /// 元素: (地址, 数据)
     write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
+    /// 在途命令计数（提交线程发出命令后 +1，接收线程解析对应响应后 -1）。
+    /// 背压控制：提交线程在途数达到 MAX_IN_FLIGHT 时跳过本轮
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl PipelineEngine {
@@ -57,6 +70,7 @@ impl PipelineEngine {
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -71,6 +85,8 @@ impl PipelineEngine {
             interval_us: (1_000_000.0 / rate_hz as f64) as u64,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
+            // 独立计数器：新旧引擎互不干扰（背压信号各自独立）
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -80,6 +96,9 @@ impl PipelineEngine {
     pub fn start(&self) -> Result<PipelineHandle> {
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
+        // 复位在途计数器（上一次运行可能残留未消费的命令，如停止时
+        // USB IN 端点中尚未读取的响应）
+        self.in_flight.store(0, Ordering::SeqCst);
 
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
         let start_time = Instant::now();
@@ -111,6 +130,7 @@ impl PipelineEngine {
         let addresses = self.addresses.clone();
         let running = Arc::clone(&self.running);
         let write_queue = Arc::clone(&self.write_queue);
+        let in_flight = Arc::clone(&self.in_flight);
 
         // 预构建 TransferRequest 数组（每次采样都一样）
         // 每变量 = 写 TAR + 读 DRW，共 2 条请求
@@ -152,6 +172,21 @@ impl PipelineEngine {
                 let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
+                    // --- 背压控制 ---
+                    // 在途命令数达到上限（接收线程尚未消费完前一批响应）时
+                    // 跳过本轮：实际采样率自动匹配 DAP-Link 吞吐，避免
+                    // USB IN 端点无限堆积与响应延迟膨胀（Watch 值滞后）。
+                    // 吞吐充足时在途数远小于上限，不影响目标采样率。
+                    if in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
+                        seq += 1;
+                        let target = start + Duration::from_micros(interval_us * seq);
+                        let now = Instant::now();
+                        if now < target {
+                            spin_sleep::sleep(target - now);
+                        }
+                        continue;
+                    }
+
                     // --- 构造 DAP_Transfer 命令 ---
                     // 检查是否有待写入的请求，有则附加到命令前部。
                     // 限制每轮消耗的写入数，确保 total_requests 不超过
@@ -211,6 +246,8 @@ impl PipelineEngine {
                         log::error!("提交线程 USB 写失败 (seq={}): {}", seq, e);
                         break;
                     }
+                    // 命令已发出：在途 +1（接收线程解析对应响应后 -1）
+                    in_flight.fetch_add(1, Ordering::SeqCst);
 
                     seq += 1;
 
@@ -241,6 +278,7 @@ impl PipelineEngine {
         let addresses = self.addresses.clone();
         let num_vars = addresses.len();
         let interval_us = self.interval_us;
+        let in_flight = Arc::clone(&self.in_flight);
 
         let handle = thread::Builder::new()
             .name("dap-collect".into())
@@ -290,10 +328,15 @@ impl PipelineEngine {
                             Ok(r) => r,
                             Err(e) => {
                                 log::error!("接收线程解析失败 (seq={}): {}", seq, e);
+                                // 该命令的响应已被消费（无论解析是否成功），在途 -1
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
                                 seq += 1;
                                 continue;
                             }
                         };
+                        // 在途 -1：每条发出的命令都会收到一条响应（含非 OK 状态），
+                        // 在此统一递减，避免提交线程因计数泄漏而停摆
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
 
                         if resp.status != TRANSFER_OK {
                             log::warn!(

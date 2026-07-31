@@ -2,7 +2,7 @@ use egui_plot::{Line, Legend, Plot, PlotBounds, PlotPoint, Points};
 use crate::pipeline::sample::{Sample, ValueType};
 
 /// 波形显示模式
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WaveformDisplayMode {
     /// 连线模式：将采样点用线段连接起来（默认）
     Line,

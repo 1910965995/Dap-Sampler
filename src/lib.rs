@@ -8,3 +8,4 @@ pub mod dap;
 pub mod pipeline;
 pub mod elf;
 pub mod ui;
+pub mod project;

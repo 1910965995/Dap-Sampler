@@ -24,7 +24,8 @@ pub struct ChannelInfo {
 /// 波形面板
 ///
 /// 持有通道配置，负责从 Sample 数据构建 egui_plot 的 Line 对象并渲染。
-/// 内部缓存降采样结果，仅在新数据到达时重建，避免每帧遍历整个缓冲区。
+/// 内部缓存波形点：窗口滑动时增量更新（裁剪头部 + 追加尾部），
+/// 仅在新数据到达/通道变化时重建，避免每帧遍历整个缓冲区。
 pub struct WaveformPanel {
     /// 通道配置
     channels: Vec<ChannelInfo>,
@@ -36,6 +37,14 @@ pub struct WaveformPanel {
     pub cached_points: Vec<Vec<PlotPoint>>,
     /// 缓存对应的缓冲区长度（0 表示需要重建）
     pub cache_buffer_len: usize,
+    /// 缓存对应的 buffer_offset（最旧可用序号），增量裁剪的依据
+    cache_offset: u64,
+    /// 采样流中是否存在 NaN/Inf：非有限值被全量重建跳过，导致缓存点与
+    /// buffer 点无法一一对应；此时退回每帧全量重建（与旧行为一致），
+    /// 避免增量计数错位
+    nan_in_stream: bool,
+    /// 距上次全量 Y 轴重扫的帧数（增量模式 Y 轴基准只增不减，需定期重扫）
+    rescan_counter: u32,
     /// 通道级脏标志：仅该通道的 Y offset/scale/可见性变化时标记
     /// rebuild_cache 仅重建脏通道，避免全量重算
     dirty_channels: Vec<bool>,
@@ -52,6 +61,10 @@ pub struct WaveformPanel {
     /// 波形显示模式（连线 / 散点）
     display_mode: WaveformDisplayMode,
 }
+
+/// 增量模式下每隔多少帧全量重扫一次 Y 轴基准（约 0.5s @ 60fps）。
+/// 增量更新只增不减，信号峰值移出窗口后 Y 轴会偏高，定期重扫修正。
+const RESCAN_EVERY_FRAMES: u32 = 30;
 
 impl WaveformPanel {
     pub fn new(
@@ -79,6 +92,9 @@ impl WaveformPanel {
             value_types,
             cached_points: vec![Vec::new(); n],
             cache_buffer_len: 0,
+            cache_offset: 0,
+            nan_in_stream: false,
+            rescan_counter: 0,
             dirty_channels: vec![true; n], // 首次全部重建
             last_x_range: None,
             last_x_max: None,
@@ -109,18 +125,69 @@ impl WaveformPanel {
 
         // 不进行降采样: buffer 中所有原始样本点都必须被绘制,采样工具的波形必须忠实于采集数据。
 
-        // 缓存判断: 在以下任一情况时重建：
-        // - 新数据到达（has_new_data）→ 全量重建
-        // - buffer 长度变化（cache_buffer_len != buffer.len()）→ 全量重建
-        // - 有脏通道（Y offset/scale/可见性变化，但无新数据）→ 仅重建脏通道
+        // ---- 缓存维护（增量更新）----
+        // 窗口滑动时只裁剪头部已移出窗口的点、追加尾部新点，
+        // 不重算窗口内已有点的 y 变换 —— 每帧只处理新增/移出的
+        // ≤batch 个点，而非整个窗口（100k 窗口 × 8 通道时收益显著）。
+        //
+        // 全量重建触发条件：
+        // - 所有通道都脏（初始化、采样间隔变化、上帧全量重建）
+        // - 缓存与 buffer 对不上（offset/len 计数不匹配，如窗口被替换）
+        // - 流中出现 NaN/Inf：非有限值被跳过，缓存点与 buffer 点
+        //   无法一一对应，退回每帧全量重建（与旧行为一致）
         let has_dirty = self.dirty_channels.iter().any(|d| *d);
-        if has_new_data || self.cache_buffer_len != buffer.len() || has_dirty {
-            // 新数据或长度变化时，标记所有通道为脏（全量重建）
-            if has_new_data || self.cache_buffer_len != buffer.len() {
-                self.mark_all_dirty();
-            }
+        let all_dirty = self.dirty_channels.iter().all(|d| *d);
+
+        // 增量参数（按 buffer 计数，与 seq 是否连续无关）：
+        // head_trim = 缓存建立后头部被丢弃的点数（offset 增量）
+        // keep = 旧缓存中仍在窗口内的点数 = 追加起点
+        let cache_len = self.cache_buffer_len;
+        let head_trim = if buffer_offset >= self.cache_offset {
+            (buffer_offset - self.cache_offset) as usize
+        } else {
+            cache_len // offset 回退（如重新开始采集）→ 缓存整体失效
+        };
+        let keep = cache_len.saturating_sub(head_trim);
+        let incremental_ok = !all_dirty && buffer.len() >= keep && !self.nan_in_stream;
+
+        if !incremental_ok {
+            // 计数对不上 / 流中有 NaN / 全部通道脏：全量重建
+            self.mark_all_dirty();
             self.rebuild_cache(buffer);
             self.cache_buffer_len = buffer.len();
+            self.cache_offset = buffer_offset;
+        } else {
+            let has_new_points = buffer.len() > keep;
+            if has_new_points {
+                if self.append_has_non_finite(buffer, keep) {
+                    // 追加区含 NaN/Inf → 退回全量重建（增量计数会错位）
+                    self.nan_in_stream = true;
+                    self.mark_all_dirty();
+                    self.rebuild_cache(buffer);
+                    self.cache_buffer_len = buffer.len();
+                    self.cache_offset = buffer_offset;
+                } else {
+                    self.incremental_update(buffer, buffer_offset, head_trim, keep);
+                }
+            } else if head_trim > 0 {
+                // 无新点但窗口收缩（如运行中减小窗口）：仅裁剪头部
+                self.incremental_update(buffer, buffer_offset, head_trim, keep);
+            }
+
+            // 变换/可见性变化的通道全量重建（增量已先更新干净通道）
+            if has_dirty {
+                self.rebuild_cache(buffer);
+            }
+        }
+
+        // 定期 Y 轴重扫：增量模式 Y 轴基准只增不减，峰值移出窗口后
+        // 按当前窗口全量重扫修正（避免 Y 轴越拉越松）
+        if has_new_data {
+            self.rescan_counter += 1;
+            if self.rescan_counter >= RESCAN_EVERY_FRAMES {
+                self.rescan_counter = 0;
+                self.rescan_y_max(buffer);
+            }
         }
 
         // 动态 X 轴标签（使用上一帧的可视范围）
@@ -315,6 +382,7 @@ impl WaveformPanel {
         // 全量重建时重新累计 y_max_abs；仅脏通道更新时保持已有值
         // （非脏通道的 raw_f 未变，无需重新累计）
         let mut y_max_abs = if all_dirty { 0.0 } else { self.auto_y_max_abs };
+        let mut found_non_finite = false;
 
         for (ch_idx, ch) in self.channels.iter().enumerate() {
             let dirty = self.dirty_channels.get(ch_idx).copied().unwrap_or(true);
@@ -343,6 +411,7 @@ impl WaveformPanel {
                 let raw = s.values().get(ch_idx).copied().unwrap_or(0);
                 let raw_f = vt.to_f64(raw);
                 if !raw_f.is_finite() {
+                    found_non_finite = true;
                     continue; // NaN/Inf 不参与 Y 轴 fit,也不绘制
                 }
                 let abs_val = raw_f.abs();
@@ -361,6 +430,102 @@ impl WaveformPanel {
         if all_dirty {
             self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
         }
+        // 记录本次重建是否遇到非有限值：
+        // 决定后续帧是否退回每帧全量重建（避免增量计数错位）
+        self.nan_in_stream = found_non_finite;
+    }
+
+    /// 增量更新缓存：裁剪头部已移出窗口的点，追加尾部新点。
+    ///
+    /// 关键不变式：调用方保证 `buffer[keep..]`（追加区）不含 NaN/Inf，
+    /// 且流中无历史 NaN（nan_in_stream=false）——否则缓存点与 buffer 点
+    /// 无法一一对应，增量计数会错位，需走全量重建。
+    fn incremental_update(
+        &mut self,
+        buffer: &[Sample],
+        buffer_offset: u64,
+        head_trim: usize,
+        keep: usize,
+    ) {
+        // Y 轴基准只增不减（定期重扫修正峰值移出窗口的情况）
+        let mut y_max_abs = self.auto_y_max_abs;
+
+        for (ch_idx, ch) in self.channels.iter().enumerate() {
+            if !ch.visible {
+                continue;
+            }
+            let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
+            let scale = ch.y_scale as f64;
+            let offset = ch.y_offset as f64;
+
+            let pts = &mut self.cached_points[ch_idx];
+            if head_trim > 0 {
+                // 裁剪头部：仅移动元素，保留容量（避免重新分配）
+                pts.drain(..head_trim.min(pts.len()));
+            }
+            for s in &buffer[keep..] {
+                let raw = s.values().get(ch_idx).copied().unwrap_or(0);
+                let raw_f = vt.to_f64(raw);
+                // 追加区已预检无 NaN/Inf；防御性跳过（不破坏计数）
+                if !raw_f.is_finite() {
+                    continue;
+                }
+                let abs_val = raw_f.abs();
+                if abs_val > y_max_abs {
+                    y_max_abs = abs_val;
+                }
+                pts.push(PlotPoint::new(s.timestamp_sec, raw_f * scale + offset));
+            }
+        }
+
+        self.auto_y_max_abs = y_max_abs;
+        self.cache_buffer_len = buffer.len();
+        self.cache_offset = buffer_offset;
+    }
+
+    /// 预检追加区 `buffer[keep..]` 是否含 NaN/Inf。
+    ///
+    /// 有非有限值时缓存点与 buffer 点无法一一对应（全量重建会跳过这些点），
+    /// 增量追加会导致计数错位，必须退回全量重建。
+    fn append_has_non_finite(&self, buffer: &[Sample], keep: usize) -> bool {
+        for s in &buffer[keep..] {
+            for (ch_idx, ch) in self.channels.iter().enumerate() {
+                if !ch.visible {
+                    continue;
+                }
+                let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
+                let raw = s.values().get(ch_idx).copied().unwrap_or(0);
+                if !vt.to_f64(raw).is_finite() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 按当前窗口全量重扫 Y 轴基准（不重建 PlotPoint，仅扫原始值）。
+    ///
+    /// 增量模式 Y 轴只增不减，信号峰值移出窗口后需定期调用修正，
+    /// 避免 Y 轴持续偏松。
+    fn rescan_y_max(&mut self, buffer: &[Sample]) {
+        let mut y_max_abs = 0.0f64;
+        for (ch_idx, ch) in self.channels.iter().enumerate() {
+            if !ch.visible {
+                continue;
+            }
+            let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
+            for s in buffer {
+                let raw = s.values().get(ch_idx).copied().unwrap_or(0);
+                let raw_f = vt.to_f64(raw);
+                if raw_f.is_finite() {
+                    let a = raw_f.abs();
+                    if a > y_max_abs {
+                        y_max_abs = a;
+                    }
+                }
+            }
+        }
+        self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
     }
 
     /// 标记指定通道为脏（需要重建缓存）
@@ -372,7 +537,6 @@ impl WaveformPanel {
 
     /// 标记所有通道为脏（全量重建）
     fn mark_all_dirty(&mut self) {
-        self.cache_buffer_len = 0;
         for d in self.dirty_channels.iter_mut() {
             *d = true;
         }
@@ -541,5 +705,127 @@ mod tests {
         // 编译期检查: uniform_downsample 不应存在
         // (无法直接 assert 编译失败,但我们通过文档 + 后续 grep 在 PR 中确认)
         // 此测试仅作为占位提示。如未来有人重新引入降采样,这里需补充编译期检查。
+    }
+
+    // ============================================================
+    // 增量缓存（incremental_update）
+    // ============================================================
+
+    #[test]
+    fn incremental_update_trims_and_appends() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        let buf1 = make_buffer(10, &[1.0f32.to_bits()]); // 10 点，raw=1.0
+        panel.rebuild_cache(&buf1);
+        panel.cache_buffer_len = buf1.len();
+        panel.cache_offset = 0;
+
+        // 模拟窗口滑动：头部丢弃 3 点（offset=3），尾部追加 4 点（raw=2.0）
+        let mut buf2: Vec<Sample> = buf1[3..].to_vec();
+        for k in 0..4u64 {
+            buf2.push(Sample::new(10 + k, (10 + k) as f64 * 0.001, &[2.0f32.to_bits()]));
+        }
+
+        panel.incremental_update(&buf2, 3, 3, buf1.len() - 3);
+
+        // 7 个保留点 + 4 个新点 = 11
+        assert_eq!(panel.cached_points[0].len(), 11);
+        assert_eq!(panel.cache_buffer_len, 11);
+        assert_eq!(panel.cache_offset, 3);
+        // 保留点：x 从 3*0.001 开始，值保持 1.0（未被重算）
+        for (i, p) in panel.cached_points[0][..7].iter().enumerate() {
+            assert!((p.x - (i as f64 + 3.0) * 0.001).abs() < 1e-9);
+            assert!((p.y - 1.0).abs() < 1e-9);
+        }
+        // 新点：值 2.0，x 从 10*0.001 开始
+        for (i, p) in panel.cached_points[0][7..].iter().enumerate() {
+            assert!((p.x - (10.0 + i as f64) * 0.001).abs() < 1e-9);
+            assert!((p.y - 2.0).abs() < 1e-9);
+        }
+        // Y 轴基准增长到新点的最大值
+        assert!((panel.auto_y_max_abs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn incremental_update_applies_transform_to_new_points() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0), ("CH2", 100.0, 0.5)]);
+        let buf1 = make_buffer(5, &[4.0f32.to_bits(), 4.0f32.to_bits()]);
+        panel.rebuild_cache(&buf1);
+        panel.cache_buffer_len = 5;
+        panel.cache_offset = 0;
+
+        // 追加 2 个新点（raw=8.0）
+        let mut buf2 = buf1.clone();
+        for k in 0..2u64 {
+            buf2.push(Sample::new(5 + k, (5 + k) as f64 * 0.001, &[8.0f32.to_bits(), 8.0f32.to_bits()]));
+        }
+
+        panel.incremental_update(&buf2, 0, 0, 5);
+
+        assert_eq!(panel.cached_points[0].len(), 7);
+        assert_eq!(panel.cached_points[1].len(), 7);
+        // 新点应用各自变换：CH1 = 8.0*1.0+0.0 = 8.0；CH2 = 8.0*0.5+100.0 = 104.0
+        assert!((panel.cached_points[0][5].y - 8.0).abs() < 1e-6);
+        assert!((panel.cached_points[1][5].y - 104.0).abs() < 1e-6);
+        // 旧点保持原变换值：CH2 首点 = 4.0*0.5+100.0 = 102.0
+        assert!((panel.cached_points[1][0].y - 102.0).abs() < 1e-6);
+        // Y 轴基准 = 新点 raw 的最大值 8.0
+        assert!((panel.auto_y_max_abs - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn incremental_update_window_shrink_only_trims() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        let buf1 = make_buffer(10, &[1.0f32.to_bits()]);
+        panel.rebuild_cache(&buf1);
+        panel.cache_buffer_len = 10;
+        panel.cache_offset = 0;
+
+        // 窗口收缩：只丢弃头部 6 点（如运行中减小窗口，无新数据）
+        let buf2: Vec<Sample> = buf1[6..].to_vec();
+        panel.incremental_update(&buf2, 6, 6, 4);
+
+        assert_eq!(panel.cached_points[0].len(), 4);
+        assert_eq!(panel.cache_buffer_len, 4);
+        assert_eq!(panel.cache_offset, 6);
+        // 保留点未被重算（x 从 6*0.001 开始）
+        for (i, p) in panel.cached_points[0].iter().enumerate() {
+            assert!((p.x - (i as f64 + 6.0) * 0.001).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn append_has_non_finite_detects_nan() {
+        let panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        let mut buf = make_buffer(2, &[1.0f32.to_bits()]);
+        buf.push(Sample::new(2, 0.002, &[f32::NAN.to_bits()]));
+        // 追加区（keep=2 起）含 NaN → true
+        assert!(panel.append_has_non_finite(&buf, 2));
+        // 前 2 点正常 → false
+        assert!(!panel.append_has_non_finite(&buf[..2], 0));
+    }
+
+    #[test]
+    fn rescan_y_max_resets_drifted_scale() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        panel.auto_y_max_abs = 100.0; // 人为抬高（模拟峰值已移出窗口）
+        let buf = make_buffer(5, &[3.0f32.to_bits()]);
+        panel.rescan_y_max(&buf);
+        assert!((panel.auto_y_max_abs - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rebuild_cache_tracks_nan_in_stream() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        let mut buf = make_buffer(3, &[1.0f32.to_bits()]);
+        buf.push(Sample::new(3, 0.003, &[f32::INFINITY.to_bits()]));
+        panel.rebuild_cache(&buf);
+        assert!(panel.nan_in_stream);
+        // NaN/Inf 点被跳过：3 个有效点
+        assert_eq!(panel.cached_points[0].len(), 3);
+
+        // 非有限值离开 buffer 后，重扫应复位标志
+        let clean = make_buffer(3, &[1.0f32.to_bits()]);
+        panel.rebuild_cache(&clean);
+        assert!(!panel.nan_in_stream);
     }
 }

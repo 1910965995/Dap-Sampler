@@ -10,6 +10,10 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "dap-sampler", about = "CMSIS-DAP v2 High-Speed Variable Sampler")]
 struct Cli {
+    /// 将日志同时写入文件（GUI 下日志默认不可见，排查连接问题用，如 --log-file dap-sampler.log）
+    #[arg(long, global = true)]
+    log_file: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -140,11 +144,28 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
-
     let cli = Cli::parse();
+
+    // 初始化日志：默认输出到 stderr；指定 --log-file 时扇出到文件
+    // （GUI 子系统下日志在控制台不可见，写文件后才能排查连接/采样问题）
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    logger.format_timestamp_millis();
+    let mut log_path: Option<String> = None;
+    if let Some(path) = cli.log_file.as_deref() {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                logger.target(env_logger::Target::Pipe(Box::new(TeeWriter {
+                    file: std::sync::Mutex::new(file),
+                })));
+                log_path = Some(path.to_string());
+            }
+            Err(e) => eprintln!("警告: 无法打开日志文件 '{}': {}", path, e),
+        }
+    }
+    logger.init();
+    if let Some(path) = log_path {
+        log::info!("日志将同时写入: {}", path);
+    }
 
     match cli.command.unwrap_or(Command::Gui {
         addresses: vec![],
@@ -212,6 +233,32 @@ fn attach_parent_console() {
                 }
             }
         }
+    }
+}
+
+/// 扇出写入器：env_logger 的输出同时写到 stderr 与日志文件。
+///
+/// GUI 子系统（windows_subsystem = "windows"）下 stderr 无控制台句柄，
+/// 写入失败被忽略——文件仍能拿到全部日志；CLI 下则两者都有。
+struct TeeWriter {
+    file: std::sync::Mutex<std::fs::File>,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(buf);
+        }
+        let _ = std::io::stderr().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.flush();
+        }
+        let _ = std::io::stderr().flush();
+        Ok(())
     }
 }
 
@@ -422,6 +469,9 @@ fn cmd_monitor(address: &str, rate: u32, count: Option<u32>, as_float: bool, swd
 
     let max_samples = count.unwrap_or(u32::MAX);
     let start = std::time::Instant::now();
+    // 高采样率下 thread::sleep 精度不足（Windows 下约 15.6ms 时钟周期），
+    // 改用 spin_sleep 自旋等待，5kHz（200µs 间隔）以上也能精确命中目标时刻
+    let sleeper = spin_sleep::SpinSleeper::default();
 
     for seq in 0..max_samples {
         let value_raw = swd.read_memory(addr)?;
@@ -439,7 +489,7 @@ fn cmd_monitor(address: &str, rate: u32, count: Option<u32>, as_float: bool, swd
         let elapsed = start.elapsed();
         let target = std::time::Duration::from_micros(interval_us * (seq + 1) as u64);
         if elapsed < target {
-            std::thread::sleep(target - elapsed);
+            sleeper.sleep(target - elapsed);
         }
     }
 

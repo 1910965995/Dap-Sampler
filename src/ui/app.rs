@@ -218,7 +218,7 @@ impl DapSamplerApp {
         }
 
         // 保存当前通道地址列表（用于 Watch 写入）
-        self.current_addresses = addresses.clone();
+        let prev_addresses = std::mem::replace(&mut self.current_addresses, addresses.clone());
 
         // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
         if self.active_usb.is_none() {
@@ -238,7 +238,32 @@ impl DapSamplerApp {
             self.active_usb = Some(Arc::new(usb));
         }
 
-        // 3. 创建 PipelineEngine
+        // 3. 更新波形面板（通道名和类型）
+        // Paused→Start 且通道配置未变时保留历史波形数据；
+        // 其余情况（Idle→Start 或通道增删/改名/改类型）清空缓冲重新开始
+        let old_names = self.waveform.channel_names();
+        let config_unchanged = prev_addresses == addresses
+            && self.waveform.value_types() == types.as_slice()
+            && old_names.len() == channel_names.len()
+            && old_names
+                .iter()
+                .zip(&channel_names)
+                .all(|(a, b)| *a == b.as_str());
+        let keep_history = self.controls.state == AcquisitionState::Paused && config_unchanged;
+
+        self.waveform =
+            WaveformPanel::new(channel_names.clone(), channel_colors, self.interval_us, types.clone(), self.display_mode);
+
+        // 4. 数据缓冲区：Pause 恢复且配置未变时保留历史（含光标与计数），否则清空重建
+        if keep_history {
+            self.display_buf.set_max_samples(self.window_size);
+        } else {
+            self.display_buf = DisplayBuffer::new(self.window_size);
+            self.cursor.clear();
+            self.controls.update_count(0);
+        }
+
+        // 5. 创建 PipelineEngine
         let engine = PipelineEngine::new(
             Arc::clone(self.active_usb.as_ref().unwrap()),
             DapProtocol::new(),
@@ -246,19 +271,10 @@ impl DapSamplerApp {
             self.rate_hz,
         );
 
-        // 4. 更新波形面板（通道名和类型）
-        self.waveform =
-            WaveformPanel::new(channel_names.clone(), channel_colors, self.interval_us, types.clone(), self.display_mode);
-
-        // 5. 清空旧数据，用当前窗口大小创建新缓冲区
-        self.display_buf = DisplayBuffer::new(self.window_size);
-        self.cursor.clear();
-        self.controls.update_count(0);
-
         // 同步 Watch 面板
         self.watch_panel.sync_from_channels(&channel_names, &types, &self.current_addresses);
 
-        // 6. 启动采集
+        // 7. 启动采集
         match engine.start() {
             Ok(handle) => {
                 self.pipeline = Some(handle);
@@ -488,8 +504,32 @@ impl DapSamplerApp {
                             );
                         });
                     }
+                } else {
+                    // Cursor2 已滑出缓冲（窗口滚动后）
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
+                        "⚠ Cursor 2 已滑出缓冲范围",
+                    );
                 }
             }
+        } else if let Some(seq) = self.cursor.cursor1 {
+            // 光标存在但已滑出缓冲范围（窗口滚动/清空后）：给出可见提示，
+            // 而不是静默不显示读数
+            ui.separator();
+            let range_text = if self.display_buf.is_empty() {
+                "(缓冲已清空)".to_string()
+            } else {
+                format!(
+                    "[{} ~ {}]",
+                    self.display_buf.oldest_seq(),
+                    self.display_buf.next_seq() - 1
+                )
+            };
+            ui.colored_label(
+                egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
+                format!("⚠ Cursor @ seq {} 已滑出缓冲范围 {}", seq, range_text),
+            );
         }
     }
 }

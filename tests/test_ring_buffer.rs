@@ -52,9 +52,9 @@ fn push_multiple_pop_all() {
     let n = rb.pop_batch(&mut buf);
 
     assert_eq!(n, 5);
-    for i in 0..5 {
-        assert_eq!(buf[i].seq, i as u64);
-        assert_eq!(buf[i].values()[0], i as u32 * 10);
+    for (i, s) in buf.iter().enumerate().take(5) {
+        assert_eq!(s.seq, i as u64);
+        assert_eq!(s.values()[0], i as u32 * 10);
     }
 }
 

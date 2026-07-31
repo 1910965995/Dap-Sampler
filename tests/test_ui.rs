@@ -178,10 +178,10 @@ fn value_type_parse() {
 
 #[test]
 fn sample_as_f64s_typed_float() {
-    let s = make_float_sample(0, 3.14);
+    let s = make_float_sample(0, 3.25);
     let types = vec![ValueType::Float];
     let result = s.as_f64s_typed(&types);
-    assert!((result[0] - 3.14).abs() < 0.001);
+    assert!((result[0] - 3.25).abs() < 0.001);
 }
 
 #[test]
@@ -215,20 +215,20 @@ fn sample_as_f64s_typed_int16() {
 #[test]
 fn sample_as_f64s_typed_mixed() {
     // 混合类型：float + uint32
-    let s = Sample::new(0, 0.0, &[3.14f32.to_bits(), 100u32]);
+    let s = Sample::new(0, 0.0, &[3.25f32.to_bits(), 100u32]);
     let types = vec![ValueType::Float, ValueType::Uint32];
     let result = s.as_f64s_typed(&types);
-    assert!((result[0] - 3.14).abs() < 0.001);
+    assert!((result[0] - 3.25).abs() < 0.001);
     assert!((result[1] - 100.0).abs() < 0.001);
 }
 
 #[test]
 fn sample_as_f64s_typed_default_float() {
     // 类型列表短于 values 时，缺失位置默认 float
-    let s = Sample::new(0, 0.0, &[3.14f32.to_bits(), 100u32]);
+    let s = Sample::new(0, 0.0, &[3.25f32.to_bits(), 100u32]);
     let types = vec![ValueType::Float]; // 只有 1 个类型，但 values 有 2 个
     let result = s.as_f64s_typed(&types);
-    assert!((result[0] - 3.14).abs() < 0.001);
+    assert!((result[0] - 3.25).abs() < 0.001);
     // 第二个值默认用 float 解释（100 as f32 bits = 1.4e-43，不是 100.0）
     assert!(result[1] < 1.0); // 不等于 100.0
 }

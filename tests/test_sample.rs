@@ -71,9 +71,9 @@ fn as_floats_nan_infinity() {
 // ================================================================
 
 #[test]
-fn sample_clone() {
+fn sample_copy_preserves_fields() {
     let s1 = Sample::new(5, 0.005, &[0xDEADBEEF, 0xCAFEBABE]);
-    let s2 = s1.clone();
+    let s2 = s1; // Sample 为 Copy 类型，赋值即拷贝
     assert_eq!(s2.seq, 5);
     assert_eq!(s2.values().len(), 2);
     assert_eq!(s2.values()[0], 0xDEADBEEF);

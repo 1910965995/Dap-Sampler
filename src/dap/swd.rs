@@ -200,27 +200,6 @@ impl SwdLink {
         Ok(())
     }
 
-    /// 自动检测 SWD 时钟（从低频到高频试探）
-    fn auto_detect_clock(&self) -> Result<u32> {
-        let clock_vals = [1_000_000, 2_000_000, 4_000_000, 8_000_000, 10_000_000];
-        let mut best_clock = 1_000_000;
-
-        for &clock in &clock_vals {
-            let cmd = self.dap.build_clock_request(clock);
-            self.usb.write(&cmd)?;
-            let mut buf = [0u8; 64];
-            let n = self.usb.read(&mut buf)?;
-            let status = DapProtocol::parse_clock_response(&buf[..n])?;
-            if status == 0 {
-                best_clock = clock;
-            } else {
-                break;
-            }
-        }
-        info!("最佳 SWD 时钟: {} Hz", best_clock);
-        Ok(best_clock)
-    }
-
     /// 读取 DPIDR 寄存器
     fn read_dpidr(&self) -> Result<u32> {
         let req = TransferRequest::read_dp(DP_REG_DPIDR);

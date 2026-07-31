@@ -12,7 +12,15 @@ impl DapProtocol {
     pub fn new() -> Self {
         Self { dap_index: 0 }
     }
+}
 
+impl Default for DapProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DapProtocol {
     // --------------------------------------------------------
     // DAP_Info
     // --------------------------------------------------------
@@ -203,12 +211,12 @@ impl DapProtocol {
         let num_values = (data_bytes.len() / 4).min(crate::pipeline::sample::MAX_VALUES);
         let mut values = [0u32; crate::pipeline::sample::MAX_VALUES];
 
-        for i in 0..num_values {
+        for (i, slot) in values.iter_mut().enumerate().take(num_values) {
             let offset = i * 4;
             let bytes: [u8; 4] = data_bytes[offset..offset + 4]
                 .try_into()
                 .map_err(|_| Error::InvalidResponse("数据解析错误".into()))?;
-            values[i] = u32::from_le_bytes(bytes);
+            *slot = u32::from_le_bytes(bytes);
         }
 
         Ok(TransferResponse { status, count, data: values, len: num_values })

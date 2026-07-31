@@ -393,7 +393,7 @@ pub fn find_bulk_endpoints(handle: &rusb::DeviceHandle<Context>) -> Result<(u8, 
     Err(Error::DeviceNotFound)
 }
 
-/// 读取 USB 字符串描述符（优先 ASCII，fallback 到 Unicode）
+/// 读取 USB 字符串描述符（仅 ASCII；厂商/产品字符串通常为 ASCII）
 fn read_string_descriptor(
     handle: &rusb::DeviceHandle<Context>,
     idx: Option<u8>,

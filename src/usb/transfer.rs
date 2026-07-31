@@ -74,7 +74,7 @@ impl BulkTransfer {
 
         // 3. 发送 DAP_HostStatus (Connect LED off)
         let host_status_cmd = [crate::dap::commands::DAP_LED, 0x00, 0x00];
-        if let Ok(_) = self.handle.write_bulk(self.ep_out, &host_status_cmd, Duration::from_millis(200)) {
+        if self.handle.write_bulk(self.ep_out, &host_status_cmd, Duration::from_millis(200)).is_ok() {
             let _ = self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(200));
         }
 
@@ -129,13 +129,8 @@ impl BulkTransfer {
     pub fn flush_input(&self) {
         let mut buf = [0u8; 1024];
         let mut flushed = 0;
-        loop {
-            match self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(10)) {
-                Ok(n) => {
-                    flushed += n;
-                }
-                Err(_) => break,
-            }
+        while let Ok(n) = self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(10)) {
+            flushed += n;
         }
         if flushed > 0 {
             log::info!("已清空 USB 缓冲区残留数据: {} 字节", flushed);

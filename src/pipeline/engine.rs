@@ -26,6 +26,7 @@ const MAX_TRANSFER_REQUESTS: usize = 64;
 /// 周期，实际采样率平滑匹配设备吞吐，避免：
 /// - USB IN 端点无限堆积（停止时要排空数千条残留响应）
 /// - 响应延迟膨胀（Watch 面板显示的值越来越滞后）
+///
 /// 吞吐充足时该值不会成为瓶颈（在途数远小于上限）。
 const MAX_IN_FLIGHT: usize = 4;
 

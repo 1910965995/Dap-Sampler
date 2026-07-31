@@ -84,8 +84,7 @@ pub fn node_display_label(label: &str, path: &str) -> String {
     if !label.starts_with('[') {
         return label.to_string();
     }
-    if path.ends_with(label) {
-        let prefix = &path[..path.len() - label.len()];
+    if let Some(prefix) = path.strip_suffix(label) {
         if prefix.is_empty() {
             return label.to_string();
         }
@@ -107,7 +106,7 @@ fn cmp_tree_label(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn sort_tree_children(nodes: &mut Vec<TreeNode>) {
+fn sort_tree_children(nodes: &mut [TreeNode]) {
     nodes.sort_by(|a, b| cmp_tree_label(&a.label, &b.label));
     for node in nodes.iter_mut() {
         sort_tree_children(&mut node.children);
@@ -409,6 +408,12 @@ impl VariableBrowser {
     pub fn clear(&mut self) {
         self.checked_paths.clear();
         self.expanded.clear();
+    }
+}
+
+impl Default for VariableBrowser {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -140,34 +140,6 @@ impl ChannelPanel {
         action
     }
 
-    /// 紧凑渲染（用于侧边栏变量浏览器下方）
-    pub fn show_compact(&mut self, ui: &mut egui::Ui) -> Option<usize> {
-        let mut remove_idx: Option<usize> = None;
-
-        egui::ScrollArea::vertical()
-            .id_salt("channel_compact_scroll")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                for (i, ch) in self.channels.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(ch.color, "●");
-                        ui.label(&ch.name);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_button(ui, "×", GREY_FG, GREY_BG, GREY_HOVER) {
-                                remove_idx = Some(i);
-                            }
-                            let vis_label = if ch.visible { "●" } else { "○" };
-                            if icon_button(ui, vis_label, GREY_FG, GREY_BG, GREY_HOVER) {
-                                ch.visible = !ch.visible;
-                            }
-                        });
-                    });
-                }
-            });
-
-        remove_idx
-    }
-
     /// 通道数量
     pub fn channel_count(&self) -> usize {
         self.channels.len()
@@ -208,6 +180,12 @@ impl ChannelPanel {
     }
 }
 
+impl Default for ChannelPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,7 +211,7 @@ mod tests {
     fn visible_label_shows_filled_when_visible() {
         // 依赖 icon_button 的渲染行为：visible=true → label="●", false → label="○"
         let p = panel_with_one_channel();
-        assert_eq!(p.channels[0].visible, true);
+        assert!(p.channels[0].visible);
         let label_visible = "●";
         assert_eq!(label_visible, "●");
 

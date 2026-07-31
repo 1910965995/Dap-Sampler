@@ -188,7 +188,7 @@ fn expand_variable(
                 for i in 0..count {
                     let elem_dv = DwarfVarInfo {
                         name: format!("[{}]", i),
-                        address: dv.address + (i as u32) * elem_size,
+                        address: dv.address + i * elem_size,
                         type_offset: *element_type_offset,
                         source_file: dv.source_file.clone(),
                         source_line: dv.source_line,

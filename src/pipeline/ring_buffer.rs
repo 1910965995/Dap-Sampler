@@ -98,7 +98,7 @@ impl RingBuffer {
         let available = h.wrapping_sub(t).min(self.capacity);
         let count = available.min(buf.len());
 
-        for i in 0..count {
+        for (i, out) in buf.iter_mut().enumerate().take(count) {
             let idx = (t.wrapping_add(i)) % self.capacity;
             // SAFETY: 顺序锁保证读到一致快照（写入并发时重试）
             unsafe {
@@ -115,7 +115,7 @@ impl RingBuffer {
                         break data; // 两次序号一致且为偶：快照稳定
                     }
                 };
-                buf[i] = sample;
+                *out = sample;
             }
         }
 

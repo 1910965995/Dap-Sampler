@@ -36,10 +36,6 @@ pub struct WatchEntry {
     y_offset_buffer: String,
     /// Y Scale 输入框文本
     y_scale_buffer: String,
-    /// Y Offset 输入框是否获得焦点
-    y_offset_editing: bool,
-    /// Y Scale 输入框是否获得焦点
-    y_scale_editing: bool,
     /// Remark 输入框文本
     remark_buffer: String,
 }
@@ -119,8 +115,6 @@ impl WatchPanel {
                     refresh_buffer: String::new(),
                     y_offset_buffer: String::new(),
                     y_scale_buffer: String::new(),
-                    y_offset_editing: false,
-                    y_scale_editing: false,
                     remark_buffer: String::new(),
                 }
             })
@@ -480,14 +474,10 @@ impl WatchPanel {
                                     .hint_text(&entry.remark),
                             );
                             // Enter 或失焦时把 buffer 写入 remark
-                            if (resp.lost_focus()
-                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)))
-                                || resp.lost_focus()
-                            {
-                                if !entry.remark_buffer.is_empty() {
-                                    entry.remark = entry.remark_buffer.clone();
-                                    entry.remark_buffer.clear();
-                                }
+                            // （(失焦且 Enter) || 失焦 ≡ 失焦）
+                            if resp.lost_focus() && !entry.remark_buffer.is_empty() {
+                                entry.remark = entry.remark_buffer.clone();
+                                entry.remark_buffer.clear();
                             }
                         });
                     });
@@ -502,6 +492,12 @@ impl WatchPanel {
         self.pending_writes.extend(new_writes);
         // 将本帧提交的 y_offset/y_scale 变更加入队列
         self.dirty_transforms.extend(new_transforms);
+    }
+}
+
+impl Default for WatchPanel {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -606,8 +602,6 @@ mod tests {
             refresh_buffer: String::new(),
             y_offset_buffer: String::new(),
             y_scale_buffer: String::new(),
-            y_offset_editing: false,
-            y_scale_editing: false,
             remark_buffer: String::new(),
         }
     }
@@ -620,7 +614,7 @@ mod tests {
         let addresses: Vec<u32> = entries.iter().map(|e| e.address).collect();
         p.sync_from_channels(&names, &types, &addresses);
         // 覆盖默认值
-        for (panel_e, e) in p.entries.iter_mut().zip(entries.into_iter()) {
+        for (panel_e, e) in p.entries.iter_mut().zip(entries) {
             panel_e.y_offset = e.y_offset;
             panel_e.y_scale = e.y_scale;
         }

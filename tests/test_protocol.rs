@@ -336,7 +336,7 @@ fn build_transfer_with_writes() {
 #[test]
 fn build_transfer_multiple_variables() {
     // 4 variables (= 8 requests: 4 write TAR + 4 read DRW)
-    let addresses = vec![0x20000100u32, 0x20000104, 0x20000108, 0x2000010c];
+    let addresses = [0x20000100u32, 0x20000104, 0x20000108, 0x2000010c];
     let requests: Vec<TransferRequest> = addresses
         .iter()
         .flat_map(|&addr| {

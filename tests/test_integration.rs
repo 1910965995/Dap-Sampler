@@ -43,7 +43,8 @@ fn e2e_single_variable_read_flow() {
     let sample = Sample::new(0, 0.0, resp.values());
     assert_eq!(sample.values()[0], 0x40490FDB);
     let floats = sample.as_floats();
-    assert!((floats[0] - 3.1415927).abs() < 1e-6);
+    let expected = f32::from_bits(0x40490FDB);
+    assert!((floats[0] - expected).abs() < 1e-6);
 
     // Step 4: 时间戳验证
     assert!((sample.timestamp_sec - 0.0).abs() < 1e-9);

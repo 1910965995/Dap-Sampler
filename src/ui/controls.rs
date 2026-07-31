@@ -78,10 +78,10 @@ impl ControlPanel {
             }
         }
 
-        if self.state != AcquisitionState::Idle {
-            if ui.button("\u{23f9} Stop").clicked() {
-                cmd = Some(AcquisitionCommand::Stop);
-            }
+        if self.state != AcquisitionState::Idle
+            && ui.button("\u{23f9} Stop").clicked()
+        {
+            cmd = Some(AcquisitionCommand::Stop);
         }
 
         ui.separator();

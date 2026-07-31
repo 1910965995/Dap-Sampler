@@ -455,7 +455,7 @@ fn parse_address(s: &str) -> anyhow::Result<u32> {
     }
     // 否则先尝试十进制（PowerShell 会把 0x0000000c 转成十进制 "12"），
     // 再回退到十六进制
-    if let Ok(v) = u32::from_str_radix(s, 10) {
+    if let Ok(v) = s.parse::<u32>() {
         return Ok(v);
     }
     u32::from_str_radix(s, 16)

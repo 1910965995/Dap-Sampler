@@ -59,7 +59,7 @@ fn make_request_all_16_combinations_unique() {
                     let b = make_request(rnw, apndp, a2, a3);
                     assert!(seen.insert(b), "Duplicate byte: 0x{:02X}", b);
                     // Validate bit positions
-                    assert_eq!((b >> 0) & 1, apndp as u8);
+                    assert_eq!(b & 1, apndp as u8);
                     assert_eq!((b >> 1) & 1, rnw as u8);
                     assert_eq!((b >> 2) & 1, a2 as u8);
                     assert_eq!((b >> 3) & 1, a3 as u8);
@@ -138,8 +138,8 @@ fn req_write_ap_csw() {
 #[test]
 fn transfer_request_read_dp() {
     let req = TransferRequest::read_dp(DP_REG_DPIDR);
-    assert_eq!(req.rnw, true);
-    assert_eq!(req.apndp, false);
+    assert!(req.rnw);
+    assert!(!req.apndp);
     assert_eq!(req.reg_addr, DP_REG_DPIDR);
     assert_eq!(req.write_data, None);
     assert_eq!(req.request_byte(), req_read_dp(DP_REG_DPIDR));
@@ -148,8 +148,8 @@ fn transfer_request_read_dp() {
 #[test]
 fn transfer_request_write_dp() {
     let req = TransferRequest::write_dp(DP_REG_CTRL_STAT, 0x50000000);
-    assert_eq!(req.rnw, false);
-    assert_eq!(req.apndp, false);
+    assert!(!req.rnw);
+    assert!(!req.apndp);
     assert_eq!(req.reg_addr, DP_REG_CTRL_STAT);
     assert_eq!(req.write_data, Some(0x50000000));
     assert_eq!(req.request_byte(), req_write_dp(DP_REG_CTRL_STAT));
@@ -158,8 +158,8 @@ fn transfer_request_write_dp() {
 #[test]
 fn transfer_request_read_ap() {
     let req = TransferRequest::read_ap(AP_REG_DRW);
-    assert_eq!(req.rnw, true);
-    assert_eq!(req.apndp, true);
+    assert!(req.rnw);
+    assert!(req.apndp);
     assert_eq!(req.reg_addr, AP_REG_DRW);
     assert_eq!(req.write_data, None);
     assert_eq!(req.request_byte(), req_read_ap(AP_REG_DRW));
@@ -168,8 +168,8 @@ fn transfer_request_read_ap() {
 #[test]
 fn transfer_request_write_ap() {
     let req = TransferRequest::write_ap(AP_REG_TAR, 0x20000100);
-    assert_eq!(req.rnw, false);
-    assert_eq!(req.apndp, true);
+    assert!(!req.rnw);
+    assert!(req.apndp);
     assert_eq!(req.reg_addr, AP_REG_TAR);
     assert_eq!(req.write_data, Some(0x20000100));
     assert_eq!(req.request_byte(), req_write_ap(AP_REG_TAR));

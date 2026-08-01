@@ -276,7 +276,11 @@ impl VariableBrowser {
         elf_ctx: Option<&ElfContext>,
     ) -> Vec<(String, bool)> {
         if elf_ctx.is_none() {
-            ui.label("No ELF file loaded");
+            // 与 Cursor 面板提示保持一致的灰色
+            ui.label(
+                egui::RichText::new("No ELF file loaded")
+                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+            );
             return vec![];
         }
 

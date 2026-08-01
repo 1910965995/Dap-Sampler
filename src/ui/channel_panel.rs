@@ -81,7 +81,11 @@ impl ChannelPanel {
         let mut action = ChannelPanelAction::default();
 
         if self.channels.is_empty() {
-            ui.label("No channels");
+            // 与 Cursor 面板提示保持一致的灰色
+            ui.label(
+                egui::RichText::new("No channels")
+                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+            );
             return action;
         }
 

@@ -1103,18 +1103,9 @@ impl eframe::App for DapSamplerApp {
                     });
             });
 
-        // ---- 底部 Watch 面板 ----
-        egui::TopBottomPanel::bottom("watch_panel")
-            .resizable(true)
-            .default_height(180.0)
-            .min_height(180.0)
-            .show(ctx, |ui| {
-                let colors: Vec<egui::Color32> =
-                    self.channel_panel.channels.iter().map(|c| c.color).collect();
-                self.watch_panel.show(ui, &colors);
-            });
-
-        // ---- 底部状态栏（Watch 面板之下、界面最底部）----
+        // ---- 底部状态栏（界面最底部，Watch 面板之下）----
+        // egui 0.31 bottom panel 堆叠语义：先声明的在最底部，后声明的叠在它上方，
+        // 因此状态栏必须先于 watch_panel 声明，才能紧贴窗口底边。
         egui::TopBottomPanel::bottom("status_bar")
             .resizable(false)
             .exact_height(24.0)
@@ -1135,6 +1126,17 @@ impl eframe::App for DapSamplerApp {
                         }
                     }
                 });
+            });
+
+        // ---- 底部 Watch 面板 ----
+        egui::TopBottomPanel::bottom("watch_panel")
+            .resizable(true)
+            .default_height(180.0)
+            .min_height(180.0)
+            .show(ctx, |ui| {
+                let colors: Vec<egui::Color32> =
+                    self.channel_panel.channels.iter().map(|c| c.color).collect();
+                self.watch_panel.show(ui, &colors);
             });
 
         // 把本帧 watch 表中提交的 y_offset/y_scale 变更应用到波形图

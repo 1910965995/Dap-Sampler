@@ -1213,9 +1213,9 @@ impl eframe::App for DapSamplerApp {
             }
         });
 
-        // ---- 关于窗口（帮助 → 关于）----
+        // ---- About 窗口（Help → About）----
         if self.show_about {
-            egui::Window::new("关于 DAP Sampler")
+            egui::Window::new("About DAP Sampler")
                 .open(&mut self.show_about)
                 .collapsible(false)
                 .resizable(false)
@@ -1223,11 +1223,11 @@ impl eframe::App for DapSamplerApp {
                 .show(ctx, |ui| {
                     ui.heading("DAP Sampler");
                     ui.add_space(4.0);
-                    ui.label(format!("版本: v{}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("Version: v{}", env!("CARGO_PKG_VERSION")));
                     ui.add_space(6.0);
                     ui.separator();
                     ui.label(
-                        "基于 CMSIS-DAP v2 协议的高速变量采样与可视化工具\n适用于 ARM Cortex-M 调试场景",
+                        "High-speed variable sampler & visualization tool\nbased on the CMSIS-DAP v2 protocol for ARM Cortex-M",
                     );
                     ui.add_space(6.0);
                 });

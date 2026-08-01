@@ -53,7 +53,7 @@ fn set_error(&mut self, message: impl Into<String>);
 ### UI 布局
 
 - `egui::TopBottomPanel::bottom("status_bar")`，`resizable(false)`、`exact_height(24.0)`
-- 声明位置：在 `watch_panel`（底部 Watch 面板）**之后**、`CentralPanel` **之前** show——两个 bottom panel 按声明顺序堆叠，状态栏位于界面最底部；CentralPanel 自动让出空间
+- 声明位置：在 `watch_panel`（底部 Watch 面板）**之前**、`CentralPanel` **之前** show——egui 0.31 中**先声明的 bottom panel 位于界面最底部**，后声明的叠在其上方；因此状态栏贴窗口底边，Watch 面板叠在状态栏上方；CentralPanel 自动让出空间
 - 内容：一行左对齐文字；错误消息红色 `Color32::from_rgb(0xff, 0x55, 0x55)`（与现有错误色一致），普通消息用主题默认文字色
 - 消息为空时状态栏显示为空（占位不显示文字）
 

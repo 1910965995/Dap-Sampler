@@ -774,10 +774,9 @@ impl DapSamplerApp {
                 let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
                 ui.horizontal(|ui| {
                     ui.colored_label(color, "●");
+                    // 变量名/读数用默认文字色，仅圆点保留通道颜色
                     ui.label(
-                        egui::RichText::new(format!("{}: {:.4}", name, v))
-                            .monospace()
-                            .color(color),
+                        egui::RichText::new(format!("{}: {:.4}", name, v)).monospace(),
                     );
                 });
             }
@@ -797,10 +796,9 @@ impl DapSamplerApp {
                         let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
                         ui.horizontal(|ui| {
                             ui.colored_label(color, "●");
+                            // 差值读数用默认文字色，仅圆点保留通道颜色
                             ui.label(
-                                egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v))
-                                    .monospace()
-                                    .color(color),
+                                egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace(),
                             );
                         });
                     }

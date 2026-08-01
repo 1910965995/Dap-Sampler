@@ -802,79 +802,87 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
-        // ---- 顶部标题栏（精简：标题 + 状态 + ELF + 释放）----
+        // ---- 顶部菜单栏：文件/工具 下拉菜单 + 右侧状态信息 ----
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("DAP Sampler");
-                ui.separator();
-
-                // 工程操作：新建 / 打开 / 保存
-                if ui.button("\u{1f4c1} 新建工程").clicked() {
-                    self.new_project();
-                }
-                if ui.button("\u{1f4c2} 打开工程").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("DAP Sampler Project", &["dapsproj"])
-                        .pick_file()
-                    {
-                        self.open_project(&path);
+            egui::menu::bar(ui, |ui| {
+                // ---- 文件菜单：工程操作 + 退出 ----
+                ui.menu_button("文件", |ui| {
+                    if ui.button("\u{1f4c1} 新建工程").clicked() {
+                        self.new_project();
+                        ui.close_menu();
                     }
-                }
-                if ui.button("\u{1f4be} 保存工程").clicked() {
-                    self.save_project();
-                }
-                let proj_name = self
-                    .project_path
-                    .as_ref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "(未保存)".to_string());
-                ui.label(
-                    egui::RichText::new(format!("project: {}", proj_name))
-                        .small()
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-                );
-
-                ui.separator();
-
-                // 状态指示（带颜色圆点）
-                let (state_text, state_color) = match self.controls.state {
-                    AcquisitionState::Idle => ("Idle", egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-                    AcquisitionState::Running => ("Running", egui::Color32::from_rgb(0x39, 0xd3, 0x53)),
-                    AcquisitionState::Paused => ("Paused", egui::Color32::from_rgb(0xe8, 0xa4, 0x00)),
-                };
-                ui.colored_label(state_color, format!("● {}", state_text));
-
-                if let Some(err) = &self.last_error {
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0x55, 0x55),
-                        format!("Error: {}", err),
-                    ).on_hover_text(
-                        "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
-                    );
-                }
-
-                ui.separator();
-
-                // Open ELF 按钮
-                if ui.button("\u{1f4c1} Open ELF").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("ELF", &["elf", "axf", "out", ""])
-                        .pick_file()
-                    {
-                        match ElfParser::load(&path) {
-                            Ok(ctx) => {
-                                log::info!("ELF loaded: {} variables", ctx.variables.len());
-                                self.elf_ctx = Some(ctx);
-                            }
-                            Err(e) => log::error!("ELF load failed: {}", e),
+                    if ui.button("\u{1f4c2} 打开工程…").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("DAP Sampler Project", &["dapsproj"])
+                            .pick_file()
+                        {
+                            self.open_project(&path);
                         }
                     }
-                }
+                    if ui.button("\u{1f4be} 保存工程").clicked() {
+                        self.save_project();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("退出").clicked() {
+                        ui.close_menu();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
 
-                // 右对齐：采样信息 + 释放按钮
+                // ---- 工具菜单：加载固件 ----
+                ui.menu_button("工具", |ui| {
+                    if ui.button("\u{1f4c4} 打开 ELF 文件…").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ELF", &["elf", "axf", "out", ""])
+                            .pick_file()
+                        {
+                            match ElfParser::load(&path) {
+                                Ok(ctx) => {
+                                    log::info!("ELF loaded: {} variables", ctx.variables.len());
+                                    self.elf_ctx = Some(ctx);
+                                }
+                                Err(e) => log::error!("ELF load failed: {}", e),
+                            }
+                        }
+                    }
+                });
+
+                // 右对齐：工程名 + 状态 + 采样信息 + 错误
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 工程名（悬停显示完整路径）
+                    let proj_name = self
+                        .project_path
+                        .as_ref()
+                        .and_then(|p| std::path::Path::new(p).file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "(未保存)".to_string());
+                    let proj_label = ui.label(
+                        egui::RichText::new(format!("\u{1f4c4} {}", proj_name))
+                            .small()
+                            .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                    );
+                    match &self.project_path {
+                        Some(p) => {
+                            proj_label.on_hover_text(p.clone());
+                        }
+                        None => {
+                            proj_label.on_hover_text("尚未保存工程：文件 → 保存工程");
+                        }
+                    }
+                    ui.separator();
+
+                    // 状态指示（带颜色圆点）
+                    let (state_text, state_color) = match self.controls.state {
+                        AcquisitionState::Idle => ("Idle", egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                        AcquisitionState::Running => ("Running", egui::Color32::from_rgb(0x39, 0xd3, 0x53)),
+                        AcquisitionState::Paused => ("Paused", egui::Color32::from_rgb(0xe8, 0xa4, 0x00)),
+                    };
+                    ui.colored_label(state_color, format!("● {}", state_text));
+                    ui.separator();
+
                     // 采集进度
                     if let Some(target) = self.controls.target_count {
                         let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
@@ -903,20 +911,31 @@ impl eframe::App for DapSamplerApp {
                     if self.controls.total_samples > 0 {
                         let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
                         ui.label(format!("Samples: {} ({:.1}s)", self.controls.total_samples, duration));
+                        ui.separator();
                     }
 
                     // 消费端落后提示：环形缓冲覆盖了旧采样点（数据丢失）
                     if let Some(ref handle) = self.pipeline {
                         let overwritten = handle.overwritten_samples();
                         if overwritten > 0 {
-                            ui.separator();
                             ui.colored_label(
                                 egui::Color32::from_rgb(0xff, 0xa0, 0x3c),
                                 format!("Overwritten: {}", overwritten),
                             ).on_hover_text(
                                 "UI 消费速度低于采样速度，环形缓冲区已覆盖旧采样点（数据丢失）。\n通常由窗口拖拽、对话框阻塞或采样率过高引起。"
                             );
+                            ui.separator();
                         }
+                    }
+
+                    // 错误提示（最左）
+                    if let Some(err) = &self.last_error {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xff, 0x55, 0x55),
+                            format!("Error: {}", err),
+                        ).on_hover_text(
+                            "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
+                        );
                     }
                 });
             });

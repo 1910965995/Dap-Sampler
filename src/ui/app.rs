@@ -990,12 +990,12 @@ impl eframe::App for DapSamplerApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
                 // ---- 文件菜单：工程操作 ----
-                self.hover_menu(ui, "file", "文件(F)", |ui, app| {
-                    if menu_item(ui, "新建工程").clicked() {
+                self.hover_menu(ui, "file", "File(F)", |ui, app| {
+                    if menu_item(ui, "New Project").clicked() {
                         app.new_project();
                         return true;
                     }
-                    if menu_item(ui, "打开工程…").clicked() {
+                    if menu_item(ui, "Open Project…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("DAP Sampler Project", &["dapsproj"])
                             .pick_file()
@@ -1004,7 +1004,7 @@ impl eframe::App for DapSamplerApp {
                         }
                         return true;
                     }
-                    if menu_item(ui, "保存工程").clicked() {
+                    if menu_item(ui, "Save Project").clicked() {
                         app.save_project();
                         return true;
                     }
@@ -1012,8 +1012,8 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 导入/导出菜单 ----
-                self.hover_menu(ui, "tools", "导入(I) / 导出(E)", |ui, app| {
-                    if menu_item(ui, "导入 ELF 文件…").clicked() {
+                self.hover_menu(ui, "tools", "Import(I) / Export(E)", |ui, app| {
+                    if menu_item(ui, "Import ELF File…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ELF", &["elf", "axf", "out", ""])
                             .pick_file()
@@ -1032,8 +1032,8 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 帮助菜单 ----
-                self.hover_menu(ui, "help", "帮助(H)", |ui, app| {
-                    if menu_item(ui, "关于").clicked() {
+                self.hover_menu(ui, "help", "Help(H)", |ui, app| {
+                    if menu_item(ui, "About").clicked() {
                         app.show_about = true;
                         return true;
                     }

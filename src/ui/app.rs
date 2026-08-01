@@ -81,6 +81,17 @@ pub struct DapSamplerApp {
     show_about: bool,
 }
 
+/// 菜单项：整行（全宽 × 22px）可点击、文字左对齐
+///
+/// 不能用 `add_sized`（其内部强制居中布局），需用 `allocate_ui`
+/// 继承菜单的左对齐布局，否则文字会居中显示。
+fn menu_item(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.allocate_ui(egui::vec2(ui.available_width(), 22.0), |ui| {
+        ui.add(egui::SelectableLabel::new(false, text))
+    })
+    .inner
+}
+
 impl DapSamplerApp {
     pub fn new(
         manual_addresses: Vec<u32>,
@@ -939,11 +950,11 @@ impl eframe::App for DapSamplerApp {
 
                 // ---- 文件菜单：工程操作 ----
                 self.hover_menu(ui, "file", "文件(F)", |ui, app| {
-                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "新建工程")).clicked() {
+                    if menu_item(ui, "新建工程").clicked() {
                         app.new_project();
                         return true;
                     }
-                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "打开工程…")).clicked() {
+                    if menu_item(ui, "打开工程…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("DAP Sampler Project", &["dapsproj"])
                             .pick_file()
@@ -952,7 +963,7 @@ impl eframe::App for DapSamplerApp {
                         }
                         return true;
                     }
-                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "保存工程")).clicked() {
+                    if menu_item(ui, "保存工程").clicked() {
                         app.save_project();
                         return true;
                     }
@@ -961,7 +972,7 @@ impl eframe::App for DapSamplerApp {
 
                 // ---- 导入/导出菜单 ----
                 self.hover_menu(ui, "tools", "导入(I) / 导出(E)", |ui, app| {
-                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "导入 ELF 文件…")).clicked() {
+                    if menu_item(ui, "导入 ELF 文件…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ELF", &["elf", "axf", "out", ""])
                             .pick_file()
@@ -981,7 +992,7 @@ impl eframe::App for DapSamplerApp {
 
                 // ---- 帮助菜单 ----
                 self.hover_menu(ui, "help", "帮助(H)", |ui, app| {
-                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "关于")).clicked() {
+                    if menu_item(ui, "关于").clicked() {
                         app.show_about = true;
                         return true;
                     }

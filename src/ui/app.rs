@@ -765,9 +765,7 @@ impl DapSamplerApp {
         ) {
             ui.separator();
             ui.label(
-                egui::RichText::new(format!("T: {:.6} s", r.time_sec))
-                    .monospace()
-                    .color(egui::Color32::from_rgb(0xff, 0xe0, 0x6e)),
+                egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace(),
             );
             for (i, v) in r.values.iter().enumerate() {
                 let name = self.waveform.channel_names().get(i).copied().unwrap_or("?");
@@ -788,9 +786,7 @@ impl DapSamplerApp {
                 ) {
                     ui.separator();
                     ui.label(
-                        egui::RichText::new(format!("\u{0394}T: {:.6} s", dt))
-                            .monospace()
-                            .color(egui::Color32::from_rgb(0x58, 0xa6, 0xff)),
+                        egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace(),
                     );
                     for (i, v) in dv.iter().enumerate() {
                         let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);

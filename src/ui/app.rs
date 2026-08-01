@@ -92,6 +92,39 @@ fn menu_item(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .inner
 }
 
+/// 菜单按钮：默认无底色（与菜单栏背景一致），悬停或展开时
+/// 用与普通按钮相同的高亮色（widgets.hovered.weak_bg_fill）。
+///
+/// 不能用 `SelectableLabel`（其选中/悬停背景取自 selection.bg_fill，
+/// 默认主题下是蓝色），需手动绘制背景。
+fn menu_button(ui: &mut egui::Ui, title: &str, open: bool) -> egui::Response {
+    let galley = egui::WidgetText::from(egui::RichText::new(title))
+        .into_galley(ui, None, f32::INFINITY, egui::TextStyle::Button);
+    let padding = ui.spacing().button_padding;
+    let size = galley.size() + padding * 2.0;
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        if open || response.hovered() || response.is_pointer_button_down_on() {
+            let bg = if response.is_pointer_button_down_on() {
+                visuals.widgets.active.weak_bg_fill
+            } else {
+                visuals.widgets.hovered.weak_bg_fill
+            };
+            ui.painter().rect(
+                rect,
+                visuals.widgets.hovered.corner_radius,
+                bg,
+                egui::Stroke::NONE,
+                egui::StrokeKind::Inside,
+            );
+        }
+        let text_pos = rect.min + padding;
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+    }
+    response
+}
+
 impl DapSamplerApp {
     pub fn new(
         manual_addresses: Vec<u32>,
@@ -812,7 +845,8 @@ impl DapSamplerApp {
         content: impl FnOnce(&mut egui::Ui, &mut DapSamplerApp) -> bool,
     ) {
         let open = self.hover_menu == Some(id);
-        let response = ui.add(egui::Button::new(title).selected(open));
+        // 菜单按钮：默认无底色（与菜单栏背景一致），悬停或展开时高亮
+        let response = menu_button(ui, title, open);
 
         if open {
             let area = egui::Area::new(ui.id().with(("menu_popup", id)))

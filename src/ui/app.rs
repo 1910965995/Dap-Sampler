@@ -69,8 +69,10 @@ pub struct DapSamplerApp {
     display_mode: WaveformDisplayMode,
     /// 显示窗口大小（采样点数）
     window_size: usize,
-    /// 最近一次操作错误（显示在顶部状态栏）
-    last_error: Option<String>,
+    /// 底部状态栏消息（None = 空）
+    status_text: Option<String>,
+    /// 状态消息是否为错误（错误显示红色）
+    status_is_error: bool,
     /// 侧栏选中的通道（波形加粗高亮；再次点击取消）
     selected_channel: Option<usize>,
     /// 当前工程文件路径（None = 未保存过；保存时已有路径则直接覆盖）
@@ -209,7 +211,8 @@ impl DapSamplerApp {
             target_count,
             display_mode,
             window_size: 2000,
-            last_error: None,
+            status_text: None,
+            status_is_error: false,
             selected_channel: None,
             project_path: None,
             hover_menu: None,
@@ -220,12 +223,21 @@ impl DapSamplerApp {
     fn set_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         log::error!("{}", message);
-        self.last_error = Some(message);
+        self.status_text = Some(message);
+        self.status_is_error = true;
+    }
+
+    /// 记录一条普通状态消息（显示在底部状态栏，默认文字色）
+    fn set_status(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("{}", message);
+        self.status_text = Some(message);
+        self.status_is_error = false;
     }
 
     /// 新建工程：清空当前全部配置，参数回默认值
     fn new_project(&mut self) {
-        self.last_error = None;
+        self.status_text = None;
         self.stop_acquisition();
         // 清空 ELF / 通道 / Watch / 手工模式
         self.elf_ctx = None;
@@ -313,7 +325,7 @@ impl DapSamplerApp {
 
     /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
     fn open_project(&mut self, path: &std::path::Path) {
-        self.last_error = None;
+        self.status_text = None;
         self.stop_acquisition();
 
         // 1. 读取并解析（失败不动当前状态）
@@ -470,7 +482,7 @@ impl DapSamplerApp {
     }
 
     fn start_acquisition(&mut self) {
-        self.last_error = None;
+        self.status_text = None;
         // 1. 确定要采集的地址和通道信息
         let (addresses, channel_names, channel_colors, types) =
             if !self.manual_addresses.is_empty() {
@@ -940,15 +952,6 @@ impl DapSamplerApp {
                 }
             }
 
-            // 错误提示
-            if let Some(err) = &self.last_error {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xff, 0x55, 0x55),
-                    format!("Error: {}", err),
-                ).on_hover_text(
-                    "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
-                );
-            }
         });
     }
 }
@@ -1253,5 +1256,39 @@ impl Drop for DapSamplerApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn set_status_records_info_message() {
+        let mut app = make_app();
+        app.set_status("采样率已变更为 5000 Hz");
+        assert_eq!(app.status_text.as_deref(), Some("采样率已变更为 5000 Hz"));
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn set_error_records_error_message() {
+        let mut app = make_app();
+        app.set_error("未选择任何采样通道");
+        assert_eq!(app.status_text.as_deref(), Some("未选择任何采样通道"));
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn set_status_overwrites_previous_message() {
+        let mut app = make_app();
+        app.set_error("旧错误");
+        app.set_status("新信息");
+        assert_eq!(app.status_text.as_deref(), Some("新信息"));
+        assert!(!app.status_is_error);
     }
 }

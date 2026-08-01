@@ -298,7 +298,7 @@ impl VariableBrowser {
         // 统计信息
         let total = ctx.variables.len();
         let checked_count = self.checked_paths.len();
-        ui.label(format!("Variables: {} | Selected: {}", total, checked_count));
+        ui.label(format!("Variables: {}  Selected: {}", total, checked_count));
 
         ui.separator();
 

@@ -84,8 +84,6 @@ impl ControlPanel {
             cmd = Some(AcquisitionCommand::Stop);
         }
 
-        ui.separator();
-
         // --- 参数输入（仅 Idle 时可修改）---
         let is_idle = self.state == AcquisitionState::Idle;
         ui.add_enabled_ui(is_idle, |ui| {
@@ -97,7 +95,6 @@ impl ControlPanel {
                     .speed(100.0)
                     .suffix(" Hz")
             );
-            ui.separator();
             ui.label("Window:");
             ui.add(
                 egui::DragValue::new(&mut self.window_size)
@@ -106,7 +103,6 @@ impl ControlPanel {
                     .speed(10.0)
                     .suffix(" pts")
             );
-            ui.separator();
             ui.label("SWD Clock:");
             egui::ComboBox::from_id_salt("swd_clock_combo")
                 .selected_text(format!("{} MHz", self.swd_clock_mhz))

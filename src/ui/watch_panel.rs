@@ -168,7 +168,11 @@ impl WatchPanel {
         ui.add_space(2.0);
 
         if self.entries.is_empty() {
-            ui.label("No watch variables");
+            ui.label(
+                egui::RichText::new("No watch variables\nImport ELF or add channels to start watching")
+                    .size(10.0)
+                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+            );
             return;
         }
 

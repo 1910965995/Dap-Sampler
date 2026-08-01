@@ -129,7 +129,20 @@ impl WaveformPanel {
         selected_channel: Option<usize>,
     ) -> Option<u64> {
         if buffer.is_empty() {
-            ui.label("Waiting for data...");
+            // 空状态：居中显示提示与引导
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.35);
+                ui.label(
+                    egui::RichText::new("Waiting for data...")
+                        .size(14.0)
+                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                );
+                ui.label(
+                    egui::RichText::new("Press Start to begin sampling")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                );
+            });
             return None;
         }
 

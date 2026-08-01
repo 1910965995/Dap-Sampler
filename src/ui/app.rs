@@ -773,6 +773,20 @@ impl DapSamplerApp {
         });
         let delta = self.cursor.delta(buffer, offset, &types);
 
+        // ---- Delta ----
+        if let Some((dt, dv)) = delta {
+            ui.separator();
+            ui.label(egui::RichText::new("Delta").strong());
+            ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
+            for (i, v) in dv.iter().enumerate() {
+                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, "●");
+                    ui.label(egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace());
+                });
+            }
+        }
+
         // ---- Cursor 1 ----
         if let Some(r) = r1 {
             ui.separator();
@@ -823,20 +837,6 @@ impl DapSamplerApp {
                 egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
                 "⚠ Cursor 2 已滑出缓冲范围",
             );
-        }
-
-        // ---- Delta ----
-        if let Some((dt, dv)) = delta {
-            ui.separator();
-            ui.label(egui::RichText::new("Delta").strong());
-            ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
-            for (i, v) in dv.iter().enumerate() {
-                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, "●");
-                    ui.label(egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace());
-                });
-            }
         }
     }
 
@@ -901,8 +901,7 @@ impl DapSamplerApp {
             if ui.button("Auto Fit Y").clicked() {
                 self.waveform.request_auto_fit_y();
             }
-            ui.separator();
-            // 实际采样率（运行中，位于窗口信息之前）
+            // 实际采样率（运行中）
             if self.controls.state == AcquisitionState::Running && self.controls.actual_rate_hz > 0.0 {
                 let pct = self.controls.actual_rate_hz / self.controls.sample_rate as f64 * 100.0;
                 let rate_label = format!("Actual Rate: {:.0} Hz ({:.0}%)", self.controls.actual_rate_hz, pct);
@@ -916,22 +915,12 @@ impl DapSamplerApp {
                 } else {
                     ui.label(rate_label);
                 }
-                ui.separator();
             }
-
-            // 窗口信息
-            ui.label(format!(
-                "Window: {} pts ({:.3}s)",
-                self.display_buf.len(),
-                self.display_buf.len() as f64 * self.interval_us / 1_000_000.0
-            ));
-            ui.separator();
 
             // 采样信息
             if let Some(target) = self.controls.target_count {
                 let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
                 ui.label(format!("Progress: {:.0}%", pct));
-                ui.separator();
             }
             if self.controls.total_samples > 0 {
                 let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
@@ -942,7 +931,6 @@ impl DapSamplerApp {
             if let Some(ref handle) = self.pipeline {
                 let overwritten = handle.overwritten_samples();
                 if overwritten > 0 {
-                    ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(0xff, 0xa0, 0x3c),
                         format!("Overwritten: {}", overwritten),
@@ -954,7 +942,6 @@ impl DapSamplerApp {
 
             // 错误提示
             if let Some(err) = &self.last_error {
-                ui.separator();
                 ui.colored_label(
                     egui::Color32::from_rgb(0xff, 0x55, 0x55),
                     format!("Error: {}", err),
@@ -1170,8 +1157,6 @@ impl eframe::App for DapSamplerApp {
                     self.display_buf.set_max_samples(self.window_size);
                     log::info!("显示窗口大小已变更为 {} 个点", self.window_size);
                 }
-
-                ui.separator();
 
                 // 波形显示模式切换
                 ui.label("Display:");

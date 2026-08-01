@@ -77,6 +77,8 @@ pub struct DapSamplerApp {
     project_path: Option<String>,
     /// 当前悬停展开的菜单（None = 无；鼠标移出按钮与菜单区域后自动收起）
     hover_menu: Option<&'static str>,
+    /// 关于窗口是否显示（帮助 → 关于）
+    show_about: bool,
 }
 
 impl DapSamplerApp {
@@ -167,6 +169,7 @@ impl DapSamplerApp {
             selected_channel: None,
             project_path: None,
             hover_menu: None,
+            show_about: false,
         }
     }
 
@@ -807,10 +810,13 @@ impl DapSamplerApp {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(180.0);
-                        content(ui, self)
+                        // 菜单项文字左对齐（egui 默认布局是水平居中）
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            content(ui, self)
+                        })
                     })
                 });
-            let action_clicked = area.inner.inner;
+            let action_clicked = area.inner.inner.inner;
             let menu_rect = area.response.rect;
             // 点击菜单项执行动作 → 立即收起；否则指针移出按钮与菜单区域 → 收起
             let pointer = ui.ctx().pointer_hover_pos();
@@ -844,19 +850,7 @@ impl DapSamplerApp {
                 self.waveform.request_auto_fit_y();
             }
             ui.separator();
-            ui.label(format!(
-                "Window: {} pts ({:.3}s)",
-                self.display_buf.len(),
-                self.display_buf.len() as f64 * self.interval_us / 1_000_000.0
-            ));
-            ui.separator();
-
-            // 采样信息
-            if let Some(target) = self.controls.target_count {
-                let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
-                ui.label(format!("Progress: {:.0}%", pct));
-                ui.separator();
-            }
+            // 实际采样率（运行中，位于窗口信息之前）
             if self.controls.state == AcquisitionState::Running && self.controls.actual_rate_hz > 0.0 {
                 let pct = self.controls.actual_rate_hz / self.controls.sample_rate as f64 * 100.0;
                 let rate_label = format!("Actual Rate: {:.0} Hz ({:.0}%)", self.controls.actual_rate_hz, pct);
@@ -870,6 +864,21 @@ impl DapSamplerApp {
                 } else {
                     ui.label(rate_label);
                 }
+                ui.separator();
+            }
+
+            // 窗口信息
+            ui.label(format!(
+                "Window: {} pts ({:.3}s)",
+                self.display_buf.len(),
+                self.display_buf.len() as f64 * self.interval_us / 1_000_000.0
+            ));
+            ui.separator();
+
+            // 采样信息
+            if let Some(target) = self.controls.target_count {
+                let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
+                ui.label(format!("Progress: {:.0}%", pct));
                 ui.separator();
             }
             if self.controls.total_samples > 0 {
@@ -928,13 +937,13 @@ impl eframe::App for DapSamplerApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
-                // ---- 文件菜单：工程操作 + 退出 ----
-                self.hover_menu(ui, "file", "文件 ▾", |ui, app| {
-                    if ui.add_sized([ui.available_width(), 22.0], egui::Button::new("\u{1f4c1} 新建工程")).clicked() {
+                // ---- 文件菜单：工程操作 ----
+                self.hover_menu(ui, "file", "文件(F)", |ui, app| {
+                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "新建工程")).clicked() {
                         app.new_project();
                         return true;
                     }
-                    if ui.add_sized([ui.available_width(), 22.0], egui::Button::new("\u{1f4c2} 打开工程…")).clicked() {
+                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "打开工程…")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("DAP Sampler Project", &["dapsproj"])
                             .pick_file()
@@ -943,21 +952,16 @@ impl eframe::App for DapSamplerApp {
                         }
                         return true;
                     }
-                    if ui.add_sized([ui.available_width(), 22.0], egui::Button::new("\u{1f4be} 保存工程")).clicked() {
+                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "保存工程")).clicked() {
                         app.save_project();
-                        return true;
-                    }
-                    ui.separator();
-                    if ui.add_sized([ui.available_width(), 22.0], egui::Button::new("退出")).clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         return true;
                     }
                     false
                 });
 
-                // ---- 工具菜单：加载固件 ----
-                self.hover_menu(ui, "tools", "工具 ▾", |ui, app| {
-                    if ui.add_sized([ui.available_width(), 22.0], egui::Button::new("\u{1f4c4} 打开 ELF 文件…")).clicked() {
+                // ---- 导入/导出菜单 ----
+                self.hover_menu(ui, "tools", "导入(I) / 导出(E)", |ui, app| {
+                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "导入 ELF 文件…")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ELF", &["elf", "axf", "out", ""])
                             .pick_file()
@@ -970,6 +974,15 @@ impl eframe::App for DapSamplerApp {
                                 Err(e) => log::error!("ELF load failed: {}", e),
                             }
                         }
+                        return true;
+                    }
+                    false
+                });
+
+                // ---- 帮助菜单 ----
+                self.hover_menu(ui, "help", "帮助(H)", |ui, app| {
+                    if ui.add_sized([ui.available_width(), 22.0], egui::SelectableLabel::new(false, "关于")).clicked() {
+                        app.show_about = true;
                         return true;
                     }
                     false
@@ -1147,6 +1160,26 @@ impl eframe::App for DapSamplerApp {
                 self.cursor.click(seq);
             }
         });
+
+        // ---- 关于窗口（帮助 → 关于）----
+        if self.show_about {
+            egui::Window::new("关于 DAP Sampler")
+                .open(&mut self.show_about)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.heading("DAP Sampler");
+                    ui.add_space(4.0);
+                    ui.label(format!("版本: v{}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        "基于 CMSIS-DAP v2 协议的高速变量采样与可视化工具\n适用于 ARM Cortex-M 调试场景",
+                    );
+                    ui.add_space(6.0);
+                });
+        }
 
         // 非 Running 状态时强制关闭 Follow,让 X 轴停在当前位置
         if self.controls.state != AcquisitionState::Running {

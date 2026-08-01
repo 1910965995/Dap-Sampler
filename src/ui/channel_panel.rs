@@ -84,6 +84,7 @@ impl ChannelPanel {
             // 与 Cursor 面板提示保持一致的灰色
             ui.label(
                 egui::RichText::new("No channels")
+                    .size(13.0)
                     .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
             );
             return action;

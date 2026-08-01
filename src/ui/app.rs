@@ -268,6 +268,7 @@ impl DapSamplerApp {
         self.controls.target_count = None;
         self.project_path = None;
         log::info!("已新建工程（清空配置）");
+        self.set_status("已新建工程（清空配置）");
     }
 
     /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
@@ -318,6 +319,7 @@ impl DapSamplerApp {
             Ok(()) => {
                 self.project_path = Some(path.display().to_string());
                 log::info!("工程已保存: {}", path.display());
+                self.set_status(format!("工程已保存: {}", path.display()));
             }
             Err(e) => self.set_error(format!("保存工程失败: {}", e)),
         }
@@ -479,6 +481,7 @@ impl DapSamplerApp {
         // 7. 记录工程路径
         self.project_path = Some(path.display().to_string());
         log::info!("已打开工程: {}", path.display());
+        self.set_status(format!("已打开工程: {}", path.display()));
     }
 
     fn start_acquisition(&mut self) {
@@ -592,6 +595,7 @@ impl DapSamplerApp {
                 self.pipeline = Some(handle);
                 self.controls.set_running();
                 self.acquisition_start = Some(Instant::now());
+                self.set_status("开始采集");
             }
             Err(e) => self.set_error(format!("启动采集失败: {}", e)),
         }
@@ -625,12 +629,14 @@ impl DapSamplerApp {
                 }
             }
         }
+        self.set_status("采集已停止");
     }
 
     fn pause_acquisition(&mut self) {
         self.stop_pipeline();
         self.controls.set_paused();
         // Pause 时保持 USB 连接，恢复采集更快
+        self.set_status("采集已暂停");
     }
 
     fn drain_pipeline(&mut self) {
@@ -1011,9 +1017,13 @@ impl eframe::App for DapSamplerApp {
                             match ElfParser::load(&path) {
                                 Ok(ctx) => {
                                     log::info!("ELF loaded: {} variables", ctx.variables.len());
+                                    app.set_status(format!("ELF loaded: {} variables", ctx.variables.len()));
                                     app.elf_ctx = Some(ctx);
                                 }
-                                Err(e) => log::error!("ELF load failed: {}", e),
+                                Err(e) => {
+                                    log::error!("ELF load failed: {}", e);
+                                    app.set_error(format!("ELF load failed: {}", e));
+                                }
                             }
                         }
                         return true;
@@ -1171,12 +1181,14 @@ impl eframe::App for DapSamplerApp {
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
                     log::info!("采样率已变更为 {} Hz", self.rate_hz);
+                    self.set_status(format!("采样率已变更为 {} Hz", self.rate_hz));
                 }
 
                 // 检测 SWD 时钟变化（仅记录日志，下次连接时生效）
                 if self.controls.swd_clock_mhz != self.swd_clock_mhz {
                     self.swd_clock_mhz = self.controls.swd_clock_mhz;
                     log::info!("SWD 时钟已变更为 {} MHz（下次连接 DAP-Link 时生效）", self.swd_clock_mhz);
+                    self.set_status(format!("SWD 时钟已变更为 {} MHz（下次连接 DAP-Link 时生效）", self.swd_clock_mhz));
                 }
 
                 // 检测窗口大小变化
@@ -1184,6 +1196,7 @@ impl eframe::App for DapSamplerApp {
                     self.window_size = self.controls.window_size;
                     self.display_buf.set_max_samples(self.window_size);
                     log::info!("显示窗口大小已变更为 {} 个点", self.window_size);
+                    self.set_status(format!("显示窗口大小已变更为 {} 个点", self.window_size));
                 }
 
                 // 波形显示模式切换
@@ -1201,6 +1214,11 @@ impl eframe::App for DapSamplerApp {
                 if mode != self.display_mode {
                     self.display_mode = mode;
                     self.waveform.set_display_mode(mode);
+                    let mode_label = match mode {
+                        WaveformDisplayMode::Line => "Line",
+                        WaveformDisplayMode::Point => "Point",
+                    };
+                    self.set_status(format!("显示模式已切换为 {}", mode_label));
                 }
             });
 

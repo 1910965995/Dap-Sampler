@@ -10,7 +10,7 @@ use crate::elf::{ElfContext, ElfParser};
 use super::display_buffer::DisplayBuffer;
 use super::waveform::{WaveformPanel, WaveformDisplayMode};
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
-use super::cursor::CursorState;
+use super::cursor::{CursorResult, CursorState};
 use super::variable_browser::VariableBrowser;
 use super::channel_panel::ChannelPanel;
 use super::watch_panel::WatchPanel;
@@ -758,55 +758,33 @@ impl DapSamplerApp {
         );
         let types = self.waveform.value_types().to_vec();
         let colors: Vec<egui::Color32> = self.channel_panel.channels.iter().map(|c| c.color).collect();
-        if let Some(r) = self.cursor.get_result(
-            self.display_buf.all(),
-            self.display_buf.oldest_seq(),
-            &types,
-        ) {
+        let buffer = self.display_buf.all();
+        let offset = self.display_buf.oldest_seq();
+
+        let r1 = self.cursor.get_result(buffer, offset, &types);
+        let r2 = self.cursor.cursor2.and_then(|seq2| {
+            let local_idx2 = seq2.checked_sub(offset)? as usize;
+            let sample2 = buffer.get(local_idx2)?;
+            Some(CursorResult {
+                seq: seq2,
+                time_sec: sample2.timestamp_sec,
+                values: sample2.as_f64s_typed(&types),
+            })
+        });
+        let delta = self.cursor.delta(buffer, offset, &types);
+
+        // ---- Cursor 1 ----
+        if let Some(r) = r1 {
             ui.separator();
-            ui.label(
-                egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace(),
-            );
+            ui.label(egui::RichText::new("Cursor 1").strong());
             for (i, v) in r.values.iter().enumerate() {
-                let name = self.waveform.channel_names().get(i).copied().unwrap_or("?");
                 let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
                 ui.horizontal(|ui| {
                     ui.colored_label(color, "●");
-                    // 变量名/读数用默认文字色，仅圆点保留通道颜色
-                    ui.label(
-                        egui::RichText::new(format!("{}: {:.4}", name, v)).monospace(),
-                    );
+                    ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
                 });
             }
-            if self.cursor.cursor2.is_some() {
-                if let Some((dt, dv)) = self.cursor.delta(
-                    self.display_buf.all(),
-                    self.display_buf.oldest_seq(),
-                    &types,
-                ) {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace(),
-                    );
-                    for (i, v) in dv.iter().enumerate() {
-                        let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
-                        ui.horizontal(|ui| {
-                            ui.colored_label(color, "●");
-                            // 差值读数用默认文字色，仅圆点保留通道颜色
-                            ui.label(
-                                egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace(),
-                            );
-                        });
-                    }
-                } else {
-                    // Cursor2 已滑出缓冲（窗口滚动后）
-                    ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
-                        "⚠ Cursor 2 已滑出缓冲范围",
-                    );
-                }
-            }
+            ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
         } else if let Some(seq) = self.cursor.cursor1 {
             // 光标存在但已滑出缓冲范围（窗口滚动/清空后）：给出可见提示，
             // 而不是静默不显示读数
@@ -822,8 +800,43 @@ impl DapSamplerApp {
             };
             ui.colored_label(
                 egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
-                format!("⚠ Cursor @ seq {} 已滑出缓冲范围 {}", seq, range_text),
+                format!("⚠ Cursor 1 @ seq {} 已滑出缓冲范围 {}", seq, range_text),
             );
+        }
+
+        // ---- Cursor 2 ----
+        if let Some(r) = r2 {
+            ui.separator();
+            ui.label(egui::RichText::new("Cursor 2").strong());
+            for (i, v) in r.values.iter().enumerate() {
+                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, "●");
+                    ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
+                });
+            }
+            ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
+        } else if self.cursor.cursor2.is_some() {
+            // Cursor2 已滑出缓冲（窗口滚动后）
+            ui.separator();
+            ui.colored_label(
+                egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
+                "⚠ Cursor 2 已滑出缓冲范围",
+            );
+        }
+
+        // ---- Delta ----
+        if let Some((dt, dv)) = delta {
+            ui.separator();
+            ui.label(egui::RichText::new("Delta").strong());
+            ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
+            for (i, v) in dv.iter().enumerate() {
+                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, "●");
+                    ui.label(egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace());
+                });
+            }
         }
     }
 

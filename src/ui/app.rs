@@ -1114,6 +1114,29 @@ impl eframe::App for DapSamplerApp {
                 self.watch_panel.show(ui, &colors);
             });
 
+        // ---- 底部状态栏（Watch 面板之下、界面最底部）----
+        egui::TopBottomPanel::bottom("status_bar")
+            .resizable(false)
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(msg) = &self.status_text {
+                        let color = if self.status_is_error {
+                            egui::Color32::from_rgb(0xff, 0x55, 0x55)
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        let label = ui.label(egui::RichText::new(msg).color(color));
+                        // 错误消息悬停时显示排障提示
+                        if self.status_is_error {
+                            label.on_hover_text(
+                                "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
+                            );
+                        }
+                    }
+                });
+            });
+
         // 把本帧 watch 表中提交的 y_offset/y_scale 变更应用到波形图
         for (name, offset, scale) in self.watch_panel.drain_changed_transforms() {
             self.waveform.set_channel_transform(&name, offset, scale);

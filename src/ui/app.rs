@@ -238,6 +238,7 @@ impl DapSamplerApp {
     /// 新建工程：清空当前全部配置，参数回默认值
     fn new_project(&mut self) {
         self.status_text = None;
+        self.status_is_error = false;
         self.stop_acquisition();
         // 清空 ELF / 通道 / Watch / 手工模式
         self.elf_ctx = None;
@@ -326,6 +327,7 @@ impl DapSamplerApp {
     /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
     fn open_project(&mut self, path: &std::path::Path) {
         self.status_text = None;
+        self.status_is_error = false;
         self.stop_acquisition();
 
         // 1. 读取并解析（失败不动当前状态）
@@ -485,6 +487,7 @@ impl DapSamplerApp {
 
     fn start_acquisition(&mut self) {
         self.status_text = None;
+        self.status_is_error = false;
         // 1. 确定要采集的地址和通道信息
         let (addresses, channel_names, channel_colors, types) =
             if !self.manual_addresses.is_empty() {

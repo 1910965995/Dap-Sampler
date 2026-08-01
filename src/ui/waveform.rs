@@ -209,28 +209,6 @@ impl WaveformPanel {
         // Y 轴标签
         let y_label = "Value".to_string();
 
-        // --- 波形工具栏 ---
-        ui.horizontal(|ui| {
-            let follow_text = if self.auto_scroll {
-                "\u{23f8} Follow: ON"
-            } else {
-                "\u{25b6} Follow: OFF"
-            };
-            if ui.button(follow_text).clicked() {
-                self.auto_scroll = !self.auto_scroll;
-            }
-            ui.separator();
-            if ui.button("Auto Fit Y").clicked() {
-                self.auto_fit_y = true;
-            }
-            ui.separator();
-            ui.label(format!(
-                "Window: {} pts ({:.3}s)",
-                buffer.len(),
-                buffer.len() as f64 * self.interval_us / 1_000_000.0
-            ));
-        });
-
         // 始终允许缩放/拖拽，auto_scroll 只决定 X 轴是否跟随最新数据
         let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
@@ -602,6 +580,11 @@ impl WaveformPanel {
     /// 设置波形显示模式
     pub fn set_display_mode(&mut self, mode: WaveformDisplayMode) {
         self.display_mode = mode;
+    }
+
+    /// 当前是否处于 Follow（自动滚动）模式
+    pub fn is_follow(&self) -> bool {
+        self.auto_scroll
     }
 
     /// 设置 Follow (auto_scroll) 状态。

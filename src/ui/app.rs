@@ -603,7 +603,7 @@ impl DapSamplerApp {
         self.watch_panel.sync_from_channels(&channel_names, &types, &self.current_addresses);
 
         // 7. 启动采集
-        match engine.start() {
+        match engine.start(self.buffer_capacity) {
             Ok(handle) => {
                 self.pipeline = Some(handle);
                 self.controls.set_running();

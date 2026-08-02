@@ -558,7 +558,7 @@ fn cmd_sample(
     // 创建引擎并启动
     let usb = Arc::new(usb);
     let engine = PipelineEngine::new(usb, dap, addresses.clone(), rate);
-    let handle = engine.start()?;
+    let handle = engine.start(dap_sampler::ui::controls::DEFAULT_BUFFER_CAPACITY)?;
 
     // 准备输出
     let mut writer: Box<dyn Write> = match output_path {

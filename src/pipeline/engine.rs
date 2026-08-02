@@ -94,14 +94,14 @@ impl PipelineEngine {
     /// 启动流水线，返回控制句柄
     ///
     /// 可重复调用（Stop 后再次 Start），不消费 self。
-    pub fn start(&self) -> Result<PipelineHandle> {
+    pub fn start(&self, capacity: usize) -> Result<PipelineHandle> {
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
         // 复位在途计数器（上一次运行可能残留未消费的命令，如停止时
         // USB IN 端点中尚未读取的响应）
         self.in_flight.store(0, Ordering::SeqCst);
 
-        let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
+        let ring = Arc::new(RingBuffer::new(capacity));
         let start_time = Instant::now();
 
         // 时间戳完全由接收线程的 seq 计算：

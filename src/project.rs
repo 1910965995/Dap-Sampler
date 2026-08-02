@@ -55,22 +55,22 @@ impl ProjectFile {
         for v in &self.variables {
             if !v.y_offset.is_finite() || !v.y_scale.is_finite() || !v.refresh_period_s.is_finite() {
                 return Err(Error::Other(format!(
-                    "工程文件序列化失败: 变量 \"{}\" 含非有限浮点数（NaN/Infinity）",
+                    "Project file serialization failed: variable \"{}\" contains non-finite float (NaN/Infinity)",
                     v.name
                 )));
             }
         }
         serde_json::to_string_pretty(self)
-            .map_err(|e| Error::Other(format!("工程文件序列化失败: {}", e)))
+            .map_err(|e| Error::Other(format!("Project file serialization failed: {}", e)))
     }
 
     /// 从 JSON 字符串反序列化，并校验版本号
     pub fn from_json(text: &str) -> Result<ProjectFile> {
         let file: ProjectFile = serde_json::from_str(text)
-            .map_err(|e| Error::Other(format!("工程文件解析失败: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Project file parse failed: {}", e)))?;
         if file.version != PROJECT_VERSION {
             return Err(Error::Other(format!(
-                "工程文件版本不支持: 文件版本 {}, 当前支持版本 {}",
+                "Unsupported project file version: file version {}, current supported version {}",
                 file.version, PROJECT_VERSION
             )));
         }
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn corrupted_json_returns_err() {
         let err = ProjectFile::from_json("{ not valid json !!").unwrap_err();
-        assert!(err.to_string().contains("解析失败"), "错误应说明解析失败: {}", err);
+        assert!(err.to_string().contains("parse failed"), "error should mention parse failure: {}", err);
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
         file.version = 99;
         let json = file.to_json().unwrap();
         let err = ProjectFile::from_json(&json).unwrap_err();
-        assert!(err.to_string().contains("版本不支持"), "错误应说明版本不支持: {}", err);
+        assert!(err.to_string().contains("Unsupported project file version"), "error should mention unsupported version: {}", err);
     }
 
     #[test]

@@ -57,11 +57,10 @@ impl ControlPanel {
         }
     }
 
-    /// 渲染控制面板，返回用户操作
+    /// 渲染采集控制按钮（Start/Pause/Stop），返回用户操作
     ///
-    /// 返回 `Some(AcquisitionCommand)` 表示用户点击了按钮。
-    /// 仅渲染采集控制按钮和参数输入；采样计数/实际率/进度由顶部状态栏显示。
-    pub fn show(&mut self, ui: &mut egui::Ui) -> Option<AcquisitionCommand> {
+    /// 与参数输入分离，便于外部在按钮与参数之间插入其他控件（如 Follow）。
+    pub fn show_buttons(&mut self, ui: &mut egui::Ui) -> Option<AcquisitionCommand> {
         let mut cmd = None;
 
         // --- 采集控制按钮 ---
@@ -84,6 +83,11 @@ impl ControlPanel {
             cmd = Some(AcquisitionCommand::Stop);
         }
 
+        cmd
+    }
+
+    /// 渲染参数输入（仅 Idle 时可修改）：Rate / Window / SWD Clock
+    pub fn show_params(&mut self, ui: &mut egui::Ui) {
         // --- 参数输入（仅 Idle 时可修改）---
         let is_idle = self.state == AcquisitionState::Idle;
         ui.add_enabled_ui(is_idle, |ui| {
@@ -112,8 +116,6 @@ impl ControlPanel {
                     }
                 });
         });
-
-        cmd
     }
 
     /// 更新状态（由外部调用）

@@ -280,7 +280,7 @@ impl VariableBrowser {
             ui.label(
                 egui::RichText::new("No ELF file loaded")
                     .size(10.0)
-                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                    .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
             );
             return vec![];
         }

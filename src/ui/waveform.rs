@@ -64,8 +64,6 @@ pub struct WaveformPanel {
     last_x_max: Option<f64>,
     /// 当前缓冲区数据的绝对值最大值（Y 轴自适应用）
     auto_y_max_abs: f64,
-    /// 是否自动调整 Y 轴范围（跟随模式下持续生效）
-    auto_fit_y: bool,
     /// 是否自动滚动跟随最新数据
     auto_scroll: bool,
     /// 波形显示模式（连线 / 散点）
@@ -75,6 +73,14 @@ pub struct WaveformPanel {
 /// 增量模式下每隔多少帧全量重扫一次 Y 轴基准（约 0.5s @ 60fps）。
 /// 增量更新只增不减，信号峰值移出窗口后 Y 轴会偏高，定期重扫修正。
 const RESCAN_EVERY_FRAMES: u32 = 30;
+
+/// 波形渲染输出
+pub struct WaveformOutput {
+    /// 用户在波形上点击放置光标的采样点序号
+    pub cursor_seq: Option<u64>,
+    /// 波形图（Plot）的屏幕矩形区域（缓冲为空时无图 → None，用于叠加采样信息）
+    pub plot_rect: Option<egui::Rect>,
+}
 
 impl WaveformPanel {
     pub fn new(
@@ -109,7 +115,6 @@ impl WaveformPanel {
             last_x_range: None,
             last_x_max: None,
             auto_y_max_abs: 1.0,
-            auto_fit_y: true, // 首次渲染自动调整 Y 轴
             auto_scroll: true,
             display_mode,
         }
@@ -117,7 +122,8 @@ impl WaveformPanel {
 
     /// 渲染波形
     ///
-    /// 返回 `Some(seq)` 表示用户在波形上点击放置光标（seq 为点击位置对应的采样序号）。
+    /// 返回波形输出：点击放置光标的采样序号 + 波形图矩形区域
+    /// （缓冲为空时为 None，用于叠加采样信息）。
     /// `has_new_data` 为 true 时重建降采样缓存。
     pub fn show(
         &mut self,
@@ -127,7 +133,7 @@ impl WaveformPanel {
         _visible_width: f32,
         has_new_data: bool,
         selected_channel: Option<usize>,
-    ) -> Option<u64> {
+    ) -> WaveformOutput {
         if buffer.is_empty() {
             // 空状态：居中显示提示与引导
             ui.vertical_centered(|ui| {
@@ -135,15 +141,15 @@ impl WaveformPanel {
                 ui.label(
                     egui::RichText::new("Waiting for data...")
                         .size(14.0)
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                 );
                 ui.label(
                     egui::RichText::new("Press Start to begin sampling")
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                 );
             });
-            return None;
+            return WaveformOutput { cursor_seq: None, plot_rect: None };
         }
 
         // 不进行降采样: buffer 中所有原始样本点都必须被绘制,采样工具的波形必须忠实于采集数据。
@@ -225,11 +231,9 @@ impl WaveformPanel {
         // 始终允许缩放/拖拽，auto_scroll 只决定 X 轴是否跟随最新数据
         let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
-        let auto_fit = self.auto_fit_y;
-        self.auto_fit_y = false; // 一次性触发（首次渲染或用户点击 Auto Fit Y）
 
         let plot = Plot::new("waveform_plot")
-            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
             .show_grid(true)
             .show_axes(true)
             .x_axis_label(x_label)
@@ -277,14 +281,6 @@ impl WaveformPanel {
                 );
                 plot_ui.set_plot_bounds(new_bounds);
                 self.last_x_max = Some(latest_ts);
-            } else if auto_fit {
-                // 非 Follow 模式下点击 Auto Fit Y：只调整 Y 轴，保留当前 X 轴范围
-                let new_bounds = PlotBounds::from_min_max(
-                    [cur_bounds.min()[0], -y_bound],
-                    [cur_bounds.max()[0], y_bound],
-                );
-                plot_ui.set_plot_bounds(new_bounds);
-                self.last_x_max = Some(cur_x_max);
             } else {
                 self.last_x_max = Some(cur_x_max);
             }
@@ -363,8 +359,10 @@ impl WaveformPanel {
             }
         });
 
-        let _ = plot_response;
-        clicked_seq
+        WaveformOutput {
+            cursor_seq: clicked_seq,
+            plot_rect: Some(plot_response.response.rect),
+        }
     }
 
     /// 重建波形缓存
@@ -564,11 +562,6 @@ impl WaveformPanel {
                 self.mark_channel_dirty(index);
             }
         }
-    }
-
-    /// 触发自动调整 Y 轴范围
-    pub fn request_auto_fit_y(&mut self) {
-        self.auto_fit_y = true;
     }
 
     pub fn channel_count(&self) -> usize {

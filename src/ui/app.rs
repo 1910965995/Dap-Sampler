@@ -16,16 +16,16 @@ use super::channel_panel::ChannelPanel;
 use super::watch_panel::WatchPanel;
 use crate::project::{ProjectFile, ProjectVariable, PROJECT_VERSION};
 
-/// 示波器风格通道色板（高明度、色相均分、暗底可读；避免灰与近邻红粉）
+/// 示波器风格通道色板（v1.1.0 配色：红/绿/蓝/橙/品红/青/灰/粉）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
-    egui::Color32::from_rgb(255, 196, 72),  // 琥珀黄
-    egui::Color32::from_rgb(64, 196, 255),  // 天蓝
-    egui::Color32::from_rgb(255, 112, 168), // 玫红
-    egui::Color32::from_rgb(80, 220, 140),  // 翠绿
-    egui::Color32::from_rgb(200, 140, 255), // 淡紫
-    egui::Color32::from_rgb(255, 148, 64),  // 橙
-    egui::Color32::from_rgb(72, 230, 220),  // 青
-    egui::Color32::from_rgb(180, 200, 255), // 冰蓝
+    egui::Color32::from_rgb(255, 68, 68),   // 红
+    egui::Color32::from_rgb(68, 255, 68),   // 绿
+    egui::Color32::from_rgb(68, 68, 255),   // 蓝
+    egui::Color32::from_rgb(255, 200, 68),  // 橙
+    egui::Color32::from_rgb(255, 68, 255),  // 品红
+    egui::Color32::from_rgb(68, 255, 255),  // 青
+    egui::Color32::from_rgb(180, 180, 180), // 灰
+    egui::Color32::from_rgb(255, 150, 150), // 粉
 ];
 
 /// DAP Sampler 主应用
@@ -220,6 +220,7 @@ impl DapSamplerApp {
         }
     }
 
+    /// 记录一条错误消息（显示在底部状态栏，红色）
     fn set_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         log::error!("{}", message);
@@ -268,7 +269,7 @@ impl DapSamplerApp {
         self.selected_channel = None;
         self.controls.target_count = None;
         self.project_path = None;
-        self.set_status("已新建工程（清空配置）");
+        self.set_status("New project created (config cleared)");
     }
 
     /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
@@ -318,9 +319,9 @@ impl DapSamplerApp {
         match std::fs::write(&path, json) {
             Ok(()) => {
                 self.project_path = Some(path.display().to_string());
-                self.set_status(format!("工程已保存: {}", path.display()));
+                self.set_status(format!("Project saved: {}", path.display()));
             }
-            Err(e) => self.set_error(format!("保存工程失败: {}", e)),
+            Err(e) => self.set_error(format!("Failed to save project: {}", e)),
         }
     }
 
@@ -334,7 +335,7 @@ impl DapSamplerApp {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                self.set_error(format!("读取工程文件失败: {}", e));
+                self.set_error(format!("Failed to read project file: {}", e));
                 return;
             }
         };
@@ -356,7 +357,7 @@ impl DapSamplerApp {
                 }
                 Err(e) => {
                     self.elf_ctx = None;
-                    self.set_error(format!("ELF 加载失败，已用保存的变量地址继续: {}", e));
+                    self.set_error(format!("ELF load failed, continuing with saved variable addresses: {}", e));
                     false
                 }
             }
@@ -386,7 +387,7 @@ impl DapSamplerApp {
             }
             if !missing.is_empty() {
                 self.set_error(format!(
-                    "工程中 {} 个变量在 ELF 中不存在，已跳过: {}",
+                    "{} variables in project not found in ELF, skipped: {}",
                     missing.len(),
                     missing.join(", ")
                 ));
@@ -481,7 +482,7 @@ impl DapSamplerApp {
         // 7. 记录工程路径
         self.project_path = Some(path.display().to_string());
         if !self.status_is_error {
-            self.set_status(format!("已打开工程: {}", path.display()));
+            self.set_status(format!("Project opened: {}", path.display()));
         }
     }
 
@@ -502,7 +503,7 @@ impl DapSamplerApp {
                 // ELF 模式：从 channel_panel 动态获取
                 let channels = &self.channel_panel.channels;
                 if channels.is_empty() {
-                    self.set_error("未选择任何采样通道：请加载 ELF 并勾选变量，或通过 --addresses 指定地址");
+                    self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
                     return;
                 }
 
@@ -519,7 +520,7 @@ impl DapSamplerApp {
                     .collect();
 
                 if addresses.is_empty() {
-                    self.set_error("已选择通道但没有找到对应变量地址：请检查 ELF 符号/调试信息是否匹配");
+                    self.set_error("Channels selected but no matching variable addresses found: check ELF symbols/debug info");
                     return;
                 }
 
@@ -530,7 +531,7 @@ impl DapSamplerApp {
             };
 
         if addresses.is_empty() {
-            self.set_error("未选择任何采样通道：请加载 ELF 并勾选变量，或通过 --addresses 指定地址");
+            self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
             return;
         }
 
@@ -542,13 +543,13 @@ impl DapSamplerApp {
             let mut swd = match SwdLink::new() {
                 Ok(s) => s,
                 Err(e) => {
-                    self.set_error(format!("连接 DAP-Link 失败: {}", e));
+                    self.set_error(format!("Failed to connect to DAP-Link: {}", e));
                     return;
                 }
             };
             let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
             if let Err(e) = swd.init_with_clock(clock_hz) {
-                self.set_error(format!("SWD 初始化失败: {}", e));
+                self.set_error(format!("SWD initialization failed: {}", e));
                 return;
             }
             let (usb, _) = swd.into_parts();
@@ -597,9 +598,9 @@ impl DapSamplerApp {
                 self.pipeline = Some(handle);
                 self.controls.set_running();
                 self.acquisition_start = Some(Instant::now());
-                self.set_status("开始采集");
+                self.set_status("Acquisition started");
             }
-            Err(e) => self.set_error(format!("启动采集失败: {}", e)),
+            Err(e) => self.set_error(format!("Failed to start acquisition: {}", e)),
         }
     }
 
@@ -631,14 +632,14 @@ impl DapSamplerApp {
                 }
             }
         }
-        self.set_status("采集已停止");
+        self.set_status("Acquisition stopped");
     }
 
     fn pause_acquisition(&mut self) {
         self.stop_pipeline();
         self.controls.set_paused();
         // Pause 时保持 USB 连接，恢复采集更快
-        self.set_status("采集已暂停");
+        self.set_status("Acquisition paused");
     }
 
     fn drain_pipeline(&mut self) {
@@ -694,7 +695,7 @@ impl DapSamplerApp {
                 Ok(mut swd) => {
                     let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
                     if let Err(e) = swd.init_with_clock(clock_hz) {
-                        log::error!("写入前 SWD 初始化失败: {}", e);
+                        log::error!("写入前 SWD initialization failed: {}", e);
                         return;
                     }
                     for w in &writes {
@@ -711,7 +712,7 @@ impl DapSamplerApp {
                         }
                     }
                 }
-                Err(e) => log::error!("写入时连接 DAP-Link 失败: {}", e),
+                Err(e) => log::error!("写入时Failed to connect to DAP-Link: {}", e),
             }
         }
     }
@@ -774,7 +775,7 @@ impl DapSamplerApp {
         ui.label(
             egui::RichText::new("Click waveform to place cursor 1\nClick again to place cursor 2")
                 .size(10.0)
-                .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
+                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
         );
         let types = self.waveform.value_types().to_vec();
         let colors: Vec<egui::Color32> = self.channel_panel.channels.iter().map(|c| c.color).collect();
@@ -833,7 +834,7 @@ impl DapSamplerApp {
                 )
             };
             ui.colored_label(
-                egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
+                egui::Color32::from_rgb(0xc0, 0x82, 0x00),
                 format!("⚠ Cursor 1 @ seq {} 已滑出缓冲范围 {}", seq, range_text),
             );
         }
@@ -854,7 +855,7 @@ impl DapSamplerApp {
             // Cursor2 已滑出缓冲（窗口滚动后）
             ui.separator();
             ui.colored_label(
-                egui::Color32::from_rgb(0xe8, 0xa4, 0x00),
+                egui::Color32::from_rgb(0xc0, 0x82, 0x00),
                 "⚠ Cursor 2 已滑出缓冲范围",
             );
         }
@@ -903,69 +904,85 @@ impl DapSamplerApp {
         }
     }
 
-    /// 状态信息行：波形工具按钮 + 采集状态
+    /// 波形图左上角叠加采样信息（Actual Rate / Samples / Progress / Overwritten）
     ///
-    /// 位于工具栏（SWD Clock / Display）下方、波形图上方，
-    /// 集中显示 Follow / Auto Fit Y / Window 信息与采样状态。
-    fn show_status_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            // 波形工具
-            let follow_text = if self.waveform.is_follow() {
-                "\u{23f8} Follow: ON"
+    /// 透明背景、图例风格小字，与通道图例（右上角）对称；仅在有数据时显示。
+    fn show_plot_overlay(&mut self, ui: &mut egui::Ui, plot_rect: egui::Rect) {
+        // (文字, 颜色, 悬停提示)
+        let mut items: Vec<(String, egui::Color32, Option<&'static str>)> = Vec::new();
+        if self.controls.state == AcquisitionState::Running && self.controls.actual_rate_hz > 0.0 {
+            let pct = self.controls.actual_rate_hz / self.controls.sample_rate as f64 * 100.0;
+            let (color, tip) = if pct < 90.0 {
+                (
+                    egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
+                    Some(
+                        "DAP-Link 吞吐量不足，实际采样率低于目标。\n波形时间轴已使用真实时间戳，波形形状应正确。\n降低采样率可获得更均匀的采样间隔。",
+                    ),
+                )
             } else {
-                "\u{25b6} Follow: OFF"
+                (ui.visuals().text_color(), None)
             };
-            if ui.button(follow_text).clicked() {
-                self.waveform.set_follow(!self.waveform.is_follow());
+            items.push((
+                format!("Actual Rate: {:.0} Hz ({:.0}%)", self.controls.actual_rate_hz, pct),
+                color,
+                tip,
+            ));
+        }
+        if self.controls.total_samples > 0 {
+            let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
+            items.push((
+                format!("Samples: {} ({:.1}s)", self.controls.total_samples, duration),
+                ui.visuals().text_color(),
+                None,
+            ));
+        }
+        // 采样进度（限次采集时显示）
+        if let Some(target) = self.controls.target_count {
+            let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
+            items.push((format!("Progress: {:.0}%", pct), ui.visuals().text_color(), None));
+        }
+        // 消费端落后提示：环形缓冲覆盖了旧采样点（数据丢失）
+        if let Some(ref handle) = self.pipeline {
+            let overwritten = handle.overwritten_samples();
+            if overwritten > 0 {
+                items.push((
+                    format!("Overwritten: {}", overwritten),
+                    egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
+                    Some(
+                        "UI 消费速度低于采样速度，环形缓冲区已覆盖旧采样点（数据丢失）。\n通常由窗口拖拽、对话框阻塞或采样率过高引起。",
+                    ),
+                ));
             }
-            if ui.button("Auto Fit Y").clicked() {
-                self.waveform.request_auto_fit_y();
-            }
-            // 实际采样率（运行中）
-            if self.controls.state == AcquisitionState::Running && self.controls.actual_rate_hz > 0.0 {
-                let pct = self.controls.actual_rate_hz / self.controls.sample_rate as f64 * 100.0;
-                let rate_label = format!("Actual Rate: {:.0} Hz ({:.0}%)", self.controls.actual_rate_hz, pct);
-                if pct < 90.0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0xa0, 0x3c),
-                        rate_label,
-                    ).on_hover_text(
-                        "DAP-Link 吞吐量不足，实际采样率低于目标。\n波形时间轴已使用真实时间戳，波形形状应正确。\n降低采样率可获得更均匀的采样间隔。"
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        egui::Area::new(ui.id().with("plot_rate_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 6.0))
+            .constrain_to(plot_rect)
+            .show(ui.ctx(), |ui| {
+                // 固定最小宽度，防止 label 按窄宽度换行（每项一行完整显示）
+                ui.set_min_width(240.0);
+                for (text, color, tip) in items {
+                    let label = ui.label(
+                        egui::RichText::new(text)
+                            .size(11.0)
+                            .color(color),
                     );
-                } else {
-                    ui.label(rate_label);
+                    if let Some(tip) = tip {
+                        label.on_hover_text(tip);
+                    }
                 }
-            }
-
-            // 采样信息
-            if let Some(target) = self.controls.target_count {
-                let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
-                ui.label(format!("Progress: {:.0}%", pct));
-            }
-            if self.controls.total_samples > 0 {
-                let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
-                ui.label(format!("Samples: {} ({:.1}s)", self.controls.total_samples, duration));
-            }
-
-            // 消费端落后提示：环形缓冲覆盖了旧采样点（数据丢失）
-            if let Some(ref handle) = self.pipeline {
-                let overwritten = handle.overwritten_samples();
-                if overwritten > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0xa0, 0x3c),
-                        format!("Overwritten: {}", overwritten),
-                    ).on_hover_text(
-                        "UI 消费速度低于采样速度，环形缓冲区已覆盖旧采样点（数据丢失）。\n通常由窗口拖拽、对话框阻塞或采样率过高引起。"
-                    );
-                }
-            }
-
-        });
+            });
     }
 }
 
 impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 统一浅色主题（与 Watch/通道面板的浅色风格一致）
+        ctx.set_visuals(egui::Visuals::light());
         self.drain_pipeline();
 
         // 计算实际采样率
@@ -988,7 +1005,7 @@ impl eframe::App for DapSamplerApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
                 // ---- 文件菜单：工程操作 ----
-                self.hover_menu(ui, "file", "File(F)", |ui, app| {
+                self.hover_menu(ui, "file", "Project(P)", |ui, app| {
                     if menu_item(ui, "New Project").clicked() {
                         app.new_project();
                         return true;
@@ -1010,7 +1027,7 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 导入/导出菜单 ----
-                self.hover_menu(ui, "tools", "Import(I) / Export(E)", |ui, app| {
+                self.hover_menu(ui, "tools", "Files(F)", |ui, app| {
                     if menu_item(ui, "Import ELF File…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ELF", &["elf", "axf", "out", ""])
@@ -1020,10 +1037,10 @@ impl eframe::App for DapSamplerApp {
                                 Ok(ctx) => {
                                     let variable_count = ctx.variables.len();
                                     app.elf_ctx = Some(ctx);
-                                    app.set_status(format!("ELF 已加载: {} 个变量", variable_count));
+                                    app.set_status(format!("ELF loaded: {} variables", variable_count));
                                 }
                                 Err(e) => {
-                                    app.set_error(format!("ELF 加载失败: {}", e));
+                                    app.set_error(format!("ELF load failed: {}", e));
                                 }
                             }
                         }
@@ -1042,6 +1059,33 @@ impl eframe::App for DapSamplerApp {
                 });
             });
         });
+
+        // ---- 底部状态栏（横跨整个窗口宽度，界面最底部）----
+        // egui 0.31 面板规则：bottom panel 宽度避让已声明的侧边栏；
+        // 先于 SidePanel::left 声明才能横跨全宽（含侧边栏下方）。
+        // 堆叠语义：先声明的 bottom panel 在最底部，后声明的叠在它上方，
+        // 因此状态栏先于 watch_panel 声明，紧贴窗口底边。
+        egui::TopBottomPanel::bottom("status_bar")
+            .resizable(false)
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(msg) = &self.status_text {
+                        let color = if self.status_is_error {
+                            egui::Color32::from_rgb(0xff, 0x55, 0x55)
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        let label = ui.label(egui::RichText::new(msg).color(color));
+                        // 错误消息悬停时显示排障提示
+                        if self.status_is_error {
+                            label.on_hover_text(
+                                "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
+                            );
+                        }
+                    }
+                });
+            });
 
         // ---- 左侧面板：变量浏览器 + 通道 + 光标（可展开/收起）----
         egui::SidePanel::left("sidebar")
@@ -1114,31 +1158,6 @@ impl eframe::App for DapSamplerApp {
                     });
             });
 
-        // ---- 底部状态栏（界面最底部，Watch 面板之下）----
-        // egui 0.31 bottom panel 堆叠语义：先声明的在最底部，后声明的叠在它上方，
-        // 因此状态栏必须先于 watch_panel 声明，才能紧贴窗口底边。
-        egui::TopBottomPanel::bottom("status_bar")
-            .resizable(false)
-            .exact_height(24.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(msg) = &self.status_text {
-                        let color = if self.status_is_error {
-                            egui::Color32::from_rgb(0xff, 0x55, 0x55)
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        let label = ui.label(egui::RichText::new(msg).color(color));
-                        // 错误消息悬停时显示排障提示
-                        if self.status_is_error {
-                            label.on_hover_text(
-                                "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
-                            );
-                        }
-                    }
-                });
-            });
-
         // ---- 底部 Watch 面板 ----
         egui::TopBottomPanel::bottom("watch_panel")
             .resizable(true)
@@ -1162,7 +1181,7 @@ impl eframe::App for DapSamplerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // 工具栏：采集控制 + 参数 + 显示模式
             ui.horizontal_wrapped(|ui| {
-                if let Some(cmd) = self.controls.show(ui) {
+                if let Some(cmd) = self.controls.show_buttons(ui) {
                     match cmd {
                         AcquisitionCommand::Start => {
                             if self.controls.state == AcquisitionState::Idle
@@ -1176,25 +1195,37 @@ impl eframe::App for DapSamplerApp {
                     }
                 }
 
+                // Follow 按钮（Start/Stop 之后、Rate 之前）
+                let follow_text = if self.waveform.is_follow() {
+                    "\u{23f8} Follow: ON"
+                } else {
+                    "\u{25b6} Follow: OFF"
+                };
+                if ui.button(follow_text).clicked() {
+                    self.waveform.set_follow(!self.waveform.is_follow());
+                }
+
+                self.controls.show_params(ui);
+
                 // 检测采样率变化
                 if self.controls.sample_rate != self.rate_hz {
                     self.rate_hz = self.controls.sample_rate;
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
-                    self.set_status(format!("采样率已变更为 {} Hz", self.rate_hz));
+                    self.set_status(format!("Sample rate changed to {} Hz", self.rate_hz));
                 }
 
                 // 检测 SWD 时钟变化（仅记录日志，下次连接时生效）
                 if self.controls.swd_clock_mhz != self.swd_clock_mhz {
                     self.swd_clock_mhz = self.controls.swd_clock_mhz;
-                    self.set_status(format!("SWD 时钟已变更为 {} MHz（下次连接 DAP-Link 时生效）", self.swd_clock_mhz));
+                    self.set_status(format!("SWD clock changed to {} MHz (applies on next DAP-Link connection)", self.swd_clock_mhz));
                 }
 
                 // 检测窗口大小变化
                 if self.controls.window_size != self.window_size {
                     self.window_size = self.controls.window_size;
                     self.display_buf.set_max_samples(self.window_size);
-                    self.set_status(format!("显示窗口大小已变更为 {} 个点", self.window_size));
+                    self.set_status(format!("Display window size changed to {} points", self.window_size));
                 }
 
                 // 波形显示模式切换
@@ -1216,29 +1247,29 @@ impl eframe::App for DapSamplerApp {
                         WaveformDisplayMode::Line => "Line",
                         WaveformDisplayMode::Point => "Point",
                     };
-                    self.set_status(format!("显示模式已切换为 {}", mode_label));
+                    self.set_status(format!("Display mode switched to {}", mode_label));
                 }
             });
-
-            ui.separator();
-
-            // 状态信息行（工具栏 SWD Clock / Display 下方）
-            self.show_status_row(ui);
 
             ui.separator();
 
             // 波形
             let available_width = ui.available_width();
             let buffer_offset = self.display_buf.oldest_seq();
-            if let Some(seq) = self.waveform.show(
+            let wave_out = self.waveform.show(
                 ui,
                 self.display_buf.all(),
                 buffer_offset,
                 available_width,
                 has_new_data,
                 self.selected_channel,
-            ) {
+            );
+            if let Some(seq) = wave_out.cursor_seq {
                 self.cursor.click(seq);
+            }
+            // 波形图右上角叠加：Actual Rate / Samples（透明背景，图例风格）
+            if let Some(rect) = wave_out.plot_rect {
+                self.show_plot_overlay(ui, rect);
             }
         });
 
@@ -1311,25 +1342,25 @@ mod status_tests {
     #[test]
     fn set_status_records_info_message() {
         let mut app = make_app();
-        app.set_status("采样率已变更为 5000 Hz");
-        assert_eq!(app.status_text.as_deref(), Some("采样率已变更为 5000 Hz"));
+        app.set_status("Sample rate changed to 5000 Hz");
+        assert_eq!(app.status_text.as_deref(), Some("Sample rate changed to 5000 Hz"));
         assert!(!app.status_is_error);
     }
 
     #[test]
     fn set_error_records_error_message() {
         let mut app = make_app();
-        app.set_error("未选择任何采样通道");
-        assert_eq!(app.status_text.as_deref(), Some("未选择任何采样通道"));
+        app.set_error("No sampling channel selected");
+        assert_eq!(app.status_text.as_deref(), Some("No sampling channel selected"));
         assert!(app.status_is_error);
     }
 
     #[test]
     fn set_status_overwrites_previous_message() {
         let mut app = make_app();
-        app.set_error("旧错误");
-        app.set_status("新信息");
-        assert_eq!(app.status_text.as_deref(), Some("新信息"));
+        app.set_error("old error");
+        app.set_status("new message");
+        assert_eq!(app.status_text.as_deref(), Some("new message"));
         assert!(!app.status_is_error);
     }
 }

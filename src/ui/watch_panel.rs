@@ -168,11 +168,20 @@ impl WatchPanel {
         ui.add_space(2.0);
 
         if self.entries.is_empty() {
-            ui.label(
-                egui::RichText::new("No watch variables\nImport ELF or add channels to start watching")
-                    .size(10.0)
-                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-            );
+            // 居中空状态提示（与波形区 Waiting for data... 样式一致）
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.35);
+                ui.label(
+                    egui::RichText::new("No watch variables")
+                        .size(14.0)
+                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                );
+                ui.label(
+                    egui::RichText::new("Import ELF or add channels to start watching")
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                );
+            });
             return;
         }
 

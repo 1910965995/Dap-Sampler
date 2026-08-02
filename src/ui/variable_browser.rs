@@ -302,8 +302,10 @@ impl VariableBrowser {
 
         ui.separator();
 
-        // ELF 变化 → 重建分组树缓存（一次性成本，后续帧直接复用）
-        if self.cache_key.as_deref() != Some(ctx.file_path.as_str()) {
+        // ELF 变化 → 重建分组树缓存（一次性成本，后续帧直接复用）。
+        // 判断用内容指纹：同路径重新编译（内容变）也能感知
+        let key = Self::elf_content_key(ctx);
+        if self.cache_key.as_deref() != Some(key.as_str()) {
             self.rebuild_cache(ctx);
         }
         // 搜索词变化 → 重建过滤缓存
@@ -377,11 +379,27 @@ impl VariableBrowser {
             .filter_map(|g| groups.remove(&g).map(|vars| (g, build_var_tree(&vars))))
             .collect();
 
-        self.cache_key = Some(ctx.file_path.clone());
+        self.cache_key = Some(Self::elf_content_key(ctx));
         self.tree_cache = Some(tree_groups);
         // 过滤缓存失效（下一帧按新树重建）
         self.filter_query.clear();
         self.filtered.clear();
+    }
+
+    /// ELF 内容指纹：文件路径 + 变量集合（name/path/address）。
+    ///
+    /// 缓存失效判断用内容而非仅文件路径——重新编译覆盖同一路径的 ELF
+    /// （路径不变、内容变）时也能正确重建树缓存。
+    fn elf_content_key(ctx: &ElfContext) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ctx.file_path.hash(&mut h);
+        for v in &ctx.variables {
+            v.name.hash(&mut h);
+            v.path.hash(&mut h);
+            v.address.hash(&mut h);
+        }
+        format!("{:x}", h.finish())
     }
 
     /// 重建搜索过滤缓存（搜索词变化时调用）。
@@ -560,14 +578,38 @@ mod tests {
     fn rebuild_cache_detects_elf_change() {
         let mut browser = VariableBrowser::new();
         browser.rebuild_cache(&sample_ctx());
-        assert_eq!(browser.cache_key.as_deref(), Some("test.elf"));
         assert_eq!(browser.tree_cache.as_ref().unwrap().len(), 3);
 
-        // 不同 ELF → 重建（缓存内容替换）
+        // 不同 ELF（路径不同）→ 重建（缓存内容替换）
         let ctx2 = ElfContext { file_path: "other.elf".to_string(), variables: vec![] };
         browser.rebuild_cache(&ctx2);
-        assert_eq!(browser.cache_key.as_deref(), Some("other.elf"));
         assert!(browser.tree_cache.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_key_changes_with_content_same_path() {
+        // 同一路径、内容变化（重编译覆盖）：指纹不同 → show 触发重建
+        let mut browser = VariableBrowser::new();
+        let ctx1 = sample_ctx();
+        browser.rebuild_cache(&ctx1);
+        let key1 = browser.cache_key.clone().unwrap();
+
+        let ctx2 = ElfContext {
+            file_path: "test.elf".to_string(), // 路径不变
+            variables: vec![var("a", Some("main.c"))], // 内容变（删了 b/c）
+        };
+        browser.rebuild_cache(&ctx2);
+        let key2 = browser.cache_key.clone().unwrap();
+        assert_ne!(key1, key2, "同路径内容变化时指纹应不同");
+        assert_eq!(browser.tree_cache.as_ref().unwrap().len(), 1);
+
+        // 相同内容（重新 rebuild）→ 指纹一致
+        let ctx3 = ElfContext {
+            file_path: "test.elf".to_string(),
+            variables: vec![var("a", Some("main.c"))],
+        };
+        let key3 = VariableBrowser::elf_content_key(&ctx3);
+        assert_eq!(key2, key3, "相同内容指纹应一致");
     }
 
     #[test]

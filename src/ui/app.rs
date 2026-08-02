@@ -786,7 +786,7 @@ impl DapSamplerApp {
 
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new("Click waveform to place cursor 1\nClick again to place cursor 2")
+            egui::RichText::new("Click waveform to place cursor")
                 .size(10.0)
                 .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
         );

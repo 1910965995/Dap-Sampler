@@ -240,7 +240,7 @@ impl WaveformPanel {
             let cur_bounds = plot_ui.plot_bounds();
             let cur_x_max = cur_bounds.max()[0];
 
-            // 用户拖拽/缩放检测：如果 X 轴右边界偏离了最新时间戳（超过半个窗口），
+            // 用户拖拽/缩放检测：如果 X 轴右边界偏离了上一帧位置（超过 1% 窗口时长），
             // 说明用户在手动操作，自动暂停跟随
             if auto_scroll && buffer_len > 0 {
                 let view_len = view_points.min(buffer_len);

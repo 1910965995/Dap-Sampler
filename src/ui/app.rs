@@ -279,6 +279,39 @@ impl DapSamplerApp {
         self.set_status("New project created (config cleared)");
     }
 
+    /// 将缓冲区全部数据导出为 CSV（Files → Export data to…）
+    fn export_data(&mut self) {
+        if self.display_buf.is_empty() {
+            self.set_error("No data to export: buffer is empty");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("dap-sampler-data.csv")
+            .save_file()
+        else {
+            return; // 用户取消
+        };
+        // 借用作用域：display_buf / waveform 的借用在此结束，之后才能 &mut self 反馈状态
+        let result = {
+            let samples = self.display_buf.all();
+            // 列定义用采集快照（Start 时创建，与 Sample.values() 顺序一致）
+            let names: Vec<String> = self
+                .waveform
+                .channel_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let types = self.waveform.value_types().to_vec();
+            std::fs::File::create(&path)
+                .and_then(|f| crate::export::write_csv(f, samples, &names, &types))
+        };
+        match result {
+            Ok(n) => self.set_status(format!("Data exported: {} samples to {}", n, path.display())),
+            Err(e) => self.set_error(format!("Failed to export data: {}", e)),
+        }
+    }
+
     /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
     fn save_project(&mut self) {
         let file = ProjectFile {
@@ -1057,6 +1090,10 @@ impl eframe::App for DapSamplerApp {
                                 }
                             }
                         }
+                        return true;
+                    }
+                    if menu_item(ui, "Export data to…").clicked() {
+                        app.export_data();
                         return true;
                     }
                     false

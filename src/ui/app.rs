@@ -193,7 +193,7 @@ impl DapSamplerApp {
             active_usb: None,  // USB 连接推迟到 Start 时建立
             manual_addresses,
             acquisition_start: None,
-            display_buf: DisplayBuffer::new(200_000),
+            display_buf: DisplayBuffer::new(crate::ui::controls::DEFAULT_BUFFER_CAPACITY),
             waveform,
             controls: ControlPanel::new(rate_hz, target_count, swd_clock_mhz),
             cursor: CursorState::new(),
@@ -584,9 +584,9 @@ impl DapSamplerApp {
 
         // 4. 数据缓冲区：Pause 恢复且配置未变时保留历史（含光标与计数），否则清空重建
         if keep_history {
-            self.display_buf.set_max_samples(self.window_size);
+            self.display_buf.set_max_samples(self.buffer_capacity);
         } else {
-            self.display_buf = DisplayBuffer::new(self.window_size);
+            self.display_buf = DisplayBuffer::new(self.buffer_capacity);
             self.cursor.clear();
             self.controls.update_count(0);
         }
@@ -1234,7 +1234,6 @@ impl eframe::App for DapSamplerApp {
                 // 检测窗口大小变化
                 if self.controls.window_size != self.window_size {
                     self.window_size = self.controls.window_size;
-                    self.display_buf.set_max_samples(self.window_size);
                     self.set_status(format!("Display window size changed to {} points", self.window_size));
                 }
 

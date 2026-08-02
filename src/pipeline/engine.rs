@@ -94,6 +94,8 @@ impl PipelineEngine {
     /// 启动流水线，返回控制句柄
     ///
     /// 可重复调用（Stop 后再次 Start），不消费 self。
+    ///
+    /// `capacity`：环形缓冲容量（采样点数）
     pub fn start(&self, capacity: usize) -> Result<PipelineHandle> {
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);

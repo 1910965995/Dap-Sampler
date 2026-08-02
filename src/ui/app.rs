@@ -85,6 +85,21 @@ pub struct DapSamplerApp {
     show_settings: bool,
     /// 关于窗口是否显示（帮助 → 关于）
     show_about: bool,
+    /// ELF 加载失败警告弹窗内容（Some = 显示；打开工程时 ELF 缺失时弹出）
+    elf_warning: Option<String>,
+    /// 警告弹窗是否显示（右上角 X 关闭）
+    show_elf_warning: bool,
+}
+
+/// 截断长路径：超过 max_chars 字符时保留前面部分并追加 "..."
+fn truncate_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut s: String = path.chars().take(keep).collect();
+    s.push_str("...");
+    s
 }
 
 /// 菜单项：整行（全宽 × 22px）可点击、文字左对齐
@@ -215,7 +230,8 @@ impl DapSamplerApp {
             target_count,
             display_mode,
             window_size: 2000,
-            status_text: None,
+            // 启动时状态栏默认显示 Ready
+            status_text: Some("Ready".to_string()),
             status_is_error: false,
             selected_channel: None,
             project_path: None,
@@ -223,6 +239,8 @@ impl DapSamplerApp {
             buffer_capacity: crate::ui::controls::DEFAULT_BUFFER_CAPACITY,
             show_settings: false,
             show_about: false,
+            elf_warning: None,
+            show_elf_warning: false,
         }
     }
 
@@ -246,6 +264,8 @@ impl DapSamplerApp {
     fn new_project(&mut self) {
         self.status_text = None;
         self.status_is_error = false;
+        self.elf_warning = None;
+        self.show_elf_warning = false;
         self.stop_acquisition();
         // 清空 ELF / 通道 / Watch / 手工模式
         self.elf_ctx = None;
@@ -277,6 +297,27 @@ impl DapSamplerApp {
         self.controls.target_count = None;
         self.project_path = None;
         self.set_status("New project created (config cleared)");
+    }
+
+    /// 弹出 ELF 文件选择对话框并加载
+    ///
+    /// 共用入口：Files → Import ELF File… 与 Settings → Change ELF…
+    fn import_elf(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("ELF", &["elf", "axf", "out", ""])
+            .pick_file()
+        {
+            match ElfParser::load(&path) {
+                Ok(ctx) => {
+                    let variable_count = ctx.variables.len();
+                    self.elf_ctx = Some(ctx);
+                    self.set_status(format!("ELF loaded: {} variables", variable_count));
+                }
+                Err(e) => {
+                    self.set_error(format!("ELF load failed: {}", e));
+                }
+            }
+        }
     }
 
     /// 将缓冲区全部数据导出为 CSV（Files → Export data to…）
@@ -370,6 +411,8 @@ impl DapSamplerApp {
     fn open_project(&mut self, path: &std::path::Path) {
         self.status_text = None;
         self.status_is_error = false;
+        self.elf_warning = None;
+        self.show_elf_warning = false;
         self.stop_acquisition();
 
         // 1. 读取并解析（失败不动当前状态）
@@ -399,6 +442,12 @@ impl DapSamplerApp {
                 Err(e) => {
                     self.elf_ctx = None;
                     self.set_error(format!("ELF load failed, continuing with saved variable addresses: {}", e));
+                    // 弹窗警告：状态栏红字容易被忽略，ELF 缺失是打开工程的关键异常
+                    self.elf_warning = Some(format!(
+                        "ELF file not found or failed to load:\n{}\n\nThe project will continue with saved variable addresses.",
+                        elf_path
+                    ));
+                    self.show_elf_warning = true;
                     false
                 }
             }
@@ -1027,8 +1076,16 @@ impl DapSamplerApp {
 
 impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 统一浅色主题（与 Watch/通道面板的浅色风格一致）
-        ctx.set_visuals(egui::Visuals::light());
+        // 统一浅色主题（与 Watch/通道面板的浅色风格一致）；面板/窗口底色改为纯白
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = egui::Color32::WHITE;
+        visuals.window_fill = egui::Color32::WHITE;
+        // 整体背景变白后，按钮/输入框默认底色（230 灰）显得突兀，调浅至接近白
+        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(246);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(246);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(236);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(236);
+        ctx.set_visuals(visuals);
         self.drain_pipeline();
 
         // 计算实际采样率
@@ -1075,21 +1132,7 @@ impl eframe::App for DapSamplerApp {
                 // ---- 导入/导出菜单 ----
                 self.hover_menu(ui, "tools", "Files(F)", |ui, app| {
                     if menu_item(ui, "Import ELF File…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("ELF", &["elf", "axf", "out", ""])
-                            .pick_file()
-                        {
-                            match ElfParser::load(&path) {
-                                Ok(ctx) => {
-                                    let variable_count = ctx.variables.len();
-                                    app.elf_ctx = Some(ctx);
-                                    app.set_status(format!("ELF loaded: {} variables", variable_count));
-                                }
-                                Err(e) => {
-                                    app.set_error(format!("ELF load failed: {}", e));
-                                }
-                            }
-                        }
+                        app.import_elf();
                         return true;
                     }
                     if menu_item(ui, "Export data to…").clicked() {
@@ -1334,12 +1377,14 @@ impl eframe::App for DapSamplerApp {
         if self.show_settings {
             let was_active = self.controls.state != AcquisitionState::Idle;
             let old_capacity = self.buffer_capacity;
+            let mut change_elf = false;
             egui::Window::new("General Settings")
                 .open(&mut self.show_settings)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
+                    ui.set_min_width(500.0);
                     ui.horizontal(|ui| {
                         ui.label("Buffer capacity:");
                         ui.add(
@@ -1367,18 +1412,74 @@ impl eframe::App for DapSamplerApp {
                     );
                     ui.add_space(6.0);
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new("Applies on the next Start.")
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
-                    );
+                    // ---- ELF 固件：显示当前路径（文本框样式，超长截断），可重新选择 ----
+                    // 先取出路径字符串，避免与按钮的 &mut self 借用冲突
+                    let elf_path = self
+                        .elf_ctx
+                        .as_ref()
+                        .map(|c| c.file_path.clone())
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label("Current ELF:");
+                        // 文本框样式：TextEdit 同款背景（extreme_bg_color）+ 浅灰边框
+                        let text_style = ui.style().clone();
+                        // 预留按钮宽度（约 110px），路径框占满剩余宽度
+                        let path_width = (ui.available_width() - 110.0).max(140.0);
+                        let truncated = truncate_path(&elf_path, (path_width / 6.5) as usize);
+                        egui::Frame::NONE
+                            .fill(text_style.visuals.extreme_bg_color)
+                            .stroke(text_style.visuals.widgets.noninteractive.bg_stroke)
+                            .corner_radius(text_style.visuals.widgets.noninteractive.corner_radius)
+                            .inner_margin(egui::Margin::symmetric(6, 3))
+                            .show(ui, |ui| {
+                                ui.set_min_width(path_width - 12.0);
+                                if elf_path.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No ELF file loaded")
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(&truncated)
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(0x40, 0x40, 0x40)),
+                                    );
+                                }
+                            });
+                        if ui.button("Change ELF…").clicked() {
+                            change_elf = true;
+                        }
+                    });
                 });
+            // 重新选择 ELF（闭包外调用，避免与窗口 .open 的字段借用冲突）
+            if change_elf {
+                self.import_elf();
+            }
             // 采集运行/暂停中改动容量 → 提示下次 Start 生效
             if was_active && self.buffer_capacity != old_capacity {
                 self.set_status(format!(
                     "Buffer capacity changed to {} points (applies on next Start)",
                     self.buffer_capacity
                 ));
+            }
+        }
+
+        // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
+        // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
+        if let Some(msg) = self.elf_warning.clone() {
+            egui::Window::new("Warning")
+                .open(&mut self.show_elf_warning)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(0xd0, 0x50, 0x50)));
+                });
+            // X 关闭后清除内容，避免残留
+            if !self.show_elf_warning {
+                self.elf_warning = None;
             }
         }
 
@@ -1390,9 +1491,16 @@ impl eframe::App for DapSamplerApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
+                    ui.set_min_width(400.0);
                     ui.heading("DAP Sampler");
                     ui.add_space(4.0);
                     ui.label(format!("Version: v{}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(2.0);
+                    // 开源仓库地址（可点击打开浏览器）
+                    ui.horizontal(|ui| {
+                        ui.label("github:");
+                        ui.hyperlink("https://github.com/1910965995/Dap-Sampler");
+                    });
                     ui.add_space(6.0);
                     ui.separator();
                     ui.label(
@@ -1449,6 +1557,13 @@ mod status_tests {
     }
 
     #[test]
+    fn app_starts_with_ready_status() {
+        let app = make_app();
+        assert_eq!(app.status_text.as_deref(), Some("Ready"));
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
     fn set_status_records_info_message() {
         let mut app = make_app();
         app.set_status("Sample rate changed to 5000 Hz");
@@ -1471,5 +1586,65 @@ mod status_tests {
         app.set_status("new message");
         assert_eq!(app.status_text.as_deref(), Some("new message"));
         assert!(!app.status_is_error);
+    }
+}
+
+#[cfg(test)]
+mod open_project_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn truncate_path_shortens_long_paths() {
+        // 未超长：原样返回
+        assert_eq!(truncate_path("abc", 10), "abc");
+        // 超长：保留前面部分 + "..."
+        assert_eq!(truncate_path("abcdefghij", 8), "abcde...");
+        // 极窄：只剩 "..."
+        assert_eq!(truncate_path("abcdefghij", 3), "...");
+        // 中文按字符截断
+        assert_eq!(truncate_path("中文路径测试", 4), "中...");
+        // 边界：恰好等于 max_chars 不截断
+        assert_eq!(truncate_path("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn open_project_missing_elf_sets_error_status() {
+        let mut app = make_app();
+        let dir = std::env::temp_dir();
+        let proj = dir.join(format!("missing_elf_{}.dapsproj", std::process::id()));
+        let json = r#"{
+            "version": 1,
+            "elf_path": "C:/definitely/not/exists/fw.elf",
+            "sample_rate_hz": 5000,
+            "swd_clock_mhz": 10,
+            "window_size": 2000,
+            "buffer_capacity": 200000,
+            "display_mode": "line",
+            "variables": [
+                {"name": "pid.kp", "address": 536871168, "value_type": "float", "refresh_period_s": 0.1, "y_offset": 0.0, "y_scale": 1.0, "remark": ""}
+            ]
+        }"#;
+        std::fs::write(&proj, json).unwrap();
+        app.open_project(&proj);
+        std::fs::remove_file(&proj).ok();
+        assert!(app.status_is_error, "ELF 缺失时应设置错误状态，实际 status_text={:?}", app.status_text);
+        assert!(
+            app.status_text.as_deref().unwrap_or("").contains("ELF load failed"),
+            "错误消息应提及 ELF load failed，实际 {:?}",
+            app.status_text
+        );
+        assert!(
+            app.elf_warning.is_some(),
+            "ELF 缺失时应弹出警告窗口，实际 elf_warning={:?}",
+            app.elf_warning
+        );
+        assert!(
+            app.elf_warning.as_deref().unwrap_or("").contains("C:/definitely/not/exists/fw.elf"),
+            "警告弹窗应包含 ELF 路径"
+        );
     }
 }

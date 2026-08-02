@@ -1275,13 +1275,12 @@ impl eframe::App for DapSamplerApp {
             ui.separator();
 
             // 波形
-            let available_width = ui.available_width();
             let buffer_offset = self.display_buf.oldest_seq();
             let wave_out = self.waveform.show(
                 ui,
                 self.display_buf.all(),
                 buffer_offset,
-                available_width,
+                self.controls.window_size,
                 has_new_data,
                 self.selected_channel,
             );

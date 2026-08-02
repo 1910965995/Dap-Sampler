@@ -53,8 +53,6 @@ pub struct WaveformPanel {
     /// buffer 点无法一一对应；此时退回每帧全量重建（与旧行为一致），
     /// 避免增量计数错位
     nan_in_stream: bool,
-    /// 距上次全量 Y 轴重扫的帧数（增量模式 Y 轴基准只增不减，需定期重扫）
-    rescan_counter: u32,
     /// 通道级脏标志：仅该通道的 Y offset/scale/可见性变化时标记
     /// rebuild_cache 仅重建脏通道，避免全量重算
     dirty_channels: Vec<bool>,
@@ -62,17 +60,13 @@ pub struct WaveformPanel {
     last_x_range: Option<f64>,
     /// 上一帧的 X 轴右边界，用于检测用户拖拽/缩放
     last_x_max: Option<f64>,
-    /// 当前缓冲区数据的绝对值最大值（Y 轴自适应用）
+    /// 当前 Follow 视野范围内的原始值绝对值最大值（Y 轴自适应用）
     auto_y_max_abs: f64,
     /// 是否自动滚动跟随最新数据
     auto_scroll: bool,
     /// 波形显示模式（连线 / 散点）
     display_mode: WaveformDisplayMode,
 }
-
-/// 增量模式下每隔多少帧全量重扫一次 Y 轴基准（约 0.5s @ 60fps）。
-/// 增量更新只增不减，信号峰值移出窗口后 Y 轴会偏高，定期重扫修正。
-const RESCAN_EVERY_FRAMES: u32 = 30;
 
 /// 波形渲染输出
 pub struct WaveformOutput {
@@ -110,7 +104,6 @@ impl WaveformPanel {
             cache_buffer_len: 0,
             cache_offset: 0,
             nan_in_stream: false,
-            rescan_counter: 0,
             dirty_channels: vec![true; n], // 首次全部重建
             last_x_range: None,
             last_x_max: None,
@@ -124,14 +117,15 @@ impl WaveformPanel {
     ///
     /// 返回波形输出：点击放置光标的采样序号 + 波形图矩形区域
     /// （缓冲为空时为 None，用于叠加采样信息）。
-    /// `has_new_data` 为 true 时重建降采样缓存。
+    /// Follow 模式下每帧按当前视野 X 范围重扫 Y 轴（视野外峰值不影响）；
+    /// 手动模式 Y 轴由用户控制。
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         buffer: &[Sample],
         buffer_offset: u64,
-        _visible_width: f32,
-        has_new_data: bool,
+        view_points: usize,
+        _has_new_data: bool,
         selected_channel: Option<usize>,
     ) -> WaveformOutput {
         if buffer.is_empty() {
@@ -152,7 +146,8 @@ impl WaveformPanel {
             return WaveformOutput { cursor_seq: None, plot_rect: None };
         }
 
-        // 不进行降采样: buffer 中所有原始样本点都必须被绘制,采样工具的波形必须忠实于采集数据。
+        // cached_points 保留 buffer 中全部原始样本点（不降采样）；
+        // 渲染时仅将可视范围内的点送入绘制（见 visible_range）。
 
         // ---- 缓存维护（增量更新）----
         // 窗口滑动时只裁剪头部已移出窗口的点、追加尾部新点，
@@ -209,16 +204,6 @@ impl WaveformPanel {
             }
         }
 
-        // 定期 Y 轴重扫：增量模式 Y 轴基准只增不减，峰值移出窗口后
-        // 按当前窗口全量重扫修正（避免 Y 轴越拉越松）
-        if has_new_data {
-            self.rescan_counter += 1;
-            if self.rescan_counter >= RESCAN_EVERY_FRAMES {
-                self.rescan_counter = 0;
-                self.rescan_y_max(buffer);
-            }
-        }
-
         // 动态 X 轴标签（使用上一帧的可视范围）
         let x_label = match self.last_x_range {
             Some(r) => format!("Time (s) [window: {:.2}s]", r),
@@ -251,10 +236,6 @@ impl WaveformPanel {
         // 记录上一帧的 X 轴右边界，用于检测用户是否拖拽/缩放
         let prev_x_max = self.last_x_max;
 
-        // Y 轴自适应范围：[-2*max_abs, 2*max_abs]
-        let y_max = self.auto_y_max_abs;
-        let y_bound = 2.0 * y_max;
-
         let plot_response = plot.show(ui, |plot_ui| {
             let cur_bounds = plot_ui.plot_bounds();
             let cur_x_max = cur_bounds.max()[0];
@@ -262,7 +243,8 @@ impl WaveformPanel {
             // 用户拖拽/缩放检测：如果 X 轴右边界偏离了最新时间戳（超过半个窗口），
             // 说明用户在手动操作，自动暂停跟随
             if auto_scroll && buffer_len > 0 {
-                let window_duration = buffer_len as f64 * interval_us / 1_000_000.0;
+                let view_len = view_points.min(buffer_len);
+                let window_duration = view_len as f64 * interval_us / 1_000_000.0;
                 if let Some(prev) = prev_x_max {
                     // X 右边界变化超过 1% 窗口时长 → 用户在操作
                     let drift = (cur_x_max - prev).abs();
@@ -272,9 +254,13 @@ impl WaveformPanel {
                 }
             }
 
-            // 自动滚动：X 轴跟随最新数据，Y 轴自适应 [-2*max, 2*max]
+            // 自动滚动：X 轴跟随最新数据，窗口宽度 = min(视野点数, 可用数据)
+            // Y 轴基准先用本帧视野范围重扫（首帧即可正确，无延迟）
             if auto_scroll && buffer_len > 0 {
-                let window_duration = buffer_len as f64 * interval_us / 1_000_000.0;
+                let view_len = view_points.min(buffer_len);
+                let window_duration = view_len as f64 * interval_us / 1_000_000.0;
+                self.rescan_y_max(buffer, latest_ts - window_duration, latest_ts);
+                let y_bound = 2.0 * self.auto_y_max_abs;
                 let new_bounds = PlotBounds::from_min_max(
                     [latest_ts - window_duration, -y_bound],
                     [latest_ts, y_bound],
@@ -285,14 +271,18 @@ impl WaveformPanel {
                 self.last_x_max = Some(cur_x_max);
             }
 
-            // 记录可视范围（用于下一帧的 X 轴标签）
+            // 记录可视范围（用于下一帧的 X 轴标签），渲染裁剪共用本次 bounds
             let bounds = plot_ui.plot_bounds();
             self.last_x_range = Some(bounds.max()[0] - bounds.min()[0]);
+            let vis_min = bounds.min()[0];
+            let vis_max = bounds.max()[0];
 
             // 捕获鼠标坐标（用于光标点击）
             let pointer_coord = plot_ui.pointer_coordinate();
 
             // 渲染各通道：选中加粗；有选中时其它通道降透明度
+            // 只把可视范围内的点送入渲染管线（边界各扩展 1 点避免线段断裂），
+            // 视野外不可见部分不绘制 —— 不是降采样，视野内每个原始点仍 100% 绘制。
             let has_selection = selected_channel.is_some();
             for (ch_idx, ch) in self.channels.iter().enumerate() {
                 if !ch.visible {
@@ -302,6 +292,11 @@ impl WaveformPanel {
                 if points.is_empty() {
                     continue;
                 }
+                let (start, end) = visible_range(points, vis_min, vis_max);
+                if start >= end {
+                    continue;
+                }
+                let visible = &points[start..end];
                 let is_sel = selected_channel == Some(ch_idx);
                 let color = if has_selection && !is_sel {
                     dim_color(ch.color, 0.38)
@@ -313,7 +308,7 @@ impl WaveformPanel {
                 match self.display_mode {
                     WaveformDisplayMode::Line => {
                         plot_ui.line(
-                            Line::new(points.as_slice())
+                            Line::new(visible)
                                 .name(&ch.name)
                                 .color(color)
                                 .width(line_w),
@@ -321,7 +316,7 @@ impl WaveformPanel {
                     }
                     WaveformDisplayMode::Point => {
                         plot_ui.points(
-                            Points::new(points.as_slice())
+                            Points::new(visible)
                                 .name(&ch.name)
                                 .color(color)
                                 .radius(point_r),
@@ -373,14 +368,7 @@ impl WaveformPanel {
     ///
     /// 优化：仅重建脏通道（可见性/变换变化的通道），非脏通道复用已有缓存。
     /// 调用方通过 `mark_all_dirty()` 或 `mark_channel_dirty()` 控制重建范围。
-    /// 全量重建时（所有通道脏）重新累计 Y 轴 fit 基准；仅脏通道更新时保持已有值。
     pub fn rebuild_cache(&mut self, buffer: &[Sample]) {
-        // 检查是否全量重建（所有通道都脏）
-        let all_dirty = self.dirty_channels.iter().all(|d| *d);
-
-        // 全量重建时重新累计 y_max_abs；仅脏通道更新时保持已有值
-        // （非脏通道的 raw_f 未变，无需重新累计）
-        let mut y_max_abs = if all_dirty { 0.0 } else { self.auto_y_max_abs };
         let mut found_non_finite = false;
 
         for (ch_idx, ch) in self.channels.iter().enumerate() {
@@ -411,11 +399,7 @@ impl WaveformPanel {
                 let raw_f = vt.to_f64(raw);
                 if !raw_f.is_finite() {
                     found_non_finite = true;
-                    continue; // NaN/Inf 不参与 Y 轴 fit,也不绘制
-                }
-                let abs_val = raw_f.abs();
-                if abs_val > y_max_abs {
-                    y_max_abs = abs_val;
+                    continue; // NaN/Inf 不绘制
                 }
                 let displayed_y = raw_f * scale + offset;
                 out.push(PlotPoint::new(s.timestamp_sec, displayed_y));
@@ -425,10 +409,6 @@ impl WaveformPanel {
             self.dirty_channels[ch_idx] = false;
         }
 
-        // Y 轴自适应: 仍按 raw_f,不被 offset/scale 推偏
-        if all_dirty {
-            self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
-        }
         // 记录本次重建是否遇到非有限值：
         // 决定后续帧是否退回每帧全量重建（避免增量计数错位）
         self.nan_in_stream = found_non_finite;
@@ -446,9 +426,6 @@ impl WaveformPanel {
         head_trim: usize,
         keep: usize,
     ) {
-        // Y 轴基准只增不减（定期重扫修正峰值移出窗口的情况）
-        let mut y_max_abs = self.auto_y_max_abs;
-
         for (ch_idx, ch) in self.channels.iter().enumerate() {
             if !ch.visible {
                 continue;
@@ -469,15 +446,10 @@ impl WaveformPanel {
                 if !raw_f.is_finite() {
                     continue;
                 }
-                let abs_val = raw_f.abs();
-                if abs_val > y_max_abs {
-                    y_max_abs = abs_val;
-                }
                 pts.push(PlotPoint::new(s.timestamp_sec, raw_f * scale + offset));
             }
         }
 
-        self.auto_y_max_abs = y_max_abs;
         self.cache_buffer_len = buffer.len();
         self.cache_offset = buffer_offset;
     }
@@ -502,18 +474,26 @@ impl WaveformPanel {
         false
     }
 
-    /// 按当前窗口全量重扫 Y 轴基准（不重建 PlotPoint，仅扫原始值）。
+    /// 按可视 X 范围重扫 Y 轴基准（Follow 模式下每帧调用，Y 轴跟随当前视野）。
     ///
-    /// 增量模式 Y 轴只增不减，信号峰值移出窗口后需定期调用修正，
-    /// 避免 Y 轴持续偏松。
-    fn rescan_y_max(&mut self, buffer: &[Sample]) {
+    /// 只统计视野内的原始值（不被 offset/scale 推偏），视野外历史峰值不影响当前 Y 轴。
+    /// buffer 时间戳单调递增，二分定位视野区间后扫描。
+    fn rescan_y_max(&mut self, buffer: &[Sample], x_min: f64, x_max: f64) {
+        if buffer.is_empty() {
+            return;
+        }
+        let i_start = buffer.partition_point(|s| s.timestamp_sec < x_min);
+        let i_end = buffer.partition_point(|s| s.timestamp_sec <= x_max);
+        if i_start >= i_end {
+            return;
+        }
         let mut y_max_abs = 0.0f64;
         for (ch_idx, ch) in self.channels.iter().enumerate() {
             if !ch.visible {
                 continue;
             }
             let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
-            for s in buffer {
+            for s in &buffer[i_start..i_end] {
                 let raw = s.values().get(ch_idx).copied().unwrap_or(0);
                 let raw_f = vt.to_f64(raw);
                 if raw_f.is_finite() {
@@ -615,6 +595,19 @@ impl WaveformPanel {
     }
 }
 
+/// 计算可视范围内点的切片索引 `[start, end)`（含边界各 1 点扩展，避免线段断裂）。
+///
+/// `points.x` 必须单调递增（时间戳序列）。视野完全在数据左侧/右侧时
+/// 返回含 1 个边界点的切片；空点集返回 `(0, 0)`。
+fn visible_range(points: &[PlotPoint], vis_min: f64, vis_max: f64) -> (usize, usize) {
+    if points.is_empty() {
+        return (0, 0);
+    }
+    let start = points.partition_point(|p| p.x < vis_min).saturating_sub(1);
+    let end = (points.partition_point(|p| p.x <= vis_max) + 1).min(points.len());
+    (start, end)
+}
+
 fn dim_color(c: egui::Color32, alpha: f32) -> egui::Color32 {
     let a = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
@@ -656,10 +649,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_y_uses_raw_not_transformed() {
+    fn rescan_y_uses_raw_not_transformed() {
+        // rescan 统计 raw 值，不应受 offset/scale 影响
         let mut panel = make_panel(vec![("CH1", 1.0e6, 1.0)]);
         let buffer = make_buffer(1, &[1.0f32.to_bits()]);
-        panel.rebuild_cache(&buffer);
+        panel.rescan_y_max(&buffer, 0.0, 0.001);
         // raw_f = 1.0, 不应受 offset 影响
         assert!((panel.auto_y_max_abs - 1.0).abs() < 1e-6);
     }
@@ -740,8 +734,6 @@ mod tests {
             assert!((p.x - (10.0 + i as f64) * 0.001).abs() < 1e-9);
             assert!((p.y - 2.0).abs() < 1e-9);
         }
-        // Y 轴基准增长到新点的最大值
-        assert!((panel.auto_y_max_abs - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -767,8 +759,6 @@ mod tests {
         assert!((panel.cached_points[1][5].y - 104.0).abs() < 1e-6);
         // 旧点保持原变换值：CH2 首点 = 4.0*0.5+100.0 = 102.0
         assert!((panel.cached_points[1][0].y - 102.0).abs() < 1e-6);
-        // Y 轴基准 = 新点 raw 的最大值 8.0
-        assert!((panel.auto_y_max_abs - 8.0).abs() < 1e-9);
     }
 
     #[test]
@@ -806,9 +796,9 @@ mod tests {
     #[test]
     fn rescan_y_max_resets_drifted_scale() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        panel.auto_y_max_abs = 100.0; // 人为抬高（模拟峰值已移出窗口）
+        panel.auto_y_max_abs = 100.0; // 人为抬高（模拟峰值已移出视野）
         let buf = make_buffer(5, &[3.0f32.to_bits()]);
-        panel.rescan_y_max(&buf);
+        panel.rescan_y_max(&buf, 0.0, 0.005);
         assert!((panel.auto_y_max_abs - 3.0).abs() < 1e-9);
     }
 
@@ -826,5 +816,49 @@ mod tests {
         let clean = make_buffer(3, &[1.0f32.to_bits()]);
         panel.rebuild_cache(&clean);
         assert!(!panel.nan_in_stream);
+    }
+
+    #[test]
+    fn visible_range_returns_inner_slice_with_border_points() {
+        // 10 个点，x = 0..10
+        let pts: Vec<PlotPoint> = (0..10u32)
+            .map(|i| PlotPoint::new(i as f64, 0.0))
+            .collect();
+        // 视野 [3.2, 6.8]：内部点 4..6，边界各扩展 1 → [3, 8)
+        // （右边界含 x=7 桥接点：其与 x=6 的线段跨越视野右缘，缺失会留出空隙）
+        let (s, e) = visible_range(&pts, 3.2, 6.8);
+        assert_eq!((s, e), (3, 8));
+        // 视野覆盖全部：内部 0..10，扩展后 [0, 10)
+        let (s, e) = visible_range(&pts, -1.0, 100.0);
+        assert_eq!((s, e), (0, 10));
+        // 视野完全在数据左侧：内部空，扩展后 [0, 1)
+        let (s, e) = visible_range(&pts, -50.0, -10.0);
+        assert_eq!((s, e), (0, 1));
+        // 视野完全在数据右侧：内部空，扩展后 [9, 10)（最近边界点 x=9）
+        let (s, e) = visible_range(&pts, 50.0, 90.0);
+        assert_eq!((s, e), (9, 10));
+        // 空点集
+        let (s, e) = visible_range(&[], 0.0, 1.0);
+        assert_eq!((s, e), (0, 0));
+    }
+
+    #[test]
+    fn rescan_y_max_scans_visible_window_only() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        // 值：视野外 [0,2) 有峰值 100；视野内 [2,4) 值 3
+        let buffer: Vec<Sample> = (0..4u64)
+            .map(|i| {
+                let v: f32 = if i < 2 { 100.0 } else { 3.0 };
+                Sample::new(i, i as f64 * 0.001, &[v.to_bits()])
+            })
+            .collect();
+        // 初始人为抬高，验证重扫会修正
+        panel.auto_y_max_abs = 200.0;
+        panel.rescan_y_max(&buffer, 0.002, 0.004);
+        assert!((panel.auto_y_max_abs - 3.0).abs() < 1e-9, "视野外峰值不应影响 Y 轴");
+        // 空 buffer 不 panic、保持原值
+        panel.auto_y_max_abs = 5.0;
+        panel.rescan_y_max(&[], 0.0, 1.0);
+        assert!((panel.auto_y_max_abs - 5.0).abs() < 1e-9);
     }
 }

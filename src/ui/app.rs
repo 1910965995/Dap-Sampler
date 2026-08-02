@@ -280,6 +280,7 @@ impl DapSamplerApp {
             sample_rate_hz: self.controls.sample_rate,
             swd_clock_mhz: self.controls.swd_clock_mhz,
             window_size: self.controls.window_size,
+            buffer_capacity: crate::ui::controls::DEFAULT_BUFFER_CAPACITY,
             display_mode: self.waveform.display_mode().label().to_string(),
             variables: self
                 .watch_panel

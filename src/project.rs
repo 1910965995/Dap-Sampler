@@ -21,6 +21,9 @@ pub struct ProjectFile {
     pub swd_clock_mhz: u32,
     /// 显示窗口大小（采样点数）
     pub window_size: usize,
+    /// 缓冲区容量（历史数据保留量，采样点数上限）
+    #[serde(default = "default_buffer_capacity")]
+    pub buffer_capacity: usize,
     /// 波形显示模式（小写："line" / "point"）
     pub display_mode: String,
     /// 变量列表（Watch 通道）
@@ -44,6 +47,11 @@ pub struct ProjectVariable {
     pub y_scale: f32,
     /// 用户自定义备注
     pub remark: String,
+}
+
+/// 旧版工程文件缺失 buffer_capacity 字段时的默认值（serde default 用）
+fn default_buffer_capacity() -> usize {
+    crate::ui::controls::DEFAULT_BUFFER_CAPACITY
 }
 
 impl ProjectFile {
@@ -104,6 +112,7 @@ mod tests {
             sample_rate_hz: 5000,
             swd_clock_mhz: 10,
             window_size: 2000,
+            buffer_capacity: 200_000,
             display_mode: "line".to_string(),
             variables: vec![
                 ProjectVariable {
@@ -204,5 +213,30 @@ mod tests {
             let s = vt.label().to_string();
             assert_eq!(ValueType::parse(&s).unwrap(), vt);
         }
+    }
+
+    #[test]
+    fn buffer_capacity_round_trip() {
+        let mut file = sample_file();
+        file.buffer_capacity = 500_000;
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
+        assert_eq!(restored.buffer_capacity, 500_000);
+    }
+
+    #[test]
+    fn old_project_without_buffer_capacity_defaults_to_200k() {
+        // 模拟旧版工程 JSON（无 buffer_capacity 字段）
+        let json = r#"{
+            "version": 1,
+            "elf_path": null,
+            "sample_rate_hz": 5000,
+            "swd_clock_mhz": 10,
+            "window_size": 2000,
+            "display_mode": "line",
+            "variables": []
+        }"#;
+        let restored = ProjectFile::from_json(json).unwrap();
+        // 与 controls.rs 的 DEFAULT_BUFFER_CAPACITY（200_000）保持一致
+        assert_eq!(restored.buffer_capacity, 200_000);
     }
 }

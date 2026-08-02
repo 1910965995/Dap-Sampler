@@ -39,6 +39,11 @@ pub const RATE_MAX: u32 = 100_000;
 /// 窗口大小范围
 pub const WINDOW_MIN: usize = 1;
 pub const WINDOW_MAX: usize = 100_000;
+/// 缓冲区容量范围
+pub const BUFFER_CAPACITY_MIN: usize = 1_000;
+pub const BUFFER_CAPACITY_MAX: usize = 1_000_000;
+/// 默认缓冲区容量（≈10 秒 @ 20kHz）
+pub const DEFAULT_BUFFER_CAPACITY: usize = 200_000;
 
 /// SWD 时钟可选档位（MHz）
 pub const SWD_CLOCK_OPTIONS: &[u32] = &[1, 2, 5, 10, 20, 30, 50];

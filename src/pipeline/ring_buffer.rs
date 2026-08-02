@@ -145,3 +145,26 @@ impl RingBuffer {
 // SAFETY: SPSC 模型 + 原子变量 + 槽位顺序锁 = 线程安全
 unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_limits_retention() {
+        // 容量参数生效：写入超过容量时覆盖最旧数据，保留最新 capacity 个点
+        let ring = RingBuffer::new(100);
+        for i in 0..150u64 {
+            ring.push(Sample::new(i, i as f64 * 0.001, &[1.0f32.to_bits()]));
+        }
+        assert_eq!(ring.available(), 100);
+        assert_eq!(ring.overwritten(), 50);
+        assert_eq!(ring.total_written(), 150);
+        // 消费后读取到的是最新的 100 个点（seq 50..150）
+        let mut buf = vec![Sample::default(); 200];
+        let n = ring.pop_batch(&mut buf);
+        assert_eq!(n, 100);
+        assert_eq!(buf[0].seq, 50);
+        assert_eq!(buf[99].seq, 149);
+    }
+}

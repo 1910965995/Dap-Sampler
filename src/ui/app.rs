@@ -1062,6 +1062,15 @@ impl eframe::App for DapSamplerApp {
                     false
                 });
 
+                // ---- 设置菜单 ----
+                self.hover_menu(ui, "settings", "Settings(S)", |ui, app| {
+                    if menu_item(ui, "General Settings…").clicked() {
+                        app.show_settings = true;
+                        return true;
+                    }
+                    false
+                });
+
                 // ---- 帮助菜单 ----
                 self.hover_menu(ui, "help", "Help(H)", |ui, app| {
                     if menu_item(ui, "About").clicked() {
@@ -1284,6 +1293,58 @@ impl eframe::App for DapSamplerApp {
                 self.show_plot_overlay(ui, rect);
             }
         });
+
+        // ---- General Settings 窗口（Settings → General Settings…）----
+        if self.show_settings {
+            let was_active = self.controls.state != AcquisitionState::Idle;
+            let old_capacity = self.buffer_capacity;
+            egui::Window::new("General Settings")
+                .open(&mut self.show_settings)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Buffer capacity:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.buffer_capacity)
+                                .range(
+                                    crate::ui::controls::BUFFER_CAPACITY_MIN
+                                        ..=crate::ui::controls::BUFFER_CAPACITY_MAX,
+                                )
+                                .clamp_existing_to_range(true)
+                                .speed(1_000.0)
+                                .suffix(" pts"),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    // 实时换算：容量 / 采样率 = 可回看秒数
+                    let seconds =
+                        self.buffer_capacity as f64 / self.controls.sample_rate.max(1) as f64;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "≈ {:.1} s of history @ {} Hz",
+                            seconds, self.controls.sample_rate
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                    );
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Applies on the next Start.")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                    );
+                });
+            // 采集运行/暂停中改动容量 → 提示下次 Start 生效
+            if was_active && self.buffer_capacity != old_capacity {
+                self.set_status(format!(
+                    "Buffer capacity changed to {} points (applies on next Start)",
+                    self.buffer_capacity
+                ));
+            }
+        }
 
         // ---- About 窗口（Help → About）----
         if self.show_about {

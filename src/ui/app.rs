@@ -669,9 +669,13 @@ impl DapSamplerApp {
 
     /// 同步弹窗选 Yes：地址统一用 ELF 文件的值，缺失变量删除
     fn apply_elf_sync(&mut self, prompt: &ElfSyncPrompt) {
-        // 1. 删除 ELF 中不存在的变量（通道 + Watch）
+        // 1. 删除 ELF 中不存在的变量（通道 + 勾选 + Watch）
         for name in &prompt.missing {
             self.channel_panel.remove_by_name(name);
+            self.variable_browser.checked_paths.remove(name);
+        }
+        if !prompt.missing.is_empty() {
+            self.selected_channel = None;
         }
         // 2. 确保地址收集走 ELF 分支（手工快照清空必须在 collect 之前，防误用旧手工地址）
         self.manual_addresses.clear();
@@ -724,8 +728,43 @@ impl DapSamplerApp {
             .and_then(|c| std::fs::metadata(&c.file_path).ok())
             .and_then(|m| m.modified().ok());
         if current != self.elf_mtime {
-            self.elf_change_prompt = true;
+            if current.is_none() && self.elf_mtime.is_some() {
+                // 文件被删除：Reload 问答无意义（点 Yes 必然失败），直接错误提示；
+                // 同时更新快照（None），避免每秒重复报错
+                let path = self
+                    .elf_ctx
+                    .as_ref()
+                    .map(|c| c.file_path.clone())
+                    .unwrap_or_default();
+                self.set_error(format!("ELF file is missing: {}", path));
+                self.refresh_elf_mtime();
+            } else {
+                // 文件被修改（mtime 变化）→ 弹 Reload 问答
+                self.elf_change_prompt = true;
+            }
         }
+    }
+
+    /// 移除勾选与通道中在新 ELF 里已不存在的变量（reload/ELF 更新后调用）
+    ///
+    /// 变量从 ELF 删除后，Variables 勾选统计、Channels 面板应与新内容一致，
+    /// 否则残留变量会在 Start 时因找不到地址被静默跳过。
+    fn remove_stale_variables(&mut self, elf_vars: &[ElfVariable]) {
+        let stale: Vec<String> = self
+            .variable_browser
+            .checked_paths
+            .iter()
+            .filter(|p| !elf_vars.iter().any(|ev| elf_var_matches(ev, p)))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for name in &stale {
+            self.variable_browser.checked_paths.remove(name);
+            self.channel_panel.remove_by_name(name);
+        }
+        self.selected_channel = None;
     }
 
     /// ELF Changed 弹窗选 Yes：重新解析 ELF 文件
@@ -735,6 +774,8 @@ impl DapSamplerApp {
         match ElfParser::load(&path) {
             Ok(ctx) => {
                 let variable_count = ctx.variables.len();
+                // 清理新 ELF 中已不存在的勾选/通道（Variables/Channels 跟随新内容）
+                self.remove_stale_variables(&ctx.variables);
                 self.elf_ctx = Some(ctx);
                 // Watch 立即反映新 ELF 的地址（与同步弹窗 Yes 行为一致）
                 let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
@@ -2035,6 +2076,31 @@ mod elf_sync_tests {
     }
 
     #[test]
+    fn remove_stale_variables_cleans_checked_and_channels() {
+        let elf = ElfContext {
+            file_path: "C:/fw/fw.elf".to_string(),
+            variables: vec![elf_var("keep", 0x100)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.variable_browser.checked_paths.insert("keep".to_string());
+        app.variable_browser.checked_paths.insert("gone".to_string());
+        app.channel_panel.add_channel("keep".to_string(), egui::Color32::RED, ValueType::Float);
+        app.channel_panel.add_channel("gone".to_string(), egui::Color32::GREEN, ValueType::Float);
+        app.selected_channel = Some(1);
+        // 新 ELF 只有 keep：gone 应从勾选与通道中移除
+        app.remove_stale_variables(&[elf_var("keep", 0x100)]);
+        assert!(app.variable_browser.checked_paths.contains("keep"));
+        assert!(!app.variable_browser.checked_paths.contains("gone"), "已删变量不应残留勾选");
+        assert!(app.channel_panel.has_channel("keep"));
+        assert!(!app.channel_panel.has_channel("gone"), "已删变量不应残留通道");
+        assert!(app.selected_channel.is_none(), "通道删除后选中态应清空");
+        // 无 stale 时 selected_channel 保留
+        app.selected_channel = Some(0);
+        app.remove_stale_variables(&[elf_var("keep", 0x100)]);
+        assert_eq!(app.selected_channel, Some(0));
+    }
+
+    #[test]
     fn check_elf_changed_detects_mtime_change() {
         // 临时 ELF 文件：初始快照 → 修改 mtime → 检测到变化
         let dir = std::env::temp_dir();
@@ -2071,5 +2137,34 @@ mod elf_sync_tests {
         app.check_elf_changed();
         assert!(!app.elf_change_prompt, "mtime 未变不应触发弹窗");
         std::fs::remove_file(&elf_path).ok();
+    }
+
+    #[test]
+    fn check_elf_changed_missing_file_reports_error_not_prompt() {
+        // 文件被删除 → 直接错误提示，不弹 Reload 问答（点 Yes 必然失败）
+        let dir = std::env::temp_dir();
+        let elf_path = dir.join(format!("elf_missing_test_{}.elf", std::process::id()));
+        std::fs::write(&elf_path, b"ELF").unwrap();
+        let elf = ElfContext {
+            file_path: elf_path.display().to_string(),
+            variables: vec![elf_var("pid.kp", 0x2000_0100)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.elf_mtime = std::fs::metadata(&elf_path).ok().and_then(|m| m.modified().ok());
+        std::fs::remove_file(&elf_path).unwrap();
+        app.check_elf_changed();
+        assert!(!app.elf_change_prompt, "文件删除不应弹 Reload 弹窗");
+        assert!(app.status_is_error, "应直接提示错误");
+        assert!(
+            app.status_text.as_deref().unwrap_or("").contains("missing"),
+            "错误消息应提及 missing，实际 {:?}",
+            app.status_text
+        );
+        // 快照已更新为 None → 再次检测不重复报错（状态文本保持不变）
+        app.status_text = None;
+        app.status_is_error = false;
+        app.check_elf_changed();
+        assert!(!app.status_is_error, "快照更新后不应重复报错");
+        assert!(app.elf_mtime.is_none(), "快照应更新为 None（文件不存在）");
     }
 }

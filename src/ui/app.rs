@@ -79,6 +79,10 @@ pub struct DapSamplerApp {
     project_path: Option<String>,
     /// 当前悬停展开的菜单（None = 无；鼠标移出按钮与菜单区域后自动收起）
     hover_menu: Option<&'static str>,
+    /// 缓冲区容量（历史保留量，采样点数上限；下次 Start 生效）
+    buffer_capacity: usize,
+    /// 设置窗口是否显示（设置 → 常规设置）
+    show_settings: bool,
     /// 关于窗口是否显示（帮助 → 关于）
     show_about: bool,
 }
@@ -216,6 +220,8 @@ impl DapSamplerApp {
             selected_channel: None,
             project_path: None,
             hover_menu: None,
+            buffer_capacity: crate::ui::controls::DEFAULT_BUFFER_CAPACITY,
+            show_settings: false,
             show_about: false,
         }
     }
@@ -254,6 +260,7 @@ impl DapSamplerApp {
         self.rate_hz = 5000;
         self.interval_us = 1_000_000.0 / self.rate_hz as f64;
         self.window_size = 2000;
+        self.buffer_capacity = crate::ui::controls::DEFAULT_BUFFER_CAPACITY;
         self.controls.sample_rate = self.rate_hz;
         self.controls.window_size = self.window_size;
         self.controls.swd_clock_mhz = 1;
@@ -262,7 +269,7 @@ impl DapSamplerApp {
         self.display_mode = mode;
         self.waveform = WaveformPanel::new(vec![], vec![], self.interval_us, vec![], mode);
         // 清空运行时状态
-        self.display_buf = DisplayBuffer::new(self.window_size);
+        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
         self.cursor.clear();
         self.controls.update_count(0);
         self.controls.set_stopped();
@@ -280,7 +287,7 @@ impl DapSamplerApp {
             sample_rate_hz: self.controls.sample_rate,
             swd_clock_mhz: self.controls.swd_clock_mhz,
             window_size: self.controls.window_size,
-            buffer_capacity: crate::ui::controls::DEFAULT_BUFFER_CAPACITY,
+            buffer_capacity: self.buffer_capacity,
             display_mode: self.waveform.display_mode().label().to_string(),
             variables: self
                 .watch_panel
@@ -469,12 +476,14 @@ impl DapSamplerApp {
         self.controls.window_size = file.window_size
             .clamp(crate::ui::controls::WINDOW_MIN, crate::ui::controls::WINDOW_MAX);
         self.window_size = self.controls.window_size;
+        self.buffer_capacity = file.buffer_capacity
+            .clamp(crate::ui::controls::BUFFER_CAPACITY_MIN, crate::ui::controls::BUFFER_CAPACITY_MAX);
         let mode = file.display_mode();
         self.waveform.set_display_mode(mode);
         self.display_mode = mode;
 
         // 6. 清空运行时状态，回到 Idle
-        self.display_buf = DisplayBuffer::new(self.window_size);
+        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
         self.cursor.clear();
         self.controls.update_count(0);
         self.selected_channel = None;

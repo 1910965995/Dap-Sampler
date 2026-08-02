@@ -16,6 +16,9 @@ use super::channel_panel::ChannelPanel;
 use super::watch_panel::WatchPanel;
 use crate::project::{ProjectFile, ProjectVariable, PROJECT_VERSION};
 
+/// Idle 状态下 ELF 文件变化检测的轮询间隔
+const ELF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 示波器风格通道色板（v1.1.0 配色：红/绿/蓝/橙/品红/青/灰/粉）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(255, 68, 68),   // 红
@@ -255,6 +258,12 @@ impl DapSamplerApp {
             watch_panel.sync_from_channels(&manual_channel_names, &manual_value_types, &manual_addresses);
         }
 
+        // --elf 启动路径：构造时即记录 mtime 快照，避免首帧 Idle 误判文件变化
+        let initial_elf_mtime = elf_ctx
+            .as_ref()
+            .and_then(|c| std::fs::metadata(&c.file_path).ok())
+            .and_then(|m| m.modified().ok());
+
         Self {
             pipeline: None,
             active_usb: None,  // USB 连接推迟到 Start 时建立
@@ -295,7 +304,7 @@ impl DapSamplerApp {
             show_elf_warning: false,
             elf_sync_prompt: None,
             elf_change_prompt: false,
-            elf_mtime: None,
+            elf_mtime: initial_elf_mtime,
             elf_sync_open: false,
             last_project_variables: Vec::new(),
         }
@@ -365,6 +374,10 @@ impl DapSamplerApp {
     ///
     /// 共用入口：Files → Import ELF File… 与 Settings → Change ELF…
     fn import_elf(&mut self) {
+        // 重新导入 ELF 时清除挂起的文件变化弹窗（防止残留弹窗误导）
+        self.elf_change_prompt = false;
+        self.elf_sync_prompt = None;
+        self.elf_sync_open = false;
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("ELF", &["elf", "axf", "out", ""])
             .pick_file()
@@ -373,6 +386,7 @@ impl DapSamplerApp {
                 Ok(ctx) => {
                     let variable_count = ctx.variables.len();
                     self.elf_ctx = Some(ctx);
+                    self.refresh_elf_mtime();
                     self.set_status(format!("ELF loaded: {} variables", variable_count));
                 }
                 Err(e) => {
@@ -701,6 +715,40 @@ impl DapSamplerApp {
             .as_ref()
             .and_then(|c| std::fs::metadata(&c.file_path).ok())
             .and_then(|m| m.modified().ok());
+    }
+
+    /// 检测 ELF 文件 mtime 变化（Idle 时调用）；变化 → 置 elf_change_prompt
+    fn check_elf_changed(&mut self) {
+        let current = self.elf_ctx
+            .as_ref()
+            .and_then(|c| std::fs::metadata(&c.file_path).ok())
+            .and_then(|m| m.modified().ok());
+        if current != self.elf_mtime {
+            self.elf_change_prompt = true;
+        }
+    }
+
+    /// ELF Changed 弹窗选 Yes：重新解析 ELF 文件
+    fn reload_elf(&mut self) {
+        let path = self.elf_ctx.as_ref().map(|c| c.file_path.clone());
+        let Some(path) = path else { return };
+        match ElfParser::load(&path) {
+            Ok(ctx) => {
+                let variable_count = ctx.variables.len();
+                self.elf_ctx = Some(ctx);
+                // Watch 立即反映新 ELF 的地址（与同步弹窗 Yes 行为一致）
+                let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
+                let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+                let addresses = self.collect_channel_addresses();
+                self.watch_panel.sync_from_channels(&names, &types, &addresses);
+                self.set_status(format!("ELF reloaded: {} variables", variable_count));
+            }
+            Err(e) => {
+                self.set_error(format!("ELF reload failed: {}", e));
+            }
+        }
+        self.refresh_elf_mtime();
+        self.elf_change_prompt = false;
     }
 
     fn start_acquisition(&mut self) {
@@ -1211,6 +1259,15 @@ impl eframe::App for DapSamplerApp {
         visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(236);
         visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(236);
         ctx.set_visuals(visuals);
+        // Idle 状态检测 ELF 文件变化（无其他弹窗占用时）
+        if self.controls.state == AcquisitionState::Idle
+            && self.elf_ctx.is_some()
+            && self.elf_sync_prompt.is_none()
+            && !self.elf_change_prompt
+            && self.elf_warning.is_none()
+        {
+            self.check_elf_changed();
+        }
         self.drain_pipeline();
 
         // 计算实际采样率
@@ -1637,6 +1694,39 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
+        // ---- ELF 文件变化弹窗（Idle 检测到 mtime 变化）----
+        // X 关闭等价于 No（保持现状 + 更新快照）
+        if self.elf_change_prompt {
+            let mut chose_yes = false;
+            let mut chose_no = false;
+            let mut open = true;
+            egui::Window::new("ELF Changed")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(320.0);
+                    ui.label("The ELF file has changed on disk. Reload it?");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            chose_yes = true;
+                        }
+                        if ui.button("No").clicked() {
+                            chose_no = true;
+                        }
+                    });
+                });
+            if chose_yes {
+                self.reload_elf();
+            } else if chose_no || !open {
+                // No 或 X 关闭：保持现状 + 更新快照（文件再次变化才再弹）
+                self.elf_change_prompt = false;
+                self.refresh_elf_mtime();
+            }
+        }
+
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
         if let Some(msg) = self.elf_warning.clone() {
@@ -1693,6 +1783,15 @@ impl eframe::App for DapSamplerApp {
         // Idle 状态时让 egui 进入低功耗等待模式，避免 CPU 100% 占用
         if self.controls.state == AcquisitionState::Running || has_new_data {
             ctx.request_repaint();
+        }
+        // Idle + 有 ELF + 无弹窗时每秒唤醒检测文件变化（Idle 默认低功耗不重绘）
+        if self.controls.state == AcquisitionState::Idle
+            && self.elf_ctx.is_some()
+            && self.elf_sync_prompt.is_none()
+            && !self.elf_change_prompt
+            && self.elf_warning.is_none()
+        {
+            ctx.request_repaint_after(ELF_POLL_INTERVAL);
         }
     }
 
@@ -1933,5 +2032,44 @@ mod elf_sync_tests {
         assert!(app.channel_panel.has_channel("pid.kp"));
         let entry = app.watch_panel.entries.iter().find(|e| e.name == "pid.kp").unwrap();
         assert_eq!(entry.address, 0x2000_0100);
+    }
+
+    #[test]
+    fn check_elf_changed_detects_mtime_change() {
+        // 临时 ELF 文件：初始快照 → 修改 mtime → 检测到变化
+        let dir = std::env::temp_dir();
+        let elf_path = dir.join(format!("elf_changed_test_{}.elf", std::process::id()));
+        std::fs::write(&elf_path, b"ELF").unwrap();
+        let elf = ElfContext {
+            file_path: elf_path.display().to_string(),
+            variables: vec![elf_var("pid.kp", 0x2000_0100)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.elf_mtime = std::fs::metadata(&elf_path).ok().and_then(|m| m.modified().ok());
+        // 显式修改 mtime（+10s，避免文件系统粒度问题）
+        let f = std::fs::File::options().write(true).open(&elf_path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+        )).unwrap();
+        drop(f);
+        app.check_elf_changed();
+        assert!(app.elf_change_prompt, "mtime 变化应触发弹窗");
+        std::fs::remove_file(&elf_path).ok();
+    }
+
+    #[test]
+    fn check_elf_changed_no_change_no_prompt() {
+        let dir = std::env::temp_dir();
+        let elf_path = dir.join(format!("elf_unchanged_test_{}.elf", std::process::id()));
+        std::fs::write(&elf_path, b"ELF").unwrap();
+        let elf = ElfContext {
+            file_path: elf_path.display().to_string(),
+            variables: vec![elf_var("pid.kp", 0x2000_0100)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.elf_mtime = std::fs::metadata(&elf_path).ok().and_then(|m| m.modified().ok());
+        app.check_elf_changed();
+        assert!(!app.elf_change_prompt, "mtime 未变不应触发弹窗");
+        std::fs::remove_file(&elf_path).ok();
     }
 }

@@ -89,6 +89,16 @@ pub struct DapSamplerApp {
     elf_warning: Option<String>,
     /// 警告弹窗是否显示（右上角 X 关闭）
     show_elf_warning: bool,
+    /// 打开工程时的 ELF 同步询问（Some = 弹窗挂起等待用户选择）
+    elf_sync_prompt: Option<ElfSyncPrompt>,
+    /// Idle 状态下检测 ELF 文件变化的弹窗（文件 mtime 变化）
+    elf_change_prompt: bool,
+    /// 上次记录的 ELF 文件修改时间（变化检测基准）
+    elf_mtime: Option<std::time::SystemTime>,
+    /// ELF 同步弹窗是否显示（右上角 X 关闭 → 等价 No）
+    elf_sync_open: bool,
+    /// 最近一次打开工程时的变量列表（同步弹窗选 No 时用工程地址恢复）
+    last_project_variables: Vec<ProjectVariable>,
 }
 
 /// 截断长路径：超过 max_chars 字符时保留前面部分并追加 "..."
@@ -283,6 +293,11 @@ impl DapSamplerApp {
             show_about: false,
             elf_warning: None,
             show_elf_warning: false,
+            elf_sync_prompt: None,
+            elf_change_prompt: false,
+            elf_mtime: None,
+            elf_sync_open: false,
+            last_project_variables: Vec::new(),
         }
     }
 
@@ -308,6 +323,11 @@ impl DapSamplerApp {
         self.status_is_error = false;
         self.elf_warning = None;
         self.show_elf_warning = false;
+        self.elf_sync_prompt = None;
+        self.elf_change_prompt = false;
+        self.elf_sync_open = false;
+        self.last_project_variables = Vec::new();
+        self.elf_mtime = None;
         self.stop_acquisition();
         // 清空 ELF / 通道 / Watch / 手工模式
         self.elf_ctx = None;
@@ -455,6 +475,9 @@ impl DapSamplerApp {
         self.status_is_error = false;
         self.elf_warning = None;
         self.show_elf_warning = false;
+        self.elf_sync_prompt = None;
+        self.elf_change_prompt = false;
+        self.elf_sync_open = false;
         self.stop_acquisition();
 
         // 1. 读取并解析（失败不动当前状态）
@@ -472,11 +495,21 @@ impl DapSamplerApp {
                 return;
             }
         };
+        // 暂存工程变量（同步弹窗选 No 时用工程地址恢复）
+        self.last_project_variables = file.variables.clone();
 
         // 2. 加载 ELF（失败仅警告，用保存的地址继续）
         let elf_loaded = if let Some(elf_path) = &file.elf_path {
             match ElfParser::load(elf_path) {
                 Ok(ctx) => {
+                    // 记录 mtime 快照（Idle 变化检测基准）
+                    self.elf_mtime = std::fs::metadata(elf_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    // 检测工程变量与 ELF 的差异（地址不同/缺失）→ 挂起同步询问
+                    // 注意：必须在 ctx 移入 elf_ctx 之前借用 ctx.variables
+                    self.elf_sync_prompt = compute_elf_diffs(&file.variables, &ctx.variables);
+                    self.elf_sync_open = self.elf_sync_prompt.is_some();
                     self.elf_ctx = Some(ctx);
                     log::info!("ELF 已加载: {}", elf_path);
                     true
@@ -618,6 +651,56 @@ impl DapSamplerApp {
         if !self.status_is_error {
             self.set_status(format!("Project opened: {}", path.display()));
         }
+    }
+
+    /// 同步弹窗选 Yes：地址统一用 ELF 文件的值，缺失变量删除
+    fn apply_elf_sync(&mut self, prompt: &ElfSyncPrompt) {
+        // 1. 删除 ELF 中不存在的变量（通道 + Watch）
+        for name in &prompt.missing {
+            self.channel_panel.remove_by_name(name);
+        }
+        // 2. 确保地址收集走 ELF 分支（手工快照清空必须在 collect 之前，防误用旧手工地址）
+        self.manual_addresses.clear();
+        self.manual_channel_names.clear();
+        self.manual_value_types.clear();
+        // 3. Watch 重建：地址用 ELF 查询结果（collect_channel_addresses 在 ELF 上下文返回 ELF 地址）
+        let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
+        let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+        let addresses = self.collect_channel_addresses();
+        self.watch_panel.sync_from_channels(&names, &types, &addresses);
+        // 4. 反馈
+        self.set_status(format!(
+            "ELF synchronized: {} addresses updated, {} variables removed",
+            prompt.address_diffs.len(),
+            prompt.missing.len()
+        ));
+        self.refresh_elf_mtime();
+    }
+
+    /// 同步弹窗选 No（或 X 关闭）：统一用工程记录的地址（切手工快照，采样与 Watch 一致）
+    fn use_project_addresses(&mut self, variables: &[ProjectVariable]) {
+        self.manual_addresses = variables.iter().map(|v| v.address).collect();
+        self.manual_channel_names = variables.iter().map(|v| v.name.clone()).collect();
+        self.manual_value_types = variables.iter().map(|v| v.value_type()).collect();
+        self.variable_browser.clear();
+        self.channel_panel.channels.clear();
+        for (i, v) in variables.iter().enumerate() {
+            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+            self.channel_panel.add_channel(v.name.clone(), color, v.value_type());
+        }
+        let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
+        let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+        self.watch_panel.sync_from_channels(&names, &types, &self.manual_addresses);
+        self.set_status("Using saved variable addresses (ELF not synchronized)");
+        self.refresh_elf_mtime();
+    }
+
+    /// 从当前 ELF 文件路径刷新 mtime 快照（Idle 变化检测基准）
+    fn refresh_elf_mtime(&mut self) {
+        self.elf_mtime = self.elf_ctx
+            .as_ref()
+            .and_then(|c| std::fs::metadata(&c.file_path).ok())
+            .and_then(|m| m.modified().ok());
     }
 
     fn start_acquisition(&mut self) {
@@ -1507,6 +1590,53 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
+        // ---- ELF 同步询问弹窗（打开工程时变量地址与 ELF 不一致）----
+        // X 关闭等价于 No（采用工程地址）
+        if let Some(prompt) = self.elf_sync_prompt.clone() {
+            let mut chose_yes = false;
+            let mut chose_no = false;
+            egui::Window::new("ELF Synchronization")
+                .open(&mut self.elf_sync_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(380.0);
+                    ui.label("The ELF file has changed. Should it be synchronized?");
+                    ui.add_space(6.0);
+                    if !prompt.address_diffs.is_empty() {
+                        ui.label(egui::RichText::new(format!(
+                            "• {} variables have different addresses",
+                            prompt.address_diffs.len()
+                        )).size(11.0).color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)));
+                    }
+                    if !prompt.missing.is_empty() {
+                        ui.label(egui::RichText::new(format!(
+                            "• {} variables not found in the ELF file",
+                            prompt.missing.len()
+                        )).size(11.0).color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)));
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            chose_yes = true;
+                        }
+                        if ui.button("No").clicked() {
+                            chose_no = true;
+                        }
+                    });
+                });
+            if chose_yes {
+                self.apply_elf_sync(&prompt);
+                self.elf_sync_prompt = None;
+            } else if chose_no || !self.elf_sync_open {
+                // No 按钮或 X 关闭 → 统一用工程地址
+                let vars = self.last_project_variables.clone();
+                self.use_project_addresses(&vars);
+                self.elf_sync_prompt = None;
+            }
+        }
+
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
         if let Some(msg) = self.elf_warning.clone() {
@@ -1761,5 +1891,47 @@ mod elf_sync_tests {
         let mut ev = elf_var("kp", 0x2000_0100);
         ev.path = "pid.kp".to_string();
         assert!(compute_elf_diffs(&project, &[ev]).is_none());
+    }
+
+    #[test]
+    fn apply_elf_sync_updates_watch_addresses_and_removes_missing() {
+        let elf = ElfContext {
+            file_path: "C:/fw/fw.elf".to_string(),
+            variables: vec![elf_var("pid.kp", 0x2000_0200)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        // 模拟打开工程后的状态：通道/Watch 用旧地址，且含一个 ELF 中缺失的变量
+        app.channel_panel.add_channel("pid.kp".to_string(), egui::Color32::RED, ValueType::Float);
+        app.channel_panel.add_channel("gone".to_string(), egui::Color32::GREEN, ValueType::Float);
+        app.watch_panel.sync_from_channels(
+            &["pid.kp".to_string(), "gone".to_string()],
+            &[ValueType::Float, ValueType::Float],
+            &[0x2000_0100, 0x2000_0108],
+        );
+        let prompt = ElfSyncPrompt {
+            address_diffs: vec![("pid.kp".to_string(), 0x2000_0100, 0x2000_0200)],
+            missing: vec!["gone".to_string()],
+        };
+        app.apply_elf_sync(&prompt);
+        // 缺失变量被删除
+        assert!(!app.channel_panel.has_channel("gone"));
+        assert!(!app.watch_panel.entries.iter().any(|e| e.name == "gone"));
+        // Watch 地址更新为 ELF 地址
+        let entry = app.watch_panel.entries.iter().find(|e| e.name == "pid.kp").unwrap();
+        assert_eq!(entry.address, 0x2000_0200);
+        // 手工地址清空（后续走 ELF 分支）
+        assert!(app.manual_addresses.is_empty());
+    }
+
+    #[test]
+    fn use_project_addresses_switches_to_manual_snapshot() {
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1);
+        let vars = vec![project_var("pid.kp", 0x2000_0100)];
+        app.use_project_addresses(&vars);
+        assert_eq!(app.manual_addresses, vec![0x2000_0100]);
+        assert_eq!(app.manual_channel_names, vec!["pid.kp".to_string()]);
+        assert!(app.channel_panel.has_channel("pid.kp"));
+        let entry = app.watch_panel.entries.iter().find(|e| e.name == "pid.kp").unwrap();
+        assert_eq!(entry.address, 0x2000_0100);
     }
 }

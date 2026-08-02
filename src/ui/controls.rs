@@ -27,7 +27,7 @@ pub struct ControlPanel {
     pub target_count: Option<u64>,
     /// 实际达到的采样率（由外部计算后更新）
     pub actual_rate_hz: f64,
-    /// 显示窗口大小（采样点数），超过则丢弃旧数据
+    /// 显示窗口大小（采样点数），仅作波形视野宽度（历史保留由 buffer_capacity 决定）
     pub window_size: usize,
     /// SWD 时钟频率（MHz）
     pub swd_clock_mhz: u32,

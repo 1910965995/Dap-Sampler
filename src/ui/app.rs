@@ -577,7 +577,10 @@ impl DapSamplerApp {
                 .iter()
                 .zip(&channel_names)
                 .all(|(a, b)| *a == b.as_str());
-        let keep_history = self.controls.state == AcquisitionState::Paused && config_unchanged;
+        // Pause 期间改了缓冲区容量 → 视为配置变化，恢复时重建缓冲
+        let keep_history = self.controls.state == AcquisitionState::Paused
+            && config_unchanged
+            && self.display_buf.max_samples() == self.buffer_capacity;
 
         self.waveform =
             WaveformPanel::new(channel_names.clone(), channel_colors, self.interval_us, types.clone(), self.display_mode);

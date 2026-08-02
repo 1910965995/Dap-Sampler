@@ -120,7 +120,7 @@ pub fn show(&mut self, ui, buffer, buffer_offset, view_points: usize, has_new_da
 
 - 移除 `rebuild_cache` / `incremental_update` 中的 y_max 累计逻辑（原基于全量历史，历史变大后 Y 轴被历史峰值撑松）
 - 改为每帧按当前可视 X 范围扫 buffer 原始值求 max_abs（2000 点 × 8 通道 ≈ 16k 次比较，可忽略）
-- 拖动到哪一段，Y 轴适配哪一段
+- **仅 Follow（auto_scroll）模式下自动适配**：Follow 开启时每帧按当前视野重扫并应用；手动拖动/暂停回看时 Y 轴保持用户控制（不动），避免与用户手动 Y 缩放操作冲突（用户已确认此行为，2026-08-02）
 - `rescan_counter` 定期重扫机制删除（每帧重扫替代）
 - 保留"按 raw 值、不被 offset/scale 推偏"的语义
 

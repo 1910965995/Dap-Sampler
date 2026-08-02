@@ -6,7 +6,7 @@ use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::swd::SwdLink;
-use crate::elf::{ElfContext, ElfParser};
+use crate::elf::{ElfContext, ElfParser, ElfVariable};
 use super::display_buffer::DisplayBuffer;
 use super::waveform::{WaveformPanel, WaveformDisplayMode};
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
@@ -100,6 +100,48 @@ fn truncate_path(path: &str, max_chars: usize) -> String {
     let mut s: String = path.chars().take(keep).collect();
     s.push_str("...");
     s
+}
+
+/// 打开工程时 ELF 与工程变量的差异（触发同步询问弹窗）
+#[derive(Clone)]
+struct ElfSyncPrompt {
+    /// 地址不同的变量：(变量名, 工程地址, ELF 地址)
+    address_diffs: Vec<(String, u32, u32)>,
+    /// ELF 中不存在的变量名（选 Yes 时删除）
+    missing: Vec<String>,
+}
+
+/// ELF 变量是否匹配给定名称（path 或 name 相等）
+fn elf_var_matches(ev: &ElfVariable, name: &str) -> bool {
+    ev.path == name || ev.name == name
+}
+
+/// 比较工程变量与 ELF 变量：地址不同或 ELF 中缺失 → 返回差异；无差异 → None
+///
+/// 匹配规则与 collect_channel_addresses 一致：path 或 name 相等即匹配。
+fn compute_elf_diffs(
+    project_vars: &[ProjectVariable],
+    elf_vars: &[ElfVariable],
+) -> Option<ElfSyncPrompt> {
+    let mut address_diffs = Vec::new();
+    let mut missing = Vec::new();
+    for pv in project_vars {
+        match elf_vars
+            .iter()
+            .find(|ev| elf_var_matches(ev, &pv.name))
+        {
+            Some(ev) if ev.address != pv.address => {
+                address_diffs.push((pv.name.clone(), pv.address, ev.address));
+            }
+            Some(_) => {}
+            None => missing.push(pv.name.clone()),
+        }
+    }
+    if address_diffs.is_empty() && missing.is_empty() {
+        None
+    } else {
+        Some(ElfSyncPrompt { address_diffs, missing })
+    }
 }
 
 /// 菜单项：整行（全宽 × 22px）可点击、文字左对齐
@@ -467,7 +509,7 @@ impl DapSamplerApp {
             let mut missing: Vec<String> = Vec::new();
             for v in &file.variables {
                 let exists = self.elf_ctx.as_ref().is_some_and(|ctx| {
-                    ctx.variables.iter().any(|ev| ev.path == v.name || ev.name == v.name)
+                    ctx.variables.iter().any(|ev| elf_var_matches(ev, &v.name))
                 });
                 if exists {
                     self.variable_browser.checked_paths.insert(v.name.clone());
@@ -605,7 +647,7 @@ impl DapSamplerApp {
                         self.elf_ctx.as_ref().and_then(|ctx| {
                             ctx.variables
                                 .iter()
-                                .find(|v| v.path == ch.name || v.name == ch.name)
+                                .find(|v| elf_var_matches(v, &ch.name))
                                 .map(|v| v.address)
                         })
                     })
@@ -852,7 +894,7 @@ impl DapSamplerApp {
                 self.elf_ctx.as_ref().and_then(|ctx| {
                     ctx.variables
                         .iter()
-                        .find(|v| v.path == ch.name || v.name == ch.name)
+                        .find(|v| elf_var_matches(v, &ch.name))
                         .map(|v| v.address)
                 })
             })
@@ -1646,5 +1688,78 @@ mod open_project_tests {
             app.elf_warning.as_deref().unwrap_or("").contains("C:/definitely/not/exists/fw.elf"),
             "警告弹窗应包含 ELF 路径"
         );
+    }
+}
+
+#[cfg(test)]
+mod elf_sync_tests {
+    use super::*;
+    use crate::elf::ElfVariable;
+
+    fn project_var(name: &str, address: u32) -> ProjectVariable {
+        ProjectVariable {
+            name: name.to_string(),
+            address,
+            value_type: "float".to_string(),
+            refresh_period_s: 0.1,
+            y_offset: 0.0,
+            y_scale: 1.0,
+            remark: String::new(),
+        }
+    }
+
+    fn elf_var(name: &str, address: u32) -> ElfVariable {
+        ElfVariable {
+            name: name.to_string(),
+            path: name.to_string(),
+            address,
+            byte_size: 4,
+            value_type: ValueType::Float,
+            parent_path: None,
+            source_file: None,
+        }
+    }
+
+    #[test]
+    fn compute_elf_diffs_none_when_identical() {
+        let project = vec![project_var("pid.kp", 0x2000_0100), project_var("speed", 0x2000_0104)];
+        let elf = vec![elf_var("pid.kp", 0x2000_0100), elf_var("speed", 0x2000_0104)];
+        assert!(compute_elf_diffs(&project, &elf).is_none());
+    }
+
+    #[test]
+    fn compute_elf_diffs_detects_address_changes() {
+        let project = vec![project_var("pid.kp", 0x2000_0100)];
+        let elf = vec![elf_var("pid.kp", 0x2000_0200)];
+        let diff = compute_elf_diffs(&project, &elf).expect("应有差异");
+        assert_eq!(diff.address_diffs, vec![("pid.kp".to_string(), 0x2000_0100, 0x2000_0200)]);
+        assert!(diff.missing.is_empty());
+    }
+
+    #[test]
+    fn compute_elf_diffs_detects_missing_variables() {
+        let project = vec![project_var("pid.kp", 0x2000_0100), project_var("old_var", 0x2000_0108)];
+        let elf = vec![elf_var("pid.kp", 0x2000_0100)];
+        let diff = compute_elf_diffs(&project, &elf).expect("应有差异");
+        assert!(diff.address_diffs.is_empty());
+        assert_eq!(diff.missing, vec!["old_var".to_string()]);
+    }
+
+    #[test]
+    fn compute_elf_diffs_mixed() {
+        let project = vec![project_var("a", 0x100), project_var("b", 0x104), project_var("gone", 0x108)];
+        let elf = vec![elf_var("a", 0x200), elf_var("b", 0x104)];
+        let diff = compute_elf_diffs(&project, &elf).expect("应有差异");
+        assert_eq!(diff.address_diffs, vec![("a".to_string(), 0x100, 0x200)]);
+        assert_eq!(diff.missing, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn compute_elf_diffs_matches_by_name_or_path() {
+        // ELF 用 path 匹配工程 name（变量路径带前缀时 name 与 path 不同）
+        let project = vec![project_var("pid.kp", 0x2000_0100)];
+        let mut ev = elf_var("kp", 0x2000_0100);
+        ev.path = "pid.kp".to_string();
+        assert!(compute_elf_diffs(&project, &[ev]).is_none());
     }
 }

@@ -27,6 +27,8 @@ pub fn write_csv<W: Write>(
     w.write_all(b"\r\n")?;
     // 数据行（逐值格式化，避免每行分配 Vec）
     for s in samples {
+        // 契约校验：列定义（通道数）应与每个采样点的值数一致（防 ELF 快照过期导致列错位）
+        debug_assert_eq!(names.len(), s.values().len(), "column count mismatch with sample values");
         write!(w, "{}", s.timestamp_sec)?;
         for (i, &raw) in s.values().iter().enumerate() {
             let t = types.get(i).copied().unwrap_or(ValueType::Float);

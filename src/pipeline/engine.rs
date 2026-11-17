@@ -9,7 +9,9 @@ use crate::error::*;
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::commands::*;
-use super::sample::Sample;
+use crate::dap::mem_access::MemAccess;
+use crate::pipeline::sample::ValueType;
+use super::sample::{Sample, MAX_VALUES};
 use super::ring_buffer::RingBuffer;
 
 /// 单次 DAP_Transfer 命令的最大请求数（保守上限，避免超过 USB 包大小）
@@ -38,14 +40,18 @@ const MAX_IN_FLIGHT: usize = 4;
 pub struct PipelineEngine {
     usb: Arc<BulkTransfer>,
     dap: DapProtocol,
-    addresses: Vec<u32>,
+    /// 各变量的对齐访问信息（子字变量按所在对齐整字访问 + lane 提取）
+    accesses: Vec<MemAccess>,
     /// 目标采样间隔（微秒）
     interval_us: u64,
     /// 停止标志（主线程设为 false 时，子线程退出）
     running: Arc<AtomicBool>,
     /// 写入请求队列（主线程推送，提交线程消费）
-    /// 元素: (地址, 数据)
-    write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
+    /// 元素: (变量索引, 值)
+    write_queue: Arc<Mutex<VecDeque<(usize, u32)>>>,
+    /// 各变量所在对齐整字的最近一次原始值（接收线程更新，
+    /// 提交线程对子字变量做读-改-写时合并用）
+    last_words: Arc<Mutex<Vec<Option<u32>>>>,
     /// 在途命令计数（提交线程发出命令后 +1，接收线程解析对应响应后 -1）。
     /// 背压控制：提交线程在途数达到 MAX_IN_FLIGHT 时跳过本轮
     in_flight: Arc<AtomicUsize>,
@@ -55,22 +61,33 @@ impl PipelineEngine {
     /// 从已初始化的 SWD 链路创建流水线引擎
     ///
     /// `usb` 和 `dap` 来自 `SwdLink::into_parts()`。
-    /// `addresses` 是一组目标内存地址（1-8 个）。
+    /// `addresses` 是一组目标内存地址（1-8 个），`types` 与之一一对应
+    /// （子字变量 u8/u16 按对齐整字读取后提取 lane）。
     /// `rate_hz` 是目标采样率。
     pub fn new(
         usb: Arc<BulkTransfer>,
         dap: DapProtocol,
         addresses: Vec<u32>,
+        types: &[ValueType],
         rate_hz: u32,
     ) -> Self {
         let interval_us = (1_000_000.0 / rate_hz as f64) as u64;
+        let accesses: Vec<MemAccess> = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, &addr)| {
+                let size = types.get(i).map(|t| t.byte_size()).unwrap_or(4);
+                MemAccess::from_addr_size(addr, size)
+            })
+            .collect();
         Self {
             usb,
             dap,
-            addresses,
+            accesses,
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
+            last_words: Arc::new(Mutex::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -82,10 +99,11 @@ impl PipelineEngine {
         Self {
             usb: Arc::clone(&self.usb),
             dap: self.dap,
-            addresses: self.addresses.clone(),
+            accesses: self.accesses.clone(),
             interval_us: (1_000_000.0 / rate_hz as f64) as u64,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
+            last_words: Arc::clone(&self.last_words),
             // 独立计数器：新旧引擎互不干扰（背压信号各自独立）
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
@@ -130,18 +148,22 @@ impl PipelineEngine {
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
-        let addresses = self.addresses.clone();
+        let accesses = self.accesses.clone();
         let running = Arc::clone(&self.running);
         let write_queue = Arc::clone(&self.write_queue);
+        let last_words = Arc::clone(&self.last_words);
         let in_flight = Arc::clone(&self.in_flight);
 
         // 预构建 TransferRequest 数组（每次采样都一样）
-        // 每变量 = 写 TAR + 读 DRW，共 2 条请求
-        let requests: Vec<TransferRequest> = addresses
+        // 每变量 = 写 TAR + 读 DRW，共 2 条请求。
+        // 子字变量（u8/u16）写对齐字地址，读回整字后由接收线程按 lane 提取。
+        // AHB-AP 不支持非对齐访问：对非字对齐地址发起 32 位 DRW 读行为
+        // 不可预测（实际芯片通常回退到对齐字），必须对齐后 lane 提取。
+        let requests: Vec<TransferRequest> = accesses
             .iter()
-            .flat_map(|&addr| {
+            .flat_map(|acc| {
                 vec![
-                    TransferRequest::write_ap(AP_REG_TAR, addr),
+                    TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
                     TransferRequest::read_ap(AP_REG_DRW),
                 ]
             })
@@ -165,7 +187,7 @@ impl PipelineEngine {
         }
 
         // 循环外复用缓冲区，避免每采样周期堆分配
-        let mut pending_writes: Vec<(u32, u32)> = Vec::with_capacity(24);
+        let mut pending_writes: Vec<(usize, u32)> = Vec::with_capacity(24);
         let mut cmd: Vec<u8> = Vec::with_capacity(read_part.len() + 24 * 10);
 
         let handle = thread::Builder::new()
@@ -198,8 +220,8 @@ impl PipelineEngine {
                     pending_writes.clear();
                     if let Ok(mut wq) = write_queue.lock() {
                         while pending_writes.len() < max_writes {
-                            if let Some((addr, data)) = wq.pop_front() {
-                                pending_writes.push((addr, data));
+                            if let Some((var_idx, value)) = wq.pop_front() {
+                                pending_writes.push((var_idx, value));
                             } else {
                                 break;
                             }
@@ -209,28 +231,54 @@ impl PipelineEngine {
                     // 构建 request 列表：[写入请求...] + [读取请求...]
                     // 写入: write TAR + write DRW (2 requests, 无返回数据)
                     // 读取: write TAR + read DRW (2 requests, 1 返回数据)
-                    let total_requests = requests.len() + pending_writes.len() * 2;
-                    // 安全断言：total_requests 必须在 u8 范围内
-                    debug_assert!(total_requests <= MAX_TRANSFER_REQUESTS);
-
+                    // 子字变量：用最近采样到的整字做读-改-写，只写变量的
+                    // 字节 lane，不踩相邻变量。被跳过的写入不计入头部总数
+                    // （固件按头部计数逐条解析请求字节，计数必须与字节一致）。
                     cmd.clear();
-                    // 头部（total_requests 含本次写入）
                     cmd.push(DAP_TRANSFER);
                     cmd.push(dap_index);
-                    cmd.push(total_requests as u8);
+                    let count_pos = cmd.len();
+                    cmd.push(0u8); // 头部第 3 字节：实际请求数，末尾回填
 
-                    // 先写入请求
-                    for &(addr, data) in &pending_writes {
-                        let w_tar = TransferRequest::write_ap(AP_REG_TAR, addr);
-                        let w_drw = TransferRequest::write_ap(AP_REG_DRW, data);
+                    let words_guard = last_words.lock().ok();
+                    let mut n_requests = 0usize;
+                    for &(var_idx, value) in &pending_writes {
+                        let Some(acc) = accesses.get(var_idx) else {
+                            log::warn!("写入请求被跳过：变量索引 {} 无对齐访问信息", var_idx);
+                            continue;
+                        };
+                        let write_data = if acc.mask == u32::MAX {
+                            value
+                        } else {
+                            let last = words_guard
+                                .as_ref()
+                                .and_then(|w| w.get(var_idx))
+                                .copied()
+                                .flatten();
+                            let Some(word) = last else {
+                                log::warn!(
+                                    "写入请求被跳过：变量 {} 尚未采样到所在整字，无法读-改-写",
+                                    var_idx
+                                );
+                                continue;
+                            };
+                            acc.merge(word, value)
+                        };
+                        let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
+                        let w_drw = TransferRequest::write_ap(AP_REG_DRW, write_data);
                         cmd.push(w_tar.request_byte());
-                        cmd.extend_from_slice(&addr.to_le_bytes());
+                        cmd.extend_from_slice(&acc.aligned_addr.to_le_bytes());
                         cmd.push(w_drw.request_byte());
-                        cmd.extend_from_slice(&data.to_le_bytes());
+                        cmd.extend_from_slice(&write_data.to_le_bytes());
+                        n_requests += 2;
                     }
 
                     // 再读取请求（复用预构建字节，跳过头部）
                     cmd.extend_from_slice(&read_part[3..]);
+                    n_requests += requests.len();
+                    debug_assert!(n_requests <= MAX_TRANSFER_REQUESTS);
+                    // 回填实际请求数
+                    cmd[count_pos] = n_requests as u8;
 
                     // --- 发送命令（200ms 超时）---
                     // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
@@ -278,9 +326,10 @@ impl PipelineEngine {
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
-        let addresses = self.addresses.clone();
-        let num_vars = addresses.len();
+        let accesses = self.accesses.clone();
+        let num_vars = accesses.len();
         let interval_us = self.interval_us;
+        let last_words = Arc::clone(&self.last_words);
         let in_flight = Arc::clone(&self.in_flight);
 
         let handle = thread::Builder::new()
@@ -354,8 +403,22 @@ impl PipelineEngine {
                         // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
                         let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
 
+                        // 记录各变量所在对齐整字的原始值（提交线程写子字变量
+                        // 时做读-改-写合并用），随后按 lane 提取变量值
+                        if let Ok(mut lw) = last_words.lock() {
+                            lw.resize(num_vars, None);
+                            for (i, &raw) in resp.values().iter().enumerate() {
+                                lw[i] = Some(raw);
+                            }
+                        }
+                        let mut vals = [0u32; MAX_VALUES];
+                        let n = resp.len.min(num_vars);
+                        for i in 0..n {
+                            vals[i] = accesses[i].extract(resp.data[i]);
+                        }
+
                         // 定长数组写入：零堆分配
-                        let sample = Sample::new(seq, timestamp_sec, &resp.data[..resp.len]);
+                        let sample = Sample::new(seq, timestamp_sec, &vals[..n]);
 
                         ring.push(sample);
                         seq += 1;
@@ -387,17 +450,19 @@ pub struct PipelineHandle {
     collect_handle: JoinHandle<()>,
     ring_buffer: Arc<RingBuffer>,
     running: Arc<AtomicBool>,
-    write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
+    write_queue: Arc<Mutex<VecDeque<(usize, u32)>>>,
 }
 
 impl PipelineHandle {
-    /// 推入一个写入请求（地址 + 数据）
+    /// 推入一个写入请求（变量索引 + 值）
     ///
     /// 提交线程会在下一个采样周期将此写入操作与读取操作合并为一条
     /// DAP_Transfer 命令，不影响正常采样。
-    pub fn queue_write(&self, address: u32, data: u32) {
+    /// 子字变量（u8/u16）由提交线程读-改-写：用最近采样到的对齐整字
+    /// 合并变量的字节 lane，不破坏相邻变量。
+    pub fn queue_write(&self, var_idx: usize, value: u32) {
         if let Ok(mut wq) = self.write_queue.lock() {
-            wq.push_back((address, data));
+            wq.push_back((var_idx, value));
         }
     }
 

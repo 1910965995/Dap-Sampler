@@ -3,6 +3,7 @@ use crate::error::*;
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::commands::*;
+use crate::dap::mem_access::MemAccess;
 
 /// SWD 链路层：封装 SWD 初始化和内存访问
 pub struct SwdLink {
@@ -332,6 +333,20 @@ impl SwdLink {
         }
 
         Ok(())
+    }
+
+    /// 写入一个变量（按字节大小 1/2/4）
+    ///
+    /// AHB-AP 不支持非对齐访问。子字变量（1/2 字节）读-改-写其所在的
+    /// 对齐整字，只更新变量的字节 lane，不破坏相邻变量。
+    pub fn write_variable(&self, address: u32, byte_size: u32, value: u32) -> Result<()> {
+        let acc = MemAccess::from_addr_size(address, byte_size);
+        if acc.mask == u32::MAX {
+            return self.write_memory(address, value);
+        }
+        let current = self.read_memory(acc.aligned_addr)?;
+        let merged = acc.merge(current, value);
+        self.write_memory(acc.aligned_addr, merged)
     }
 
     /// 读取内存并解析为 float

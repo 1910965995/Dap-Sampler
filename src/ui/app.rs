@@ -66,6 +66,9 @@ pub struct DapSamplerApp {
     swd_clock_mhz: u32,
     /// 当前采集的通道地址列表（与通道一一对应，用于 Watch 写入）
     current_addresses: Vec<u32>,
+    /// 当前采集的通道类型列表（与 current_addresses 一一对应，
+    /// 用于子字变量的对齐读写）
+    current_types: Vec<ValueType>,
     #[allow(dead_code)]
     target_count: Option<u64>,
     /// 波形显示模式
@@ -288,6 +291,7 @@ impl DapSamplerApp {
             rate_hz,
             swd_clock_mhz,
             current_addresses: Vec::new(),
+            current_types: Vec::new(),
             target_count,
             display_mode,
             window_size: 2000,
@@ -347,6 +351,7 @@ impl DapSamplerApp {
         self.manual_channel_names.clear();
         self.manual_value_types.clear();
         self.current_addresses.clear();
+        self.current_types.clear();
         // 参数回默认（与 DapSamplerApp::new 一致：5000 Hz / 2000 点 / 1 MHz / Line）
         self.rate_hz = 5000;
         self.interval_us = 1_000_000.0 / self.rate_hz as f64;
@@ -806,33 +811,35 @@ impl DapSamplerApp {
                 let types = self.manual_value_types.clone();
                 (self.manual_addresses.clone(), names, colors, types)
             } else {
-                // ELF 模式：从 channel_panel 动态获取
+                // ELF 模式：从 channel_panel 动态获取。
+                // 以"匹配成功"为单位收集 (通道, 地址)，保证 names/colors/
+                // types/addresses 四个列表始终一一对齐（匹配失败的通道整组跳过）
                 let channels = &self.channel_panel.channels;
                 if channels.is_empty() {
                     self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
                     return;
                 }
-
-                let addresses: Vec<u32> = channels
+                let matched: Vec<(&_, u32)> = channels
                     .iter()
                     .filter_map(|ch| {
                         self.elf_ctx.as_ref().and_then(|ctx| {
                             ctx.variables
                                 .iter()
                                 .find(|v| elf_var_matches(v, &ch.name))
-                                .map(|v| v.address)
+                                .map(|v| (ch, v.address))
                         })
                     })
                     .collect();
 
-                if addresses.is_empty() {
+                if matched.is_empty() {
                     self.set_error("Channels selected but no matching variable addresses found: check ELF symbols/debug info");
                     return;
                 }
 
-                let names: Vec<String> = channels.iter().map(|c| c.name.clone()).collect();
-                let colors: Vec<egui::Color32> = channels.iter().map(|c| c.color).collect();
-                let types: Vec<ValueType> = channels.iter().map(|c| c.value_type).collect();
+                let addresses: Vec<u32> = matched.iter().map(|(_, a)| *a).collect();
+                let names: Vec<String> = matched.iter().map(|(c, _)| c.name.clone()).collect();
+                let colors: Vec<egui::Color32> = matched.iter().map(|(c, _)| c.color).collect();
+                let types: Vec<ValueType> = matched.iter().map(|(c, _)| c.value_type).collect();
                 (addresses, names, colors, types)
             };
 
@@ -841,8 +848,9 @@ impl DapSamplerApp {
             return;
         }
 
-        // 保存当前通道地址列表（用于 Watch 写入）
+        // 保存当前通道地址/类型列表（用于 Watch 写入的子字对齐处理）
         let prev_addresses = std::mem::replace(&mut self.current_addresses, addresses.clone());
+        self.current_types = types.clone();
 
         // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
         if self.active_usb.is_none() {
@@ -895,6 +903,7 @@ impl DapSamplerApp {
             Arc::clone(self.active_usb.as_ref().unwrap()),
             DapProtocol::new(),
             addresses,
+            &types,
             self.rate_hz,
         );
 
@@ -989,7 +998,7 @@ impl DapSamplerApp {
         if let Some(ref handle) = self.pipeline {
             for w in &writes {
                 if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
-                    handle.queue_write(addr, w.raw_value);
+                    handle.queue_write(w.channel_idx, w.raw_value);
                     log::info!(
                         "已排队写入通道 {}: 0x{:08X} → 0x{:08X}",
                         w.channel_idx, w.raw_value, addr
@@ -1009,10 +1018,15 @@ impl DapSamplerApp {
                     }
                     for w in &writes {
                         if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
-                            match swd.write_memory(addr, w.raw_value) {
+                            let size = self
+                                .current_types
+                                .get(w.channel_idx)
+                                .map(|t| t.byte_size())
+                                .unwrap_or(4);
+                            match swd.write_variable(addr, size, w.raw_value) {
                                 Ok(()) => log::info!(
-                                    "已写入通道 {}: 0x{:08X} → 0x{:08X}",
-                                    w.channel_idx, w.raw_value, addr
+                                    "已写入通道 {}: 0x{:08X} → 0x{:08X} ({} bytes)",
+                                    w.channel_idx, w.raw_value, addr, size
                                 ),
                                 Err(e) => log::error!(
                                     "写入通道 {} 失败: {}", w.channel_idx, e

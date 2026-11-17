@@ -40,6 +40,15 @@ impl ValueType {
         }
     }
 
+    /// 类型字节大小（用于内存访问对齐）
+    pub fn byte_size(&self) -> u32 {
+        match self {
+            ValueType::Float | ValueType::Int32 | ValueType::Uint32 => 4,
+            ValueType::Int16 | ValueType::Uint16 => 2,
+            ValueType::Int8 | ValueType::Uint8 => 1,
+        }
+    }
+
     /// 将 u32 原始值按本类型转换为 f64
     pub fn to_f64(&self, raw: u32) -> f64 {
         match self {
@@ -109,5 +118,29 @@ impl Sample {
             let t = types.get(i).copied().unwrap_or(ValueType::Float);
             t.to_f64(v)
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_size_matches_type_width() {
+        assert_eq!(ValueType::Float.byte_size(), 4);
+        assert_eq!(ValueType::Int32.byte_size(), 4);
+        assert_eq!(ValueType::Uint32.byte_size(), 4);
+        assert_eq!(ValueType::Int16.byte_size(), 2);
+        assert_eq!(ValueType::Uint16.byte_size(), 2);
+        assert_eq!(ValueType::Int8.byte_size(), 1);
+        assert_eq!(ValueType::Uint8.byte_size(), 1);
+    }
+
+    #[test]
+    fn to_f64_u16_reads_low_lane_of_word() {
+        // MemAccess.extract 产出的值低位对齐：u16 类型只解释低 16 位
+        assert_eq!(ValueType::Uint16.to_f64(0x2222_1111), 0x1111 as f64);
+        assert_eq!(ValueType::Int16.to_f64(0x0000_FFFF), -1.0);
+        assert_eq!(ValueType::Uint8.to_f64(0xFFFF_FF22), 0x22 as f64);
     }
 }

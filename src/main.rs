@@ -555,9 +555,10 @@ fn cmd_sample(
         println!("   输出:   {}", path);
     }
 
-    // 创建引擎并启动
+    // 创建引擎并启动（CLI 模式无类型概念，全部按 u32 整字访问）
     let usb = Arc::new(usb);
-    let engine = PipelineEngine::new(usb, dap, addresses.clone(), rate);
+    let types = vec![dap_sampler::pipeline::sample::ValueType::Uint32; addresses.len()];
+    let engine = PipelineEngine::new(usb, dap, addresses.clone(), &types, rate);
     let handle = engine.start(dap_sampler::ui::controls::DEFAULT_BUFFER_CAPACITY)?;
 
     // 准备输出

@@ -1,3 +1,4 @@
+use super::text::layout_elided;
 use crate::pipeline::sample::ValueType;
 
 /// 待写入 MCU 的请求（通道索引 + 原始值）
@@ -654,27 +655,6 @@ fn draw_column_resizers(
             ui.painter().vline(x, top..=bottom, egui::Stroke::new(2.0, ACCENT));
         }
     }
-}
-
-/// 单行布局文本，超宽时以 "…" 截断。
-///
-/// 使用 epaint 的 `TextWrapping`（`max_rows = 1`）做真正的字形级截断，
-/// 避免 `painter.text` 不裁剪导致文本溢出到相邻列。
-fn layout_elided(
-    ctx: &egui::Context,
-    text: &str,
-    max_w: f32,
-    font: egui::FontId,
-    color: egui::Color32,
-) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
-    job.wrap = egui::text::TextWrapping {
-        max_width: max_w.max(1.0),
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
-    };
-    ctx.fonts(|f| f.layout_job(job))
 }
 
 /// 解析用户输入的值字符串，返回原始 u32

@@ -1,5 +1,6 @@
 pub mod display_buffer;
 pub mod cursor;
+pub mod text;
 pub mod waveform;
 pub mod controls;
 pub mod app;

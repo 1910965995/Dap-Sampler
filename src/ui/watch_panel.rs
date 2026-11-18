@@ -207,6 +207,9 @@ impl WatchPanel {
             .id_salt("watch_table_scroll")
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, _viewport| {
+                // 行与行紧贴：默认 item_spacing.y = 3 会在每行后插入间隙
+                ui.spacing_mut().item_spacing.y = 0.0;
+
                 // ---- 表头 ----
                 let (hdr_rect, _) = ui.allocate_exact_size(
                     egui::Vec2::new(total_w, header_h),
@@ -515,6 +518,10 @@ impl WatchPanel {
 
                     // 行网格线
                     paint_grid(ui.painter(), row_rect, &col_widths, border);
+
+                    // 各单元格的 allocate_new_ui 会按缩小后的内嵌矩形推进父级游标
+                    // （每格回退约 1px），显式把游标拉回整行底边，否则行会逐行重叠。
+                    ui.advance_cursor_after_rect(row_rect);
                 }
             });
 
@@ -748,6 +755,51 @@ mod tests {
             name_shape.galley.size().x,
             budget
         );
+    }
+
+    #[test]
+    fn rows_are_packed_without_vertical_gaps() {
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &[ValueType::Uint32; 3],
+            &[0x2000_0000, 0x2000_0004, 0x2000_0008],
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_min_width(DEFAULT_COL_WIDTHS.iter().sum::<f32>() + 40.0);
+                panel.show(ui, &[]);
+            });
+        });
+
+        // 取三行 Name 文本的 y 坐标，行距应恰好等于 row_h（无额外间隙）
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        let mut ys: Vec<f32> = ["a", "b", "c"]
+            .iter()
+            .filter_map(|name| {
+                texts
+                    .iter()
+                    .find(|t| t.galley.job.text == *name)
+                    .map(|t| t.pos.y)
+            })
+            .collect();
+        assert_eq!(ys.len(), 3, "expected all three rows painted");
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let row_h = 24.0;
+        for pair in ys.windows(2) {
+            let step = pair[1] - pair[0];
+            assert!(
+                (step - row_h).abs() < 0.5,
+                "row step {step} should equal row height {row_h} (no gap)"
+            );
+        }
     }
 
     #[test]

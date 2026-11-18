@@ -347,6 +347,7 @@ impl DapSamplerApp {
         self.variable_browser.clear();
         self.channel_panel.channels.clear();
         self.watch_panel.entries.clear();
+        self.watch_panel.reset_col_widths();
         self.manual_addresses.clear();
         self.manual_channel_names.clear();
         self.manual_value_types.clear();
@@ -444,6 +445,7 @@ impl DapSamplerApp {
             window_size: self.controls.window_size,
             buffer_capacity: self.buffer_capacity,
             display_mode: self.waveform.display_mode().label().to_string(),
+            watch_col_widths: self.watch_panel.col_widths().to_vec(),
             variables: self
                 .watch_panel
                 .entries
@@ -640,6 +642,8 @@ impl DapSamplerApp {
             entry.y_scale = pv.y_scale;
             entry.remark = pv.remark.clone();
         }
+        // 4.5 恢复 Watch 列宽（旧版工程无此字段时为默认宽度；非法值在面板内夹紧）
+        self.watch_panel.set_col_widths(&file.watch_col_widths);
 
         // 5. 恢复全局参数（controls 与 app 字段、waveform 三方同步）
         self.controls.sample_rate = file.sample_rate_hz

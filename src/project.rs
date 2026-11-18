@@ -26,6 +26,9 @@ pub struct ProjectFile {
     pub buffer_capacity: usize,
     /// 波形显示模式（小写："line" / "point"）
     pub display_mode: String,
+    /// Watch 面板列宽（px，按 Name/Address/.../Remark 列顺序）
+    #[serde(default = "default_watch_col_widths")]
+    pub watch_col_widths: Vec<f32>,
     /// 变量列表（Watch 通道）
     pub variables: Vec<ProjectVariable>,
 }
@@ -52,6 +55,11 @@ pub struct ProjectVariable {
 /// 旧版工程文件缺失 buffer_capacity 字段时的默认值（serde default 用）
 fn default_buffer_capacity() -> usize {
     crate::ui::controls::DEFAULT_BUFFER_CAPACITY
+}
+
+/// 旧版工程文件缺失 watch_col_widths 字段时的默认列宽（serde default 用）
+fn default_watch_col_widths() -> Vec<f32> {
+    crate::ui::watch_panel::DEFAULT_COL_WIDTHS.to_vec()
 }
 
 impl ProjectFile {
@@ -114,6 +122,7 @@ mod tests {
             window_size: 2000,
             buffer_capacity: 200_000,
             display_mode: "line".to_string(),
+            watch_col_widths: crate::ui::watch_panel::DEFAULT_COL_WIDTHS.to_vec(),
             variables: vec![
                 ProjectVariable {
                     name: "pid.kp".to_string(),
@@ -213,6 +222,33 @@ mod tests {
             let s = vt.label().to_string();
             assert_eq!(ValueType::parse(&s).unwrap(), vt);
         }
+    }
+
+    #[test]
+    fn watch_col_widths_round_trip() {
+        let mut file = sample_file();
+        file.watch_col_widths = vec![200.0, 100.0, 80.0, 120.0, 90.0, 100.0, 100.0, 260.0];
+        let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
+        assert_eq!(restored.watch_col_widths, file.watch_col_widths);
+    }
+
+    #[test]
+    fn old_project_without_watch_col_widths_gets_defaults() {
+        // 模拟旧版工程 JSON（无 watch_col_widths 字段）
+        let json = r#"{
+            "version": 1,
+            "elf_path": null,
+            "sample_rate_hz": 5000,
+            "swd_clock_mhz": 10,
+            "window_size": 2000,
+            "display_mode": "line",
+            "variables": []
+        }"#;
+        let restored = ProjectFile::from_json(json).unwrap();
+        assert_eq!(
+            restored.watch_col_widths,
+            crate::ui::watch_panel::DEFAULT_COL_WIDTHS.to_vec()
+        );
     }
 
     #[test]

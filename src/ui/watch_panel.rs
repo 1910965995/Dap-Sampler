@@ -40,8 +40,73 @@ pub struct WatchEntry {
     remark_buffer: String,
 }
 
-/// 默认列宽 (px): Name | Address | Type | Value | Refresh (s) | Y Offset | Y Scale | Remark
-const DEFAULT_COL_WIDTHS: [f32; 8] = [130.0, 112.5, 100.0, 130.0, 80.0, 120.0, 120.0, 240.0];
+// ===== 表格几何与视觉常量 =====
+
+/// 数据行高度（px，固定不随内容变化）
+const ROW_H: f32 = 24.0;
+/// 表头高度（px）
+const HEADER_H: f32 = 26.0;
+/// 单元格左右内边距（px）
+const CELL_PAD_X: f32 = 8.0;
+/// Name 列左侧通道色条宽度（px）
+const COLOR_BAR_W: f32 = 4.0;
+/// 列分隔线拖拽热区宽度（px；视觉线宽仍为 1px）
+const RESIZE_HIT_W: f32 = 7.0;
+/// 列宽上限（px）
+const MAX_COL_W: f32 = 600.0;
+
+/// 列定义：标题 + 宽度约束（列布局的单一事实来源）
+struct ColumnSpec {
+    title: &'static str,
+    default_w: f32,
+    min_w: f32,
+}
+
+/// 8 列：Name | Address | Type | Value | Refresh (s) | Y Offset | Y Scale | Remark
+const COLUMNS: [ColumnSpec; 8] = [
+    ColumnSpec { title: "Name", default_w: 150.0, min_w: 70.0 },
+    ColumnSpec { title: "Address", default_w: 110.0, min_w: 80.0 },
+    ColumnSpec { title: "Type", default_w: 90.0, min_w: 60.0 },
+    ColumnSpec { title: "Value", default_w: 130.0, min_w: 70.0 },
+    ColumnSpec { title: "Refresh (s)", default_w: 90.0, min_w: 70.0 },
+    ColumnSpec { title: "Y Offset", default_w: 100.0, min_w: 70.0 },
+    ColumnSpec { title: "Y Scale", default_w: 100.0, min_w: 70.0 },
+    ColumnSpec { title: "Remark", default_w: 240.0, min_w: 100.0 },
+];
+
+/// 默认列宽（从 `COLUMNS` 派生；随工程保存/恢复）
+pub const DEFAULT_COL_WIDTHS: [f32; 8] = default_col_widths();
+
+const fn default_col_widths() -> [f32; 8] {
+    let mut out = [0.0; COLUMNS.len()];
+    let mut i = 0;
+    while i < COLUMNS.len() {
+        out[i] = COLUMNS[i].default_w;
+        i += 1;
+    }
+    out
+}
+
+// 视觉常量（浅色主题，与 app 其它面板同色系）
+const TEXT_DARK: egui::Color32 = egui::Color32::from_rgb(45, 48, 55);
+const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x76, 0x82);
+const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(238, 240, 244);
+const STRIPE_BG: egui::Color32 = egui::Color32::from_rgb(249, 250, 251);
+/// 可编辑单元格悬停底色
+const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(240, 244, 250);
+/// 通道色条缺省色（无对应通道时）
+const BAR_FALLBACK: egui::Color32 = egui::Color32::from_rgb(160, 160, 160);
+/// 网格线：1px 浅灰（整表只描一次，保证横竖等粗）
+const GRID_STROKE: egui::Stroke = egui::Stroke {
+    width: 1.0,
+    color: egui::Color32::from_rgb(0xE0, 0xE2, 0xE6),
+};
+/// 强调色（列分隔线悬停高亮 / 单元格聚焦框）
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 130, 200);
+
+const TITLE_FONT: egui::FontId = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+const HEADER_FONT: egui::FontId = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+const CELL_FONT: egui::FontId = egui::FontId::new(12.0, egui::FontFamily::Proportional);
 
 /// Watch 面板（示波器下方）
 ///
@@ -53,6 +118,8 @@ const DEFAULT_COL_WIDTHS: [f32; 8] = [130.0, 112.5, 100.0, 130.0, 80.0, 120.0, 1
 /// - 可配置的刷新周期
 /// - 可配置的 Y Offset / Y Scale（应用于波形图）
 /// - 用户自定义备注
+///
+/// 表格样式：行高固定，列宽可拖拽调整（随工程保存）。
 pub struct WatchPanel {
     /// 变量列表
     pub entries: Vec<WatchEntry>,
@@ -60,6 +127,8 @@ pub struct WatchPanel {
     pending_writes: Vec<WriteRequest>,
     /// 已提交但尚未被外部拉取的 (channel_name, y_offset, y_scale) 列表
     pub dirty_transforms: Vec<(String, f32, f32)>,
+    /// 各列宽度（px），拖拽列分隔线调整；随工程文件保存
+    col_widths: Vec<f32>,
 }
 
 impl WatchPanel {
@@ -68,7 +137,30 @@ impl WatchPanel {
             entries: Vec::new(),
             pending_writes: Vec::new(),
             dirty_transforms: Vec::new(),
+            col_widths: DEFAULT_COL_WIDTHS.to_vec(),
         }
+    }
+
+    /// 当前列宽（px）
+    pub fn col_widths(&self) -> &[f32] {
+        &self.col_widths
+    }
+
+    /// 设置列宽（来自工程文件）。
+    ///
+    /// 宽容策略：长度不足的列保持当前值；NaN/Inf 忽略；越界值夹紧到 [min_w, MAX_COL_W]。
+    pub fn set_col_widths(&mut self, widths: &[f32]) {
+        for (i, slot) in self.col_widths.iter_mut().enumerate() {
+            let Some(&w) = widths.get(i) else { break };
+            if w.is_finite() {
+                *slot = w.clamp(COLUMNS[i].min_w, MAX_COL_W);
+            }
+        }
+    }
+
+    /// 列宽恢复默认
+    pub fn reset_col_widths(&mut self) {
+        self.col_widths = DEFAULT_COL_WIDTHS.to_vec();
     }
 
     /// 设置 Watch 列表（与示波器通道同步）
@@ -153,16 +245,17 @@ impl WatchPanel {
         std::mem::take(&mut self.dirty_transforms)
     }
 
-    /// 渲染 Watch 面板（Excel 风格带边框表格）
+    /// 渲染 Watch 面板（固定行高的细网格表格，列宽可拖拽调整）
+    ///
     /// `channel_colors` 与 entries 一一对应，用于 Name 列色条。
     pub fn show(&mut self, ui: &mut egui::Ui, channel_colors: &[egui::Color32]) {
         // 顶部标题
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Watch Window")
-                    .font(egui::FontId::proportional(13.0))
+                    .font(TITLE_FONT)
                     .strong()
-                    .color(egui::Color32::from_rgb(45, 48, 55)),
+                    .color(TEXT_DARK),
             );
         });
         ui.add_space(2.0);
@@ -171,33 +264,17 @@ impl WatchPanel {
             // 居中空状态提示（与波形区 Waiting for data... 样式一致）
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.35);
-                ui.label(
-                    egui::RichText::new("No watch variables")
-                        .size(14.0)
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
-                );
+                ui.label(egui::RichText::new("No watch variables").size(14.0).color(TEXT_MUTED));
                 ui.label(
                     egui::RichText::new("Import ELF or add channels to start watching")
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                        .color(TEXT_MUTED),
                 );
             });
             return;
         }
 
-        let col_widths: [f32; 8] = DEFAULT_COL_WIDTHS;
-        let row_h = 24.0;
-        let header_h = 26.0;
-        let total_w: f32 = col_widths.iter().sum();
-        let color_bar_w = 4.0;
-
-        let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(205, 205, 210));
-        let header_bg = egui::Color32::from_rgb(238, 240, 244);
-        let stripe_bg = egui::Color32::from_rgb(249, 250, 251);
-        let text_dark = egui::Color32::from_rgb(45, 48, 55);
-        let _text_blue = egui::Color32::from_rgb(70, 130, 200);
-        let _text_amber = egui::Color32::from_rgb(170, 110, 30);
-
+        let mut col_widths = self.col_widths.clone();
         // 收集本帧产生的写入请求
         let mut new_writes: Vec<WriteRequest> = Vec::new();
         // 收集本帧提交的 y_offset/y_scale 变更（用局部缓冲避开 self 的可变借用冲突）
@@ -210,321 +287,186 @@ impl WatchPanel {
                 // 行与行紧贴：默认 item_spacing.y = 3 会在每行后插入间隙
                 ui.spacing_mut().item_spacing.y = 0.0;
 
+                let total_w: f32 = col_widths.iter().sum();
+                // 列左偏移（前缀和）：表头与数据行共用
+                let col_x = prefix_sums(&col_widths);
+                let cell = |row: egui::Rect, i: usize| {
+                    egui::Rect::from_min_size(
+                        egui::Pos2::new(row.left() + col_x[i], row.top()),
+                        egui::Vec2::new(col_widths[i], row.height()),
+                    )
+                };
+
                 // ---- 表头 ----
                 let (hdr_rect, _) = ui.allocate_exact_size(
-                    egui::Vec2::new(total_w, header_h),
+                    egui::Vec2::new(total_w, HEADER_H),
                     egui::Sense::hover(),
                 );
-                ui.painter().rect_filled(hdr_rect, 0.0, header_bg);
-                let headers = ["Name", "Address", "Type", "Value", "Refresh (s)", "Y Offset", "Y Scale", "Remark"];
-                let mut x = hdr_rect.left();
-                for (i, h) in headers.iter().enumerate() {
-                    let cell = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, hdr_rect.top()),
-                        egui::Vec2::new(col_widths[i], header_h),
-                    );
-                    ui.painter().text(
-                        cell.left_center() + egui::Vec2::new(8.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        *h,
-                        egui::FontId::proportional(12.5),
-                        text_dark,
-                    );
-                    x += col_widths[i];
+                ui.painter().rect_filled(hdr_rect, 0.0, HEADER_BG);
+                for (i, col) in COLUMNS.iter().enumerate() {
+                    paint_text_cell(ui, cell(hdr_rect, i), col.title, &HEADER_FONT, TEXT_DARK);
                 }
-                paint_grid(ui.painter(), hdr_rect, &col_widths, border);
 
                 // ---- 数据行 ----
+                let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(self.entries.len());
                 for (row_idx, entry) in self.entries.iter_mut().enumerate() {
                     let (row_rect, _) = ui.allocate_exact_size(
-                        egui::Vec2::new(total_w, row_h),
+                        egui::Vec2::new(total_w, ROW_H),
                         egui::Sense::hover(),
                     );
+                    row_rects.push(row_rect);
 
                     // 斑马纹背景
                     if row_idx % 2 == 1 {
-                        ui.painter().rect_filled(row_rect, 0.0, stripe_bg);
+                        ui.painter().rect_filled(row_rect, 0.0, STRIPE_BG);
                     }
 
                     // 左侧通道色条
                     let ch_color = channel_colors
                         .get(row_idx)
                         .copied()
-                        .unwrap_or(egui::Color32::from_rgb(160, 160, 160));
+                        .unwrap_or(BAR_FALLBACK);
                     let bar = egui::Rect::from_min_size(
                         egui::Pos2::new(row_rect.left(), row_rect.top() + 2.0),
-                        egui::Vec2::new(color_bar_w, row_h - 4.0),
+                        egui::Vec2::new(COLOR_BAR_W, ROW_H - 4.0),
                     );
                     ui.painter().rect_filled(bar, 1.5, ch_color);
 
-                    let mut x = row_rect.left();
-
-                    // Name（过长时按像素宽度截断并加省略号，避免溢出到 Address 列）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[0], row_h),
-                    );
-                    let text_left = 8.0 + color_bar_w;
-                    let name_font = egui::FontId::proportional(12.0);
-                    let name_galley = layout_elided(
-                        ui.ctx(),
-                        &entry.name,
-                        (r.width() - text_left - 8.0).max(0.0),
-                        name_font,
-                        text_dark,
-                    );
-                    if name_galley.elided {
-                        // 被截断时悬停显示完整名称
-                        ui.interact(
-                            r,
-                            ui.id().with(("watch_name_hover", row_idx)),
-                            egui::Sense::hover(),
-                        )
-                        .on_hover_text(&entry.name);
+                    // Name（过长时截断加省略号，避免溢出到 Address 列）
+                    {
+                        let r = cell(row_rect, 0);
+                        let text_left = CELL_PAD_X + COLOR_BAR_W;
+                        let galley = layout_elided(
+                            ui.ctx(),
+                            &entry.name,
+                            (r.width() - text_left - CELL_PAD_X).max(1.0),
+                            CELL_FONT.clone(),
+                            TEXT_DARK,
+                        );
+                        if galley.elided {
+                            // 截断时悬停显示完整名称
+                            ui.interact(
+                                r,
+                                ui.id().with(("watch_name_hover", row_idx)),
+                                egui::Sense::hover(),
+                            )
+                            .on_hover_text(&entry.name);
+                        }
+                        let pos = egui::Pos2::new(
+                            r.left() + text_left,
+                            r.center().y - galley.size().y * 0.5,
+                        );
+                        ui.painter()
+                            .with_clip_rect(r)
+                            .galley(pos, galley, TEXT_DARK);
                     }
-                    let name_pos = egui::Pos2::new(
-                        r.left() + text_left,
-                        r.center().y - name_galley.size().y * 0.5,
-                    );
-                    let painter = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
-                    painter.galley(name_pos, name_galley, text_dark);
-                    x += col_widths[0];
 
-                    // Address (只读显示, 16 进制)
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[1], row_h),
-                    );
-                    let addr_str = if entry.address == 0 {
-                        "--".to_string()
-                    } else {
-                        format!("0x{:08X}", entry.address)
-                    };
-                    ui.painter().text(
-                        r.left_center() + egui::Vec2::new(8.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        addr_str,
-                        egui::FontId::proportional(12.0),
-                        text_dark,
-                    );
-                    x += col_widths[1];
+                    // Address（只读，16 进制）
+                    {
+                        let addr = if entry.address == 0 {
+                            "--".to_string()
+                        } else {
+                            format!("0x{:08X}", entry.address)
+                        };
+                        paint_text_cell(ui, cell(row_rect, 1), &addr, &CELL_FONT, TEXT_DARK);
+                    }
 
-                    // Type
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[2], row_h),
-                    );
-                    ui.painter().text(
-                        r.left_center() + egui::Vec2::new(8.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
+                    // Type（只读）
+                    paint_text_cell(
+                        ui,
+                        cell(row_rect, 2),
                         entry.value_type.label(),
-                        egui::FontId::proportional(12.0),
-                        text_dark,
+                        &CELL_FONT,
+                        TEXT_DARK,
                     );
-                    x += col_widths[2];
 
-                    // Value（可编辑文本框）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[3], row_h),
+                    // Value（可编辑，回车写入 MCU）
+                    {
+                        let hint =
+                            egui::RichText::new(&entry.display_value).color(TEXT_DARK);
+                        let resp =
+                            edit_cell(ui, cell(row_rect, 3), &mut entry.edit_buffer, hint);
+                        if resp.lost_focus()
+                            && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            if let Some(raw) = parse_value(&entry.edit_buffer, entry.value_type) {
+                                new_writes.push(WriteRequest {
+                                    channel_idx: row_idx,
+                                    raw_value: raw,
+                                });
+                                entry.display_value = format_value(raw, entry.value_type);
+                            }
+                            entry.edit_buffer.clear();
+                            entry.editing = false;
+                        }
+                        if resp.gained_focus() {
+                            entry.editing = true;
+                            entry.edit_buffer = entry.display_value.clone();
+                        }
+                        if resp.lost_focus() {
+                            entry.editing = false;
+                            entry.edit_buffer.clear();
+                        }
+                    }
+
+                    // Refresh（秒，必须 > 0）
+                    number_cell(
+                        ui,
+                        cell(row_rect, 4),
+                        &mut entry.refresh_buffer,
+                        &mut entry.refresh_period_s,
+                        "s",
+                        |v| v > 0.0,
                     );
-                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.edit_buffer)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .text_color(text_dark)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text(
-                                        egui::RichText::new(&entry.display_value)
-                                            .color(text_dark)
-                                            .family(egui::FontFamily::Proportional)
-                                            .size(12.0),
-                                    ),
-                            );
 
-                            if resp.lost_focus()
-                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                if let Some(raw) = parse_value(&entry.edit_buffer, entry.value_type) {
-                                    new_writes.push(WriteRequest {
-                                        channel_idx: row_idx,
-                                        raw_value: raw,
-                                    });
-                                    entry.display_value = format_value(raw, entry.value_type);
-                                }
-                                entry.edit_buffer.clear();
-                                entry.editing = false;
-                            }
+                    // Y Offset（任意浮点，提交后同步波形图）
+                    if number_cell(
+                        ui,
+                        cell(row_rect, 5),
+                        &mut entry.y_offset_buffer,
+                        &mut entry.y_offset,
+                        "off",
+                        |_| true,
+                    ) {
+                        new_transforms
+                            .push((entry.name.clone(), entry.y_offset, entry.y_scale));
+                    }
 
-                            if resp.gained_focus() {
-                                entry.editing = true;
-                                entry.edit_buffer = entry.display_value.clone();
-                            }
-                            if resp.lost_focus() {
-                                entry.editing = false;
-                                entry.edit_buffer.clear();
-                            }
-                        });
-                    });
-                    x += col_widths[3];
+                    // Y Scale（禁止 0，允许负数）
+                    if number_cell(
+                        ui,
+                        cell(row_rect, 6),
+                        &mut entry.y_scale_buffer,
+                        &mut entry.y_scale,
+                        "scale",
+                        |v| v != 0.0,
+                    ) {
+                        new_transforms
+                            .push((entry.name.clone(), entry.y_offset, entry.y_scale));
+                    }
 
-                    // Refresh（文本输入框，单位秒）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[4], row_h),
-                    );
-                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if entry.refresh_buffer.is_empty() {
-                                entry.refresh_buffer = format!("{:.3}", entry.refresh_period_s);
-                            }
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.refresh_buffer)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .text_color(text_dark)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("s"),
-                            );
-                            if resp.lost_focus()
-                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                if let Ok(v) = entry.refresh_buffer.trim().parse::<f32>() {
-                                    if v > 0.0 {
-                                        entry.refresh_period_s = v;
-                                    }
-                                }
-                                entry.refresh_buffer = format!("{:.3}", entry.refresh_period_s);
-                            }
-                            if resp.lost_focus() && !entry.refresh_buffer.is_empty() {
-                                entry.refresh_buffer = format!("{:.3}", entry.refresh_period_s);
-                            }
-                        });
-                    });
-                    x += col_widths[4];
-
-                    // Y Offset（文本输入框）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[5], row_h),
-                    );
-                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if entry.y_offset_buffer.is_empty() {
-                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
-                            }
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.y_offset_buffer)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .text_color(text_dark)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("off"),
-                            );
-                            // Enter 提交
-                            if resp.lost_focus()
-                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                if let Ok(v) = entry.y_offset_buffer.trim().parse::<f32>() {
-                                    entry.y_offset = v;
-                                    new_transforms.push((
-                                        entry.name.clone(),
-                                        entry.y_offset,
-                                        entry.y_scale,
-                                    ));
-                                }
-                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
-                            }
-                            // 失焦（非 Enter 也触发）reformat
-                            if resp.lost_focus() && !entry.y_offset_buffer.is_empty() {
-                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
-                            }
-                        });
-                    });
-                    x += col_widths[5];
-
-                    // Y Scale（文本输入框，禁止 0）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[6], row_h),
-                    );
-                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if entry.y_scale_buffer.is_empty() {
-                                entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
-                            }
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.y_scale_buffer)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .text_color(text_dark)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("scale"),
-                            );
-                            // Enter 提交（禁止 0）
-                            if resp.lost_focus()
-                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                if let Ok(v) = entry.y_scale_buffer.trim().parse::<f32>() {
-                                    if v != 0.0 {
-                                        entry.y_scale = v;
-                                        new_transforms.push((
-                                            entry.name.clone(),
-                                            entry.y_offset,
-                                            entry.y_scale,
-                                        ));
-                                    }
-                                    // 解析为 0 时保留旧值并 reformat
-                                    entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
-                                } else {
-                                    // 解析失败：保留旧值并 reformat
-                                    entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
-                                }
-                            }
-                            // 失焦（非 Enter 也触发）reformat
-                            if resp.lost_focus() && !entry.y_scale_buffer.is_empty() {
-                                entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
-                            }
-                        });
-                    });
-                    x += col_widths[6];
-
-                    // Remark（用户自定义备注, 可编辑文本框, 不参与写入 MCU）
-                    let r = egui::Rect::from_min_size(
-                        egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[7], row_h),
-                    );
-                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.remark_buffer)
-                                    .font(egui::FontId::proportional(12.0))
-                                    .text_color(text_dark)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text(&entry.remark),
-                            );
-                            // Enter 或失焦时把 buffer 写入 remark
-                            // （(失焦且 Enter) || 失焦 ≡ 失焦）
-                            if resp.lost_focus() && !entry.remark_buffer.is_empty() {
-                                entry.remark = entry.remark_buffer.clone();
-                                entry.remark_buffer.clear();
-                            }
-                        });
-                    });
-                    x += col_widths[7];
-
-                    // 行网格线
-                    paint_grid(ui.painter(), row_rect, &col_widths, border);
-
-                    // 各单元格的 allocate_new_ui 会按缩小后的内嵌矩形推进父级游标
-                    // （每格回退约 1px），显式把游标拉回整行底边，否则行会逐行重叠。
-                    ui.advance_cursor_after_rect(row_rect);
+                    // Remark（本地备注，失焦或回车时写入字段）
+                    {
+                        let hint =
+                            egui::RichText::new(entry.remark.as_str()).color(TEXT_MUTED);
+                        let resp =
+                            edit_cell(ui, cell(row_rect, 7), &mut entry.remark_buffer, hint);
+                        // (失焦且 Enter) || 失焦 ≡ 失焦
+                        if resp.lost_focus() && !entry.remark_buffer.is_empty() {
+                            entry.remark = entry.remark_buffer.clone();
+                            entry.remark_buffer.clear();
+                        }
+                    }
                 }
+
+                // ---- 网格：整表只描一次，共享边界不重复（否则行线会叠成 2px）----
+                paint_table_grid(ui.painter(), hdr_rect, &row_rects, &col_widths, GRID_STROKE);
+
+                // ---- 列宽拖拽 ----
+                draw_column_resizers(ui, hdr_rect, &row_rects, &mut col_widths);
             });
 
+        self.col_widths = col_widths;
         // 将本帧产生的写入请求加入队列
         self.pending_writes.extend(new_writes);
         // 将本帧提交的 y_offset/y_scale 变更加入队列
@@ -538,18 +480,179 @@ impl Default for WatchPanel {
     }
 }
 
-/// 绘制表格网格线（外框 + 列分隔线）
-fn paint_grid(painter: &egui::Painter, rect: egui::Rect, col_widths: &[f32], stroke: egui::Stroke) {
-    // 外框
-    painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-    // 列分隔竖线
-    let mut x = rect.left();
-    for &w in col_widths.iter().take(col_widths.len() - 1) {
-        x += w;
-        painter.line_segment(
-            [egui::Pos2::new(x, rect.top()), egui::Pos2::new(x, rect.bottom())],
-            stroke,
+/// 前缀和：返回各列左边界相对表左的偏移
+fn prefix_sums(widths: &[f32]) -> Vec<f32> {
+    widths
+        .iter()
+        .scan(0.0, |acc, &w| {
+            let x = *acc;
+            *acc += w;
+            Some(x)
+        })
+        .collect()
+}
+
+/// 只读文本单元格：左对齐 + 垂直居中，超宽截断加省略号
+fn paint_text_cell(
+    ui: &egui::Ui,
+    cell: egui::Rect,
+    text: &str,
+    font: &egui::FontId,
+    color: egui::Color32,
+) {
+    let galley = layout_elided(
+        ui.ctx(),
+        text,
+        (cell.width() - CELL_PAD_X * 2.0).max(1.0),
+        font.clone(),
+        color,
+    );
+    let pos = egui::Pos2::new(cell.left() + CELL_PAD_X, cell.center().y - galley.size().y * 0.5);
+    ui.painter().with_clip_rect(cell).galley(pos, galley, color);
+}
+
+/// 可编辑单元格：无边框文本框（表格风格）。
+///
+/// 悬停淡蓝底色提示可编辑；聚焦时描强调色细框。控件无边框无内边距，
+/// 高度不超出行高，保证行高固定。
+fn edit_cell(
+    ui: &mut egui::Ui,
+    cell: egui::Rect,
+    buffer: &mut String,
+    hint: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    if ui.rect_contains_pointer(cell) {
+        ui.painter().rect_filled(cell, 0.0, HOVER_BG);
+    }
+    let content = cell.shrink2(egui::Vec2::new(CELL_PAD_X, 0.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let resp = child.add(
+        egui::TextEdit::singleline(buffer)
+            .font(CELL_FONT.clone())
+            .frame(false)
+            .margin(egui::Margin::ZERO)
+            .text_color(TEXT_DARK)
+            .desired_width(f32::INFINITY)
+            .hint_text(hint),
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            cell,
+            0.0,
+            egui::Stroke::new(1.5, ACCENT),
+            egui::StrokeKind::Inside,
         );
+    }
+    resp
+}
+
+/// 数字输入单元格：Enter 提交（`accept` 决定是否接受），失焦回填格式化值。
+///
+/// 返回 true 表示本次提交成功（值已更新）。空 buffer 时惰性回填当前值。
+fn number_cell(
+    ui: &mut egui::Ui,
+    cell: egui::Rect,
+    buffer: &mut String,
+    value: &mut f32,
+    hint: &str,
+    accept: impl Fn(f32) -> bool,
+) -> bool {
+    if buffer.is_empty() {
+        *buffer = format!("{:.3}", *value);
+    }
+    let resp = edit_cell(ui, cell, buffer, hint);
+    if resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+        let committed = buffer
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|&v| accept(v))
+            .is_some_and(|v| {
+                *value = v;
+                true
+            });
+        *buffer = format!("{:.3}", *value);
+        return committed;
+    }
+    // 失焦（非 Enter 也触发）reformat
+    if resp.lost_focus() && !buffer.is_empty() {
+        *buffer = format!("{:.3}", *value);
+    }
+    false
+}
+
+/// 绘制整张表格的网格线（外框 + 列分隔竖线 + 行分隔横线）。
+///
+/// 只画一次：相邻行共享的边界若各自描边会叠成 2px 粗线（旧实现的问题）。
+/// epaint 对轴向 1px 线做像素对齐，横竖线视觉等粗。
+fn paint_table_grid(
+    painter: &egui::Painter,
+    hdr_rect: egui::Rect,
+    row_rects: &[egui::Rect],
+    col_widths: &[f32],
+    stroke: egui::Stroke,
+) {
+    let Some(last_row) = row_rects.last() else { return };
+    let table = egui::Rect::from_min_max(
+        hdr_rect.min,
+        egui::Pos2::new(hdr_rect.right(), last_row.bottom()),
+    );
+
+    // 外框
+    painter.rect_stroke(table, 0.0, stroke, egui::StrokeKind::Inside);
+
+    // 列分隔竖线：贯穿表头与所有数据行（内部边界，共 cols-1 条）
+    let mut x = table.left();
+    for &w in col_widths.iter().take(col_widths.len().saturating_sub(1)) {
+        x += w;
+        painter.vline(x, table.y_range(), stroke);
+    }
+
+    // 行分隔横线：表头底边 + 每行底边；最后一行底边由外框覆盖，不重复画
+    painter.hline(table.x_range(), hdr_rect.bottom(), stroke);
+    for rect in &row_rects[..row_rects.len() - 1] {
+        painter.hline(table.x_range(), rect.bottom(), stroke);
+    }
+}
+
+/// 列宽拖拽手柄：覆盖在每条列分隔线上（表头 + 数据行全高）。
+///
+/// 拖动改变左侧列宽并夹紧到 [min_w, MAX_COL_W]；悬停/拖动时高亮整条分隔线。
+fn draw_column_resizers(
+    ui: &mut egui::Ui,
+    hdr_rect: egui::Rect,
+    row_rects: &[egui::Rect],
+    col_widths: &mut [f32],
+) {
+    let Some(last_row) = row_rects.last() else { return };
+    let top = hdr_rect.top();
+    let bottom = last_row.bottom();
+    let mut x = hdr_rect.left();
+    for i in 0..col_widths.len().saturating_sub(1) {
+        x += col_widths[i];
+        let hit = egui::Rect::from_center_size(
+            egui::Pos2::new(x, (top + bottom) * 0.5),
+            egui::Vec2::new(RESIZE_HIT_W, bottom - top),
+        );
+        let resp = ui
+            .interact(
+                hit,
+                ui.id().with(("watch_col_resize", i)),
+                egui::Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeColumn);
+        if resp.dragged() {
+            // drag_delta 是本帧指针位移，逐帧累加
+            let dx = resp.drag_delta().x;
+            col_widths[i] = (col_widths[i] + dx).clamp(COLUMNS[i].min_w, MAX_COL_W);
+        }
+        if resp.hovered() || resp.dragged() {
+            ui.painter().vline(x, top..=bottom, egui::Stroke::new(2.0, ACCENT));
+        }
     }
 }
 
@@ -679,12 +782,97 @@ mod tests {
         p
     }
 
+    /// 建立带默认字体的测试 Context（首帧只用于初始化字体）
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx
+    }
+
+    /// 渲染一帧并返回输出
+    fn render_frame(
+        ctx: &egui::Context,
+        panel: &mut WatchPanel,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_min_width(DEFAULT_COL_WIDTHS.iter().sum::<f32>() + 40.0);
+                panel.show(ui, &[]);
+            });
+        })
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| collect_texts(s, out)),
+            _ => {}
+        }
+    }
+
+    fn collect_lines(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => out.push(*points),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| collect_lines(s, out)),
+            _ => {}
+        }
+    }
+
+    fn collect_lines_of(output: &egui::FullOutput) -> Vec<[egui::Pos2; 2]> {
+        let mut lines = Vec::new();
+        for clipped in &output.shapes {
+            collect_lines(&clipped.shape, &mut lines);
+        }
+        lines
+    }
+
+    fn find_text_y(output: &egui::FullOutput, text: &str) -> Option<f32> {
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        texts
+            .iter()
+            .find(|t| t.galley.job.text == text)
+            .map(|t| t.pos.y)
+    }
+
+    fn find_text_x(output: &egui::FullOutput, text: &str) -> Option<f32> {
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        texts
+            .iter()
+            .find(|t| t.galley.job.text == text)
+            .map(|t| t.pos.x)
+    }
+
+    /// 从输出中找出指定填充色的矩形（用于定位表头）
+    fn find_rect_by_fill(output: &egui::FullOutput, fill: egui::Color32) -> Option<egui::Rect> {
+        for clipped in &output.shapes {
+            if let egui::Shape::Rect(r) = &clipped.shape {
+                if r.fill == fill {
+                    return Some(r.rect);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn name_text_is_elided_to_column_width() {
         // 需要真实字体度量，故不用 __run_test_ui（它刻意加载空字体）。
-        // 先跑一帧让 Context 初始化默认字体。
-        let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |_| {});
+        let ctx = test_ctx();
         let font = egui::FontId::proportional(12.0);
         let color = egui::Color32::BLACK;
 
@@ -706,15 +894,6 @@ mod tests {
         assert!(!elided, "short name should not be elided");
     }
 
-    /// 递归收集一帧内的所有 TextShape（painter.galley 产出 Shape::Text）
-    fn collect_texts(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
-        match shape {
-            egui::Shape::Text(t) => out.push(t.clone()),
-            egui::Shape::Vec(v) => v.iter().for_each(|s| collect_texts(s, out)),
-            _ => {}
-        }
-    }
-
     #[test]
     fn long_name_does_not_overflow_name_column() {
         let long_name = "g_pwmChannelCallbackHandlerWithAVeryLongName";
@@ -725,16 +904,8 @@ mod tests {
             &[0x2000_0000],
         );
 
-        let ctx = egui::Context::default();
-        // 先跑一帧初始化字体
-        let _ = ctx.run(Default::default(), |_| {});
-
-        let output = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_min_width(DEFAULT_COL_WIDTHS.iter().sum::<f32>() + 40.0);
-                panel.show(ui, &[egui::Color32::RED]);
-            });
-        });
+        let ctx = test_ctx();
+        let output = render_frame(&ctx, &mut panel, Vec::new());
 
         let mut texts = Vec::new();
         for clipped in &output.shapes {
@@ -746,8 +917,8 @@ mod tests {
             .find(|t| t.galley.job.text == long_name)
             .expect("long name should be painted (elided)");
 
-        // Name 列可用宽度 = 列宽 - 左侧留白(8) - 色条(4) - 右侧留白(8)
-        let budget = DEFAULT_COL_WIDTHS[0] - 8.0 - 4.0 - 8.0;
+        // Name 列可用宽度 = 列宽 - 左侧留白 - 色条 - 右侧留白
+        let budget = COLUMNS[0].default_w - CELL_PAD_X - COLOR_BAR_W - CELL_PAD_X;
         assert!(name_shape.galley.elided, "long name should be elided");
         assert!(
             name_shape.galley.size().x <= budget + 0.5,
@@ -766,40 +937,223 @@ mod tests {
             &[0x2000_0000, 0x2000_0004, 0x2000_0008],
         );
 
-        let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |_| {});
-        let output = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_min_width(DEFAULT_COL_WIDTHS.iter().sum::<f32>() + 40.0);
-                panel.show(ui, &[]);
-            });
-        });
+        let ctx = test_ctx();
+        let output = render_frame(&ctx, &mut panel, Vec::new());
 
-        // 取三行 Name 文本的 y 坐标，行距应恰好等于 row_h（无额外间隙）
-        let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            collect_texts(&clipped.shape, &mut texts);
-        }
+        // 取三行 Name 文本的 y 坐标，行距应恰好等于 ROW_H（无额外间隙/重叠）
         let mut ys: Vec<f32> = ["a", "b", "c"]
             .iter()
-            .filter_map(|name| {
-                texts
-                    .iter()
-                    .find(|t| t.galley.job.text == *name)
-                    .map(|t| t.pos.y)
-            })
+            .filter_map(|name| find_text_y(&output, name))
             .collect();
         assert_eq!(ys.len(), 3, "expected all three rows painted");
         ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let row_h = 24.0;
         for pair in ys.windows(2) {
             let step = pair[1] - pair[0];
             assert!(
-                (step - row_h).abs() < 0.5,
-                "row step {step} should equal row height {row_h} (no gap)"
+                (step - ROW_H).abs() < 0.5,
+                "row step {step} should equal row height {ROW_H} (no gap, no overlap)"
             );
         }
+    }
+
+    #[test]
+    fn grid_draws_exactly_one_line_per_boundary() {
+        let rows = 3usize;
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &[ValueType::Uint32; 3],
+            &[0x2000_0000, 0x2000_0004, 0x2000_0008],
+        );
+
+        let ctx = test_ctx();
+        let output = render_frame(&ctx, &mut panel, Vec::new());
+        let lines = collect_lines_of(&output);
+
+        // 横线：表头底边 + 前两行底边 = rows 条；间距恒为 ROW_H
+        let mut h_ys: Vec<f32> = lines
+            .iter()
+            .filter(|l| (l[0].y - l[1].y).abs() < 0.01)
+            .map(|l| l[0].y)
+            .collect();
+        h_ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            h_ys.len(),
+            rows,
+            "expected {rows} horizontal separators, got {}: {:?}",
+            h_ys.len(),
+            h_ys
+        );
+        for pair in h_ys.windows(2) {
+            assert!(
+                (pair[1] - pair[0] - ROW_H).abs() < 0.5,
+                "horizontal separators should be {} apart, got {} ({:?})",
+                ROW_H,
+                pair[1] - pair[0],
+                h_ys
+            );
+        }
+
+        // 竖线：8 列共 7 条内部分隔线，x 间距等于各列宽度
+        let mut v_xs: Vec<f32> = lines
+            .iter()
+            .filter(|l| (l[0].x - l[1].x).abs() < 0.01)
+            .map(|l| l[0].x)
+            .collect();
+        v_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            v_xs.len(),
+            COLUMNS.len() - 1,
+            "expected {} vertical separators, got {}: {:?}",
+            COLUMNS.len() - 1,
+            v_xs.len(),
+            v_xs
+        );
+        // 分隔线 i 位于第 i 列右边界，相邻间距 = 下一列的宽度
+        for i in 0..v_xs.len() - 1 {
+            let expect = COLUMNS[i + 1].default_w;
+            assert!(
+                (v_xs[i + 1] - v_xs[i] - expect).abs() < 0.5,
+                "vertical separator spacing should be {expect}, got {}",
+                v_xs[i + 1] - v_xs[i]
+            );
+        }
+    }
+
+    #[test]
+    fn set_col_widths_clamps_and_ignores_invalid() {
+        let mut p = WatchPanel::new();
+        let original: Vec<f32> = p.col_widths().to_vec();
+
+        // 过小 → 夹到 min_w；过大 → 夹到上限；NaN → 忽略
+        let mut input = original.clone();
+        input[0] = 1.0;
+        input[1] = 5000.0;
+        input[2] = f32::NAN;
+        p.set_col_widths(&input);
+
+        assert_eq!(p.col_widths()[0], COLUMNS[0].min_w);
+        assert_eq!(p.col_widths()[1], MAX_COL_W);
+        assert!((p.col_widths()[2] - original[2]).abs() < 1e-6, "NaN should be ignored");
+
+        // 长度不足的列保持原值
+        p.set_col_widths(&[300.0]);
+        assert!((p.col_widths()[0] - 300.0).abs() < 1e-6);
+        assert!((p.col_widths()[1] - MAX_COL_W).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reset_col_widths_restores_defaults() {
+        let mut p = WatchPanel::new();
+        let mut input: Vec<f32> = DEFAULT_COL_WIDTHS.to_vec();
+        input[3] = 400.0;
+        p.set_col_widths(&input);
+        assert!((p.col_widths()[3] - 400.0).abs() < 1e-6);
+
+        p.reset_col_widths();
+        assert_eq!(p.col_widths(), DEFAULT_COL_WIDTHS.to_vec());
+    }
+
+    #[test]
+    fn header_positions_follow_column_widths() {
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(&["a".to_string()], &[ValueType::Uint32], &[0x2000_0000]);
+
+        let ctx = test_ctx();
+        let x_before = find_text_x(&render_frame(&ctx, &mut panel, Vec::new()), "Address")
+            .expect("Address header painted");
+
+        // Name 列加宽 150px → Address 表头右移
+        let mut widths: Vec<f32> = DEFAULT_COL_WIDTHS.to_vec();
+        widths[0] += 150.0;
+        panel.set_col_widths(&widths);
+        let x_after = find_text_x(&render_frame(&ctx, &mut panel, Vec::new()), "Address")
+            .expect("Address header painted");
+
+        assert!(
+            (x_after - x_before - 150.0).abs() < 1.0,
+            "Address header x should shift by 150px: {x_before} -> {x_after}"
+        );
+    }
+
+    #[test]
+    fn dragging_column_border_resizes_column() {
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(&["a".to_string()], &[ValueType::Uint32], &[0x2000_0000]);
+
+        let ctx = test_ctx();
+        // 首帧定位表头与第一条列分隔线
+        let output = render_frame(&ctx, &mut panel, Vec::new());
+        let hdr = find_rect_by_fill(&output, HEADER_BG).expect("header rect painted");
+        let grab = egui::Pos2::new(hdr.left() + panel.col_widths()[0], hdr.center().y);
+        let before = panel.col_widths()[0];
+
+        // 悬停 → 按下 → 右移 40px → 松开
+        render_frame(&ctx, &mut panel, vec![egui::Event::PointerMoved(grab)]);
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerButton {
+                pos: grab,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerMoved(grab + egui::vec2(40.0, 0.0))],
+        );
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerButton {
+                pos: grab + egui::vec2(40.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+
+        let after = panel.col_widths()[0];
+        assert!(
+            (after - before - 40.0).abs() < 2.0,
+            "dragging border by 40px should widen column by ~40px: {before} -> {after}"
+        );
+
+        // 反向拖拽同样生效：从新分隔线位置（grab+40）向左拖 30px
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerButton {
+                pos: grab + egui::vec2(40.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerMoved(grab + egui::vec2(10.0, 0.0))],
+        );
+        render_frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::PointerButton {
+                pos: grab + egui::vec2(10.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let shrunk = panel.col_widths()[0];
+        assert!(
+            (shrunk - (after - 30.0)).abs() < 2.0,
+            "dragging border left by 30px should shrink column: {after} -> {shrunk}"
+        );
     }
 
     #[test]
@@ -849,6 +1203,17 @@ mod tests {
         p.sync_from_channels(&["CH2".to_string()], &[ValueType::Float], &[0]);
         assert!((p.entries[0].y_offset - 0.0).abs() < 1e-6);
         assert!((p.entries[0].y_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_keeps_column_widths() {
+        // 列宽是面板级状态，与通道同步无关
+        let mut p = WatchPanel::new();
+        let mut widths: Vec<f32> = DEFAULT_COL_WIDTHS.to_vec();
+        widths[7] = 320.0;
+        p.set_col_widths(&widths);
+        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float], &[0]);
+        assert!((p.col_widths()[7] - 320.0).abs() < 1e-6);
     }
 
     #[test]

@@ -256,18 +256,35 @@ impl WatchPanel {
 
                     let mut x = row_rect.left();
 
-                    // Name
+                    // Name（过长时按像素宽度截断并加省略号，避免溢出到 Address 列）
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
                         egui::Vec2::new(col_widths[0], row_h),
                     );
-                    ui.painter().text(
-                        r.left_center() + egui::Vec2::new(8.0 + color_bar_w, 0.0),
-                        egui::Align2::LEFT_CENTER,
+                    let text_left = 8.0 + color_bar_w;
+                    let name_font = egui::FontId::proportional(12.0);
+                    let name_galley = layout_elided(
+                        ui.ctx(),
                         &entry.name,
-                        egui::FontId::proportional(12.0),
+                        (r.width() - text_left - 8.0).max(0.0),
+                        name_font,
                         text_dark,
                     );
+                    if name_galley.elided {
+                        // 被截断时悬停显示完整名称
+                        ui.interact(
+                            r,
+                            ui.id().with(("watch_name_hover", row_idx)),
+                            egui::Sense::hover(),
+                        )
+                        .on_hover_text(&entry.name);
+                    }
+                    let name_pos = egui::Pos2::new(
+                        r.left() + text_left,
+                        r.center().y - name_galley.size().y * 0.5,
+                    );
+                    let painter = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
+                    painter.galley(name_pos, name_galley, text_dark);
                     x += col_widths[0];
 
                     // Address (只读显示, 16 进制)
@@ -529,6 +546,27 @@ fn paint_grid(painter: &egui::Painter, rect: egui::Rect, col_widths: &[f32], str
     }
 }
 
+/// 单行布局文本，超宽时以 "…" 截断。
+///
+/// 使用 epaint 的 `TextWrapping`（`max_rows = 1`）做真正的字形级截断，
+/// 避免 `painter.text` 不裁剪导致文本溢出到相邻列。
+fn layout_elided(
+    ctx: &egui::Context,
+    text: &str,
+    max_w: f32,
+    font: egui::FontId,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ctx.fonts(|f| f.layout_job(job))
+}
+
 /// 解析用户输入的值字符串，返回原始 u32
 ///
 /// 用户输入按 10 进制处理（不支持 0x 前缀）。
@@ -632,6 +670,84 @@ mod tests {
             panel_e.y_scale = e.y_scale;
         }
         p
+    }
+
+    #[test]
+    fn name_text_is_elided_to_column_width() {
+        // 需要真实字体度量，故不用 __run_test_ui（它刻意加载空字体）。
+        // 先跑一帧让 Context 初始化默认字体。
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::BLACK;
+
+        let measure = |text: &str, budget: f32| {
+            let galley = layout_elided(&ctx, text, budget, font.clone(), color);
+            (galley.elided, galley.size().x)
+        };
+
+        // 长变量名在 Name 列可用宽度下必须被截断
+        let long = "g_pwmChannelCallbackHandlerWithAVeryLongName";
+        let budget = 80.0;
+        let (elided, width) = measure(long, budget);
+        assert!(elided, "expected long name to be elided");
+        assert!(width <= budget + 0.5, "elided width {width} exceeds budget {budget}");
+
+        // 短名称在宽松宽度下不截断
+        let budget = 400.0;
+        let (elided, _) = measure("g_pwm", budget);
+        assert!(!elided, "short name should not be elided");
+    }
+
+    /// 递归收集一帧内的所有 TextShape（painter.galley 产出 Shape::Text）
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| collect_texts(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn long_name_does_not_overflow_name_column() {
+        let long_name = "g_pwmChannelCallbackHandlerWithAVeryLongName";
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(
+            &[long_name.to_string()],
+            &[ValueType::Uint32],
+            &[0x2000_0000],
+        );
+
+        let ctx = egui::Context::default();
+        // 先跑一帧初始化字体
+        let _ = ctx.run(Default::default(), |_| {});
+
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_min_width(DEFAULT_COL_WIDTHS.iter().sum::<f32>() + 40.0);
+                panel.show(ui, &[egui::Color32::RED]);
+            });
+        });
+
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+
+        let name_shape = texts
+            .iter()
+            .find(|t| t.galley.job.text == long_name)
+            .expect("long name should be painted (elided)");
+
+        // Name 列可用宽度 = 列宽 - 左侧留白(8) - 色条(4) - 右侧留白(8)
+        let budget = DEFAULT_COL_WIDTHS[0] - 8.0 - 4.0 - 8.0;
+        assert!(name_shape.galley.elided, "long name should be elided");
+        assert!(
+            name_shape.galley.size().x <= budget + 0.5,
+            "name width {} exceeds column budget {}",
+            name_shape.galley.size().x,
+            budget
+        );
     }
 
     #[test]

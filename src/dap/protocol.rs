@@ -191,13 +191,21 @@ impl DapProtocol {
 
     /// 解析 DAP_Transfer 响应
     ///
-    /// CMSIS-DAP v2 格式: [命令回显(0x05), 计数, 状态, 数据(每读操作4字节)...]
-    /// 注意：调用方应传入恰好一个响应长度的数据（3 + 4*num_read_vars 字节）。
-    /// 接收线程按 resp_len 切片后调用此方法，避免多个响应被当作一个解析。
+    /// CMSIS-DAP v2 格式: [命令回显(0x05), 计数, 状态, 数据(每成功读操作4字节)...]
+    /// `count` 是设备实际执行的请求数——FAULT/WAIT 时序列提前中止，
+    /// 计数可能小于发出的请求数，数据区只包含已成功完成的读操作。
+    /// 调用方必须传入恰好一条响应（长度按 count 动态计算，见
+    /// pipeline::engine::transfer_frame_len），否则会解析到垃圾数据。
     pub fn parse_transfer_response(data: &[u8]) -> Result<TransferResponse> {
         if data.len() < 3 {
             return Err(Error::InvalidResponse(format!(
                 "DAP_Transfer 响应过短: {} 字节", data.len()
+            )));
+        }
+        if data[0] != DAP_TRANSFER {
+            return Err(Error::InvalidResponse(format!(
+                "响应头不是 DAP_Transfer 回显: 0x{:02X}（字节流失步）",
+                data[0]
             )));
         }
 

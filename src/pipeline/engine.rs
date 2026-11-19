@@ -32,6 +32,38 @@ const MAX_TRANSFER_REQUESTS: usize = 64;
 /// 吞吐充足时该值不会成为瓶颈（在途数远小于上限）。
 const MAX_IN_FLIGHT: usize = 4;
 
+/// 计算一条 DAP_Transfer 响应的字节长度
+///
+/// 响应 = [0x05, count, status] + 每个成功读请求 4 字节。
+/// 设备在 FAULT/WAIT 重试耗尽时提前中止序列，`count` = 实际执行的
+/// 请求数，可能小于发出的请求数——因此响应长度必须按 count 动态
+/// 计算：固定长度切帧会把下一条响应的头几个字节吃进当前块，造成
+/// 字节流永久错位（垃圾样本 + 在途计数失配）。
+///
+/// 命令内请求布局：[写 TAR + 写 DRW] × `n_writes`（不返回数据）
+/// + [写 TAR + 读 DRW] × `num_vars`（每变量返回 4 字节）
+fn transfer_frame_len(count: usize, n_writes: usize, num_vars: usize) -> usize {
+    let write_reqs = n_writes * 2;
+    // 读块内已执行的请求数；奇数位（TAR 之后）是 DRW 读，返回数据
+    let read_reqs = count.saturating_sub(write_reqs);
+    let reads = (read_reqs / 2).min(num_vars);
+    3 + 4 * reads
+}
+
+/// 在途计数递减（防下溢：为 0 时不动作）
+///
+/// 协议失步后丢弃缓冲时，计数可能先于响应归零；usize 直接 fetch_sub
+/// 会回绕成巨大值，使提交线程的背压判断永久成立（采样停摆）。
+fn in_flight_dec(counter: &AtomicUsize) {
+    let mut cur = counter.load(Ordering::SeqCst);
+    while cur > 0 {
+        match counter.compare_exchange_weak(cur, cur - 1, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -52,6 +84,9 @@ pub struct PipelineEngine {
     /// 各变量所在对齐整字的最近一次原始值（接收线程更新，
     /// 提交线程对子字变量做读-改-写时合并用）
     last_words: Arc<Mutex<Vec<Option<u32>>>>,
+    /// 每条已发出命令中的写入请求数（提交线程入队、接收线程出队）。
+    /// 响应长度按 count + 该值动态计算（写入请求不返回数据）
+    writes_per_cmd: Arc<Mutex<VecDeque<u8>>>,
     /// 在途命令计数（提交线程发出命令后 +1，接收线程解析对应响应后 -1）。
     /// 背压控制：提交线程在途数达到 MAX_IN_FLIGHT 时跳过本轮
     in_flight: Arc<AtomicUsize>,
@@ -88,6 +123,7 @@ impl PipelineEngine {
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
             last_words: Arc::new(Mutex::new(Vec::new())),
+            writes_per_cmd: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -105,6 +141,7 @@ impl PipelineEngine {
             write_queue: Arc::clone(&self.write_queue),
             last_words: Arc::clone(&self.last_words),
             // 独立计数器：新旧引擎互不干扰（背压信号各自独立）
+            writes_per_cmd: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -117,9 +154,17 @@ impl PipelineEngine {
     pub fn start(&self, capacity: usize) -> Result<PipelineHandle> {
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
-        // 复位在途计数器（上一次运行可能残留未消费的命令，如停止时
-        // USB IN 端点中尚未读取的响应）
+        // 复位在途计数器
         self.in_flight.store(0, Ordering::SeqCst);
+        // 清空写入数队列（上一次运行的残留条目会污染本会话的切帧）
+        if let Ok(mut q) = self.writes_per_cmd.lock() {
+            q.clear();
+        }
+        // 排空 USB IN 端点残留响应（上一次运行的命令响应可能仍留在
+        // 端点缓冲中——Pause/Resume 复用同一 USB 句柄时尤其如此）。
+        // 否则新会话会把旧响应当新数据消费，且写入数队列与响应失去
+        // 对应关系，切帧从此错位。
+        self.usb.flush_input();
 
         let ring = Arc::new(RingBuffer::new(capacity));
         let start_time = Instant::now();
@@ -152,6 +197,7 @@ impl PipelineEngine {
         let running = Arc::clone(&self.running);
         let write_queue = Arc::clone(&self.write_queue);
         let last_words = Arc::clone(&self.last_words);
+        let writes_per_cmd = Arc::clone(&self.writes_per_cmd);
         let in_flight = Arc::clone(&self.in_flight);
 
         // 预构建 TransferRequest 数组（每次采样都一样）
@@ -297,7 +343,11 @@ impl PipelineEngine {
                         log::error!("提交线程 USB 写失败 (seq={}): {}", seq, e);
                         break;
                     }
-                    // 命令已发出：在途 +1（接收线程解析对应响应后 -1）
+                    // 命令已发出：记录本条命令的写入数（接收线程按它计算
+                    // 响应长度），在途 +1
+                    if let Ok(mut q) = writes_per_cmd.lock() {
+                        q.push_back(pending_writes.len() as u8);
+                    }
                     in_flight.fetch_add(1, Ordering::SeqCst);
 
                     seq += 1;
@@ -330,6 +380,7 @@ impl PipelineEngine {
         let num_vars = accesses.len();
         let interval_us = self.interval_us;
         let last_words = Arc::clone(&self.last_words);
+        let writes_per_cmd = Arc::clone(&self.writes_per_cmd);
         let in_flight = Arc::clone(&self.in_flight);
 
         let handle = thread::Builder::new()
@@ -343,19 +394,16 @@ impl PipelineEngine {
                 let mut data: Vec<u8> = Vec::with_capacity(4096);
                 let mut seq: u64 = 0;
 
-                // 每个 DAP_Transfer 响应的固定长度：
-                // [DAP_TRANSFER, count, status, data...] = 3 + 4*num_vars 字节
-                // 每变量一个 u32 读数据（写 TAR 不返回数据）
-                let resp_len = 3 + 4 * num_vars;
-
                 while running.load(Ordering::Relaxed) {
                     // 读取 USB 响应（超时 200ms，允许优雅退出）
                     let n = match usb.read_timeout(&mut buf, Duration::from_millis(200)) {
                         Ok(n) => n,
                         Err(e) => {
-                            // 超时可能只是暂无数据，检查运行标志后继续
+                            // 超时可能只是暂无数据，检查运行标志后继续。
+                            // 设备拔出等错误同样在此处记录——UI 侧仍显示
+                            // Running，由用户手动停止（见 README 已知限制）。
                             if running.load(Ordering::Relaxed) {
-                                log::warn!("接收线程读超时: {}", e);
+                                log::warn!("接收线程读失败: {}", e);
                             }
                             continue;
                         }
@@ -368,27 +416,80 @@ impl PipelineEngine {
                     data.extend_from_slice(&buf[..n]);
                     carry.clear();
 
-                    // 一次 read_bulk 可能读到多个响应（USB Bulk 合并短包），
-                    // 按 resp_len 循环解析所有完整响应
+                    // 一次 read_bulk 可能读到多个响应（USB Bulk 合并短包）。
+                    // 响应长度是动态的（FAULT/WAIT 时设备提前中止，count
+                    // 小于发出的请求数），必须按响应头 [0x05, count, status]
+                    // 逐条计算长度，绝不能按固定长度切帧。
                     let mut offset = 0;
-                    while offset + resp_len <= data.len() {
-                        let chunk = &data[offset..offset + resp_len];
-                        offset += resp_len;
+                    while offset < data.len() {
+                        // 头部不足 3 字节 → 不完整，留给 carry
+                        if data.len() - offset < 3 {
+                            break;
+                        }
+                        // 响应头必须是 DAP_Transfer 回显；不是则字节流已失步
+                        // （此前从未发生失步时不应到达此处）。丢弃整个缓冲
+                        // 并复位在途计数，等待重新对齐。
+                        if data[offset] != DAP_TRANSFER {
+                            log::error!(
+                                "接收线程协议失步：响应头 0x{:02X} 不是 DAP_Transfer，丢弃 {} 字节重新同步",
+                                data[offset], data.len() - offset
+                            );
+                            offset = data.len();
+                            if let Ok(mut q) = writes_per_cmd.lock() {
+                                q.clear();
+                            }
+                            in_flight.store(0, Ordering::SeqCst);
+                            break;
+                        }
+                        let count = data[offset + 1] as usize;
+                        // 本条命令的写入数：提交线程每发一条命令入队一条。
+                        // 只 peek——响应可能跨多次 USB 读，完整消费后才出队。
+                        let n_writes = write_counts_front(&writes_per_cmd);
+                        let Some(n_writes) = n_writes else {
+                            log::error!("接收线程写入数队列为空，丢弃 {} 字节重新同步", data.len() - offset);
+                            offset = data.len();
+                            if let Ok(mut q) = writes_per_cmd.lock() {
+                                q.clear();
+                            }
+                            in_flight.store(0, Ordering::SeqCst);
+                            break;
+                        };
+                        let total_requests = 2 * (n_writes + num_vars);
+                        if count > total_requests {
+                            log::error!(
+                                "接收线程协议失步：count={} 超过命令请求数 {}，丢弃 {} 字节重新同步",
+                                count, total_requests, data.len() - offset
+                            );
+                            offset = data.len();
+                            if let Ok(mut q) = writes_per_cmd.lock() {
+                                q.clear();
+                            }
+                            in_flight.store(0, Ordering::SeqCst);
+                            break;
+                        }
+                        let need = transfer_frame_len(count, n_writes, num_vars);
+                        // 不完整响应 → 留给 carry，下次读取拼接后再解析
+                        if data.len() - offset < need {
+                            break;
+                        }
+                        let chunk = &data[offset..offset + need];
+                        offset += need;
+
+                        // 完整消费一条响应：写入数出队 + 在途递减
+                        if let Ok(mut q) = writes_per_cmd.lock() {
+                            q.pop_front();
+                        }
+                        in_flight_dec(&in_flight);
 
                         // 解析单个响应
                         let resp = match DapProtocol::parse_transfer_response(chunk) {
                             Ok(r) => r,
                             Err(e) => {
                                 log::error!("接收线程解析失败 (seq={}): {}", seq, e);
-                                // 该命令的响应已被消费（无论解析是否成功），在途 -1
-                                in_flight.fetch_sub(1, Ordering::SeqCst);
                                 seq += 1;
                                 continue;
                             }
                         };
-                        // 在途 -1：每条发出的命令都会收到一条响应（含非 OK 状态），
-                        // 在此统一递减，避免提交线程因计数泄漏而停摆
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
 
                         if resp.status != TRANSFER_OK {
                             log::warn!(
@@ -440,6 +541,11 @@ impl PipelineEngine {
 
         Ok(handle)
     }
+}
+
+/// 读取写入数队首（不消费）；队列为空返回 None
+fn write_counts_front(queue: &Mutex<VecDeque<u8>>) -> Option<usize> {
+    queue.lock().ok().and_then(|q| q.front().copied()).map(|v| v as usize)
 }
 
 /// 流水线控制句柄
@@ -502,5 +608,109 @@ impl PipelineHandle {
         let _ = self.collect_handle.join();
         log::info!("接收线程已退出");
         log::info!("流水线已停止");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_len_full_ok_response() {
+        // 全部成功：count = 2*n_writes + 2*num_vars，每变量 4 字节
+        assert_eq!(transfer_frame_len(8, 0, 4), 3 + 16);
+        // 1 条写入（2 请求）+ 4 变量（8 请求）= 10 条
+        assert_eq!(transfer_frame_len(10, 1, 4), 3 + 16);
+    }
+
+    #[test]
+    fn frame_len_fault_mid_sequence() {
+        // n_writes=1（2 条写请求）+ 4 变量（8 条读请求）
+        // 请求序列: [WTAR,WDRW] + [TAR0,DRW0,TAR1,DRW1,TAR2,DRW2,TAR3,DRW3]
+        // 在第 5 条请求处 FAULT：2 写 + TAR0,DRW0,TAR1 → 仅 DRW0 返回数据
+        assert_eq!(transfer_frame_len(5, 1, 4), 3 + 4);
+        // 在第 4 条请求处 FAULT：2 写 + TAR0,DRW0 → 1 个读数据
+        assert_eq!(transfer_frame_len(4, 1, 4), 3 + 4);
+        // 在写块内 FAULT：无读数据
+        assert_eq!(transfer_frame_len(1, 1, 4), 3);
+    }
+
+    #[test]
+    fn frame_len_fault_within_var_pair() {
+        // count 恰好停在变量对之间（TAR 已执行、DRW 未执行）：该变量无数据
+        // n_writes=0，count=3 → TAR0,DRW0,TAR1 → 仅 1 个读数据
+        assert_eq!(transfer_frame_len(3, 0, 4), 3 + 4);
+    }
+
+    #[test]
+    fn in_flight_dec_never_underflows() {
+        // 协议失步/多余响应时计数可能先归零：直接 fetch_sub 会回绕成
+        // usize::MAX，使背压判断永久成立（采样停摆）
+        let c = AtomicUsize::new(0);
+        in_flight_dec(&c);
+        assert_eq!(c.load(Ordering::SeqCst), 0);
+
+        let c = AtomicUsize::new(2);
+        in_flight_dec(&c);
+        in_flight_dec(&c);
+        in_flight_dec(&c);
+        assert_eq!(c.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fault_frame_does_not_break_stream_framing() {
+        // 模拟字节流：一条 FAULT 短响应 + 一条完整 OK 响应拼接。
+        // 旧实现按固定长度切帧会把第二条响应的头字节吃进第一条，
+        // 造成字节流永久错位；动态切帧必须恰好切出两条。
+        let num_vars = 2usize;
+        let n_writes = 1usize;
+
+        // FAULT 响应：2 写 + TAR0,DRW0,TAR1 后中止 → count=5，仅 1 个读数据
+        let mut fault = vec![DAP_TRANSFER, 5u8, TRANSFER_FAULT];
+        fault.extend_from_slice(&0xAAAA_0001u32.to_le_bytes());
+        // OK 响应：count = 2*(1+2) = 6，2 个读数据
+        let mut ok = vec![DAP_TRANSFER, (2 * (n_writes + num_vars)) as u8, TRANSFER_OK];
+        ok.extend_from_slice(&0xBBBB_0001u32.to_le_bytes());
+        ok.extend_from_slice(&0xBBBB_0002u32.to_le_bytes());
+        let mut stream = fault.clone();
+        stream.extend_from_slice(&ok);
+
+        // 按接收线程的算法切帧
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(n_writes as u8);
+        queue.push_back(0u8); // 第二条命令无写入
+        while offset < stream.len() {
+            assert!(stream.len() - offset >= 3);
+            assert_eq!(stream[offset], DAP_TRANSFER, "frame echo byte");
+            let count = stream[offset + 1] as usize;
+            let nw = queue.front().copied().unwrap() as usize;
+            let need = transfer_frame_len(count, nw, num_vars);
+            assert!(
+                stream.len() - offset >= need,
+                "frame incomplete at offset {offset}"
+            );
+            frames.push(stream[offset..offset + need].to_vec());
+            offset += need;
+            queue.pop_front();
+        }
+        assert_eq!(frames.len(), 2, "both frames must be sliced exactly");
+
+        let r1 = DapProtocol::parse_transfer_response(&frames[0]).unwrap();
+        assert_eq!(r1.status, TRANSFER_FAULT);
+        assert_eq!(r1.count, 5);
+        assert_eq!(r1.values(), &[0xAAAA_0001]);
+
+        let r2 = DapProtocol::parse_transfer_response(&frames[1]).unwrap();
+        assert_eq!(r2.status, TRANSFER_OK);
+        assert_eq!(r2.values(), &[0xBBBB_0001, 0xBBBB_0002]);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_echo() {
+        // 字节流失步时响应头不是 0x05：必须显式报错而非解析出垃圾数据
+        let bad = vec![0x06u8, 2, 1, 0, 0, 0, 0];
+        assert!(DapProtocol::parse_transfer_response(&bad).is_err());
     }
 }

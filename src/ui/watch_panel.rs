@@ -1,9 +1,12 @@
 use super::text::layout_elided;
 use crate::pipeline::sample::ValueType;
 
-/// 待写入 MCU 的请求（通道索引 + 原始值）
+/// 待写入 MCU 的请求（通道名 + 原始值）
+///
+/// 按通道名（而非表格行号）携带目标：行号在通道增删后会整体移位，
+/// 名字则在采集快照中稳定对应唯一的地址。
 pub struct WriteRequest {
-    pub channel_idx: usize,
+    pub channel_name: String,
     pub raw_value: u32,
 }
 
@@ -392,7 +395,7 @@ impl WatchPanel {
                         {
                             if let Some(raw) = parse_value(&entry.edit_buffer, entry.value_type) {
                                 new_writes.push(WriteRequest {
-                                    channel_idx: row_idx,
+                                    channel_name: entry.name.clone(),
                                     raw_value: raw,
                                 });
                                 entry.display_value = format_value(raw, entry.value_type);

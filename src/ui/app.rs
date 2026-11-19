@@ -66,6 +66,10 @@ pub struct DapSamplerApp {
     swd_clock_mhz: u32,
     /// 当前采集的通道地址列表（与通道一一对应，用于 Watch 写入）
     current_addresses: Vec<u32>,
+    /// 当前采集的通道名列表（与 current_addresses 一一对应）。
+    /// Watch 写入按名字解析到引擎快照索引：行号在通道增删后会移位，
+    /// 名字是稳定标识。
+    current_names: Vec<String>,
     /// 当前采集的通道类型列表（与 current_addresses 一一对应，
     /// 用于子字变量的对齐读写）
     current_types: Vec<ValueType>,
@@ -130,6 +134,18 @@ struct ElfSyncPrompt {
 /// ELF 变量是否匹配给定名称（path 或 name 相等）
 fn elf_var_matches(ev: &ElfVariable, name: &str) -> bool {
     ev.path == name || ev.name == name
+}
+
+/// 比较工程变量与 ELF 变量：地址不同或 ELF 中缺失 → 返回差异；无差异 → None
+///
+/// 匹配规则与 collect_channel_addresses 一致：path 或 name 相等即匹配。
+/// 将写入请求的通道名解析为采集快照中的变量索引
+///
+/// 名字是 Watch 写入的稳定标识：通道增删后表格行号整体移位，
+/// 按行号写入会命中错误的地址；按名字解析失败则该通道已不在
+/// 采集集合中，调用方应丢弃写入。
+fn resolve_channel_index(names: &[String], name: &str) -> Option<usize> {
+    names.iter().position(|n| n == name)
 }
 
 /// 比较工程变量与 ELF 变量：地址不同或 ELF 中缺失 → 返回差异；无差异 → None
@@ -291,6 +307,7 @@ impl DapSamplerApp {
             rate_hz,
             swd_clock_mhz,
             current_addresses: Vec::new(),
+            current_names: Vec::new(),
             current_types: Vec::new(),
             target_count,
             display_mode,
@@ -352,6 +369,7 @@ impl DapSamplerApp {
         self.manual_channel_names.clear();
         self.manual_value_types.clear();
         self.current_addresses.clear();
+        self.current_names.clear();
         self.current_types.clear();
         // 参数回默认（与 DapSamplerApp::new 一致：5000 Hz / 2000 点 / 1 MHz / Line）
         self.rate_hz = 5000;
@@ -852,8 +870,9 @@ impl DapSamplerApp {
             return;
         }
 
-        // 保存当前通道地址/类型列表（用于 Watch 写入的子字对齐处理）
+        // 保存当前通道地址/名字/类型列表（用于 Watch 写入的子字对齐处理与名字解析）
         let prev_addresses = std::mem::replace(&mut self.current_addresses, addresses.clone());
+        self.current_names = channel_names.clone();
         self.current_types = types.clone();
 
         // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
@@ -994,25 +1013,36 @@ impl DapSamplerApp {
             return;
         }
 
-        if self.current_addresses.is_empty() {
-            log::warn!("写入请求被忽略：无通道地址");
+        if self.current_names.is_empty() {
+            log::warn!("写入请求被忽略：无采集通道");
             return;
         }
 
         if let Some(ref handle) = self.pipeline {
+            // 采集中：按通道名解析为引擎快照中的变量索引。
+            // 名字是稳定标识——通道增删后行号会整体移位，按行号写入会命中
+            // 错误的地址；名字解析失败说明该通道不在本次采集集合中，丢弃。
             for w in &writes {
-                if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
-                    handle.queue_write(w.channel_idx, w.raw_value);
-                    log::info!(
-                        "已排队写入通道 {}: 0x{:08X} → 0x{:08X}",
-                        w.channel_idx, w.raw_value, addr
-                    );
-                } else {
-                    log::warn!("通道索引 {} 超出地址范围", w.channel_idx);
+                match resolve_channel_index(&self.current_names, &w.channel_name) {
+                    Some(idx) => {
+                        let addr = self.current_addresses[idx];
+                        handle.queue_write(idx, w.raw_value);
+                        log::info!(
+                            "已排队写入通道 {} ({}): 0x{:08X} → 0x{:08X}",
+                            idx, w.channel_name, w.raw_value, addr
+                        );
+                    }
+                    None => {
+                        log::warn!(
+                            "写入请求被丢弃：通道 '{}' 不在当前采集集合中",
+                            w.channel_name
+                        );
+                    }
                 }
             }
         } else {
-            // 采集未运行时，直接通过 SwdLink 写入
+            // 采集未运行时，直接通过 SwdLink 写入。
+            // 按 Watch 行的实时地址写入（current_* 是上次运行的快照，已过期）
             match SwdLink::new() {
                 Ok(mut swd) => {
                     let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
@@ -1021,21 +1051,26 @@ impl DapSamplerApp {
                         return;
                     }
                     for w in &writes {
-                        if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
-                            let size = self
-                                .current_types
-                                .get(w.channel_idx)
-                                .map(|t| t.byte_size())
-                                .unwrap_or(4);
-                            match swd.write_variable(addr, size, w.raw_value) {
-                                Ok(()) => log::info!(
-                                    "已写入通道 {}: 0x{:08X} → 0x{:08X} ({} bytes)",
-                                    w.channel_idx, w.raw_value, addr, size
-                                ),
-                                Err(e) => log::error!(
-                                    "写入通道 {} 失败: {}", w.channel_idx, e
-                                ),
-                            }
+                        let Some(entry) = self
+                            .watch_panel
+                            .entries
+                            .iter()
+                            .find(|e| e.name == w.channel_name)
+                        else {
+                            log::warn!(
+                                "写入请求被丢弃：通道 '{}' 不在 Watch 列表中",
+                                w.channel_name
+                            );
+                            continue;
+                        };
+                        match swd.write_variable(entry.address, entry.value_type.byte_size(), w.raw_value) {
+                            Ok(()) => log::info!(
+                                "已写入通道 '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
+                                w.channel_name, w.raw_value, entry.address, entry.value_type.byte_size()
+                            ),
+                            Err(e) => log::error!(
+                                "写入通道 '{}' 失败: {}", w.channel_name, e
+                            ),
                         }
                     }
                 }
@@ -1450,7 +1485,15 @@ impl eframe::App for DapSamplerApp {
                                     self.elf_ctx.as_ref(),
                                 );
                                 if !changes.is_empty() {
-                                    self.apply_variable_changes(changes);
+                                    // 采集中通道集合被引擎快照固定：增删会破坏
+                                    // Watch 行与采样数据的对应关系，必须先停止
+                                    if self.controls.state != AcquisitionState::Idle {
+                                        self.set_error(
+                                            "Stop acquisition before changing watched variables",
+                                        );
+                                    } else {
+                                        self.apply_variable_changes(changes);
+                                    }
                                 }
                             });
 
@@ -1472,20 +1515,28 @@ impl eframe::App for DapSamplerApp {
                                     };
                                 }
                                 if let Some(remove_idx) = action.remove {
-                                    let name = self.channel_panel.channels[remove_idx].name.clone();
-                                    self.variable_browser.checked_paths.remove(&name);
-                                    self.channel_panel.remove_channel(remove_idx);
-                                    if let Some(sel) = self.selected_channel {
-                                        if sel == remove_idx {
-                                            self.selected_channel = None;
-                                        } else if sel > remove_idx {
-                                            self.selected_channel = Some(sel - 1);
+                                    // 采集中通道集合被引擎快照固定：删除会使
+                                    // Watch 行号与采样数据错位，必须先停止
+                                    if self.controls.state != AcquisitionState::Idle {
+                                        self.set_error(
+                                            "Stop acquisition before removing channels",
+                                        );
+                                    } else {
+                                        let name = self.channel_panel.channels[remove_idx].name.clone();
+                                        self.variable_browser.checked_paths.remove(&name);
+                                        self.channel_panel.remove_channel(remove_idx);
+                                        if let Some(sel) = self.selected_channel {
+                                            if sel == remove_idx {
+                                                self.selected_channel = None;
+                                            } else if sel > remove_idx {
+                                                self.selected_channel = Some(sel - 1);
+                                            }
                                         }
+                                        let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
+                                        let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+                                        let addresses = self.collect_channel_addresses();
+                                        self.watch_panel.sync_from_channels(&names, &types, &addresses);
                                     }
-                                    let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
-                                    let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
-                                    let addresses = self.collect_channel_addresses();
-                                    self.watch_panel.sync_from_channels(&names, &types, &addresses);
                                 }
                             });
 
@@ -1975,6 +2026,54 @@ mod open_project_tests {
         assert!(
             app.elf_warning.as_deref().unwrap_or("").contains("C:/definitely/not/exists/fw.elf"),
             "警告弹窗应包含 ELF 路径"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_resolve_tests {
+    use super::*;
+    use crate::ui::watch_panel::WriteRequest;
+
+    #[test]
+    fn resolve_channel_index_maps_name_to_snapshot_index() {
+        let names = vec!["first_init".to_string(), "g_HseClkFreq".to_string()];
+        assert_eq!(resolve_channel_index(&names, "first_init"), Some(0));
+        assert_eq!(resolve_channel_index(&names, "g_HseClkFreq"), Some(1));
+    }
+
+    #[test]
+    fn resolve_channel_index_rejects_unknown_channel() {
+        // 通道被删除后，按行号写入会命中错误地址；按名字解析必须失败
+        let names = vec!["first_init".to_string(), "g_HseClkFreq".to_string()];
+        assert_eq!(resolve_channel_index(&names, "removed_var"), None);
+        assert_eq!(resolve_channel_index(&[], "first_init"), None);
+    }
+
+    #[test]
+    fn write_request_carries_channel_name_not_row_index() {
+        // 回归：行号在通道增删后整体移位，写入请求必须携带名字
+        let mut panel = WatchPanel::new();
+        panel.sync_from_channels(
+            &["first_init".to_string(), "g_HseClkFreq".to_string()],
+            &[ValueType::Uint8, ValueType::Uint32],
+            &[0x1FFF_0204, 0x1FFF_017C],
+        );
+        // 模拟在第二行编辑后产生的写入请求（与 show() 中的构造一致）
+        let req = WriteRequest {
+            channel_name: panel.entries[1].name.clone(),
+            raw_value: 42,
+        };
+        assert_eq!(req.channel_name, "g_HseClkFreq");
+        // 模拟删除第一行后的重新同步：行号移位，但名字仍指向同一变量
+        panel.sync_from_channels(
+            &["g_HseClkFreq".to_string()],
+            &[ValueType::Uint32],
+            &[0x1FFF_017C],
+        );
+        assert_eq!(
+            panel.entries.iter().position(|e| e.name == req.channel_name),
+            Some(0)
         );
     }
 }

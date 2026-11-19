@@ -1080,11 +1080,18 @@ impl DapSamplerApp {
     }
 
     fn apply_variable_changes(&mut self, changes: Vec<(String, bool)>) {
+        // 超限勾选必须回滚：复选框在渲染层已先行置位，若这里静默跳过，
+        // 「勾上了但没有通道」的状态会永久脱节（用户以为在监视，实际没采）。
+        let mut rejected: Vec<String> = Vec::new();
+
         for (path, is_checked) in changes {
             if is_checked {
                 if !self.channel_panel.has_channel(&path) {
                     let ch_count = self.channel_panel.channel_count();
                     if ch_count >= 8 {
+                        // 回滚勾选状态，保持 UI 与真实通道数一致
+                        self.variable_browser.checked_paths.remove(&path);
+                        rejected.push(path);
                         continue;
                     }
                     let color = CHANNEL_COLORS[ch_count % CHANNEL_COLORS.len()];
@@ -1092,11 +1099,21 @@ impl DapSamplerApp {
                         .and_then(|ctx| ctx.variables.iter().find(|v| v.path == path))
                         .map(|v| v.value_type)
                         .unwrap_or(ValueType::Float);
-                    self.channel_panel.add_channel(path, color, value_type);
+                    self.channel_panel.add_channel(path.clone(), color, value_type);
+                    // 维持不变量「有通道 ⟺ 已勾选」：渲染层在点击时已置位，
+                    // 这里补齐以覆盖非 UI 调用路径（两者行为保持一致）
+                    self.variable_browser.checked_paths.insert(path);
                 }
             } else {
                 self.channel_panel.remove_by_name(&path);
             }
+        }
+
+        if !rejected.is_empty() {
+            self.set_error(format!(
+                "At most 8 channels can be watched; unchecked: {}",
+                rejected.join(", ")
+            ));
         }
 
         // 同步 Watch 面板
@@ -2027,6 +2044,66 @@ mod open_project_tests {
             app.elf_warning.as_deref().unwrap_or("").contains("C:/definitely/not/exists/fw.elf"),
             "警告弹窗应包含 ELF 路径"
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_limit_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn ninth_check_is_rejected_and_rolled_back() {
+        // 前 8 个正常加入通道
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        assert_eq!(app.channel_panel.channel_count(), 8);
+        assert!(!app.status_is_error, "8 个以内不应报错");
+
+        // 第 9 个必须被拒绝：通道数不变
+        app.apply_variable_changes(vec![("var8".to_string(), true)]);
+        assert_eq!(
+            app.channel_panel.channel_count(),
+            8,
+            "第 9 个通道不得加入"
+        );
+        // 勾选状态必须回滚，否则 UI 显示已勾选但实际没通道
+        assert!(
+            !app.variable_browser.checked_paths.contains("var8"),
+            "被拒绝的变量必须回滚勾选状态"
+        );
+        // 必须有明确提示
+        assert!(app.status_is_error, "超限勾选必须给出错误提示");
+        assert!(
+            app.status_text.as_deref().unwrap_or("").contains("At most 8 channels"),
+            "错误消息应说明通道上限，实际 {:?}",
+            app.status_text
+        );
+    }
+
+    #[test]
+    fn unchecking_frees_a_slot() {
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+
+        // 取消一个 → 腾出位置
+        app.apply_variable_changes(vec![("var0".to_string(), false)]);
+        assert_eq!(app.channel_panel.channel_count(), 7);
+
+        // 现在第 9 个可以正常加入
+        app.apply_variable_changes(vec![("var8".to_string(), true)]);
+        assert_eq!(app.channel_panel.channel_count(), 8);
+        assert!(app.variable_browser.checked_paths.contains("var8"));
+        assert!(!app.status_is_error, "腾出位置后不应报错");
     }
 }
 

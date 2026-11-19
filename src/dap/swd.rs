@@ -340,20 +340,24 @@ impl SwdLink {
     /// AHB-AP 不支持非对齐访问，也没有 64 位访问：
     /// - 子字变量（1/2 字节）读-改-写其所在的对齐整字，只更新变量的
     ///   字节 lane，不破坏相邻变量
-    /// - 8 字节变量拆成低/高两个 32 位字写（自然对齐时独占两个字）
+    /// - 8 字节变量拆成低/高两个 32 位字写；每个字之前都重写 TAR，
+    ///   不依赖 CSW.AddrInc 自增（CSW 复位值由目标/探针固件决定）
     pub fn write_variable(&self, address: u32, byte_size: u32, value: u64) -> Result<()> {
         let acc = MemAccess::from_addr_size(address, byte_size);
         if acc.words > 1 {
-            if acc.aligned_addr & 7 != 0 {
+            // 非 4 字节对齐时变量跨三个字，首尾字与相邻变量共享，
+            // 无法安全写入（需要跨字读-改-写）
+            if acc.aligned_addr & 3 != 0 {
                 return Err(Error::Other(format!(
-                    "8 字节变量地址 0x{:08X} 未 8 字节对齐，无法写入",
-                    acc.aligned_addr
+                    "8 字节变量地址 0x{:08X} 未 4 字节对齐，无法写入",
+                    address
                 )));
             }
             let (low, high) = MemAccess::split_wide(value);
             let requests = [
                 TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
                 TransferRequest::write_ap(AP_REG_DRW, low),
+                TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr.wrapping_add(4)),
                 TransferRequest::write_ap(AP_REG_DRW, high),
             ];
             let resp = self.dap.execute_transfer(self.usb(), &requests)?;

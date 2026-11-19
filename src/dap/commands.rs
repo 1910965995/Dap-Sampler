@@ -146,13 +146,18 @@ impl TransferRequest {
 
 /// Transfer 响应
 ///
-/// `data` 使用定长数组（最多 8 个读请求，与采样变量上限一致），
-/// 使 DAP_Transfer 响应解析在采样热路径上零堆分配。
+/// `data` 使用定长数组，使 DAP_Transfer 响应解析在采样热路径上零堆分配。
+/// 容量按最坏情况取：每个通道最多占 3 个 32 位字（8 字节类型跨越
+/// 非 4 字节对齐边界时），因此 `MAX_VALUES * 3`。
+///
+/// 注意：这个容量只管“响应里能装多少字”，与通道数（`MAX_VALUES`）不同——
+/// 8 个 double 通道的完整响应携带 16 个字，若按通道数截断会静默丢掉
+/// 后半段通道的高字。
 #[derive(Debug)]
 pub struct TransferResponse {
     pub status: u8,
     pub count: u8,
-    pub data: [u32; crate::pipeline::sample::MAX_VALUES],
+    pub data: [u32; crate::pipeline::sample::MAX_VALUES * 3],
     /// 实际携带的读取值个数
     pub len: usize,
 }

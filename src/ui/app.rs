@@ -99,6 +99,8 @@ pub struct DapSamplerApp {
     elf_warning: Option<String>,
     /// 警告弹窗是否显示（右上角 X 关闭）
     show_elf_warning: bool,
+    /// 通道数上限弹窗内容（Some = 显示；勾选超过 8 个变量时弹出）
+    channel_limit_warning: Option<String>,
     /// 打开工程时的 ELF 同步询问（Some = 弹窗挂起等待用户选择）
     elf_sync_prompt: Option<ElfSyncPrompt>,
     /// Idle 状态下检测 ELF 文件变化的弹窗（文件 mtime 变化）
@@ -323,6 +325,7 @@ impl DapSamplerApp {
             show_about: false,
             elf_warning: None,
             show_elf_warning: false,
+            channel_limit_warning: None,
             elf_sync_prompt: None,
             elf_change_prompt: false,
             elf_mtime: initial_elf_mtime,
@@ -1110,10 +1113,14 @@ impl DapSamplerApp {
         }
 
         if !rejected.is_empty() {
-            self.set_error(format!(
-                "At most 8 channels can be watched; unchecked: {}",
+            let msg = format!(
+                "At most 8 channels can be watched.\n\nUnchecked: {}",
                 rejected.join(", ")
-            ));
+            );
+            // 状态栏红字 + 居中弹窗：弹窗更醒目，避免用户漏看而
+            // 误以为变量在监视中
+            self.set_error(msg.clone());
+            self.channel_limit_warning = Some(msg);
         }
 
         // 同步 Watch 面板
@@ -1854,6 +1861,34 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
+        // ---- 通道数上限弹窗（勾选超过 8 个变量时）----
+        // 底部红字容易被忽略，这里用居中弹窗明确告知被拒绝的变量
+        if let Some(msg) = self.channel_limit_warning.clone() {
+            let mut open = true;
+            let mut close_clicked = false;
+            egui::Window::new("Channel Limit")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(380.0);
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .color(egui::Color32::from_rgb(0xd0, 0x50, 0x50)),
+                    );
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("OK").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                });
+            if !open || close_clicked {
+                self.channel_limit_warning = None;
+            }
+        }
+
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
         if let Some(msg) = self.elf_warning.clone() {
@@ -2085,6 +2120,13 @@ mod channel_limit_tests {
             "错误消息应说明通道上限，实际 {:?}",
             app.status_text
         );
+        // 弹窗比底部红字醒目：必须同时挂出弹窗内容
+        let popup = app.channel_limit_warning.as_deref().unwrap_or("");
+        assert!(
+            popup.contains("At most 8 channels") && popup.contains("var8"),
+            "应弹出提示并列出被拒绝的变量，实际 {:?}",
+            app.channel_limit_warning
+        );
     }
 
     #[test]
@@ -2104,6 +2146,26 @@ mod channel_limit_tests {
         assert_eq!(app.channel_panel.channel_count(), 8);
         assert!(app.variable_browser.checked_paths.contains("var8"));
         assert!(!app.status_is_error, "腾出位置后不应报错");
+        assert!(
+            app.channel_limit_warning.is_none(),
+            "成功加入时不应弹窗"
+        );
+    }
+
+    #[test]
+    fn applying_popup_dismissal_clears_warning() {
+        // 弹窗内容为 None 时不渲染；用户点 OK / X 后应清空
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        app.apply_variable_changes(vec![("var9".to_string(), true)]);
+        assert!(app.channel_limit_warning.is_some());
+
+        // 模拟关闭
+        app.channel_limit_warning = None;
+        assert!(app.channel_limit_warning.is_none());
     }
 }
 

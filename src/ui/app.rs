@@ -335,6 +335,33 @@ impl DapSamplerApp {
     }
 
     /// 记录一条错误消息（显示在底部状态栏，红色）
+    /// 通道数上限弹窗（勾选超过 8 个变量时）
+    ///
+    /// 底部红字容易被忽略，用居中弹窗明确告知被拒绝的变量。
+    /// 右上角 X 关闭；vscroll(false) 防止内容区撑高窗口。
+    fn show_channel_limit_popup(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.channel_limit_warning.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Channel Limit")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .vscroll(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.label(
+                    egui::RichText::new(msg)
+                        .color(egui::Color32::from_rgb(0xd0, 0x50, 0x50)),
+                );
+            });
+        if !open {
+            self.channel_limit_warning = None;
+        }
+    }
+
     fn set_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         log::error!("{}", message);
@@ -1861,33 +1888,7 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
-        // ---- 通道数上限弹窗（勾选超过 8 个变量时）----
-        // 底部红字容易被忽略，这里用居中弹窗明确告知被拒绝的变量
-        if let Some(msg) = self.channel_limit_warning.clone() {
-            let mut open = true;
-            let mut close_clicked = false;
-            egui::Window::new("Channel Limit")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.set_min_width(380.0);
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .color(egui::Color32::from_rgb(0xd0, 0x50, 0x50)),
-                    );
-                    ui.add_space(6.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("OK").clicked() {
-                            close_clicked = true;
-                        }
-                    });
-                });
-            if !open || close_clicked {
-                self.channel_limit_warning = None;
-            }
-        }
+        self.show_channel_limit_popup(ctx);
 
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）

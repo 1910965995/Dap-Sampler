@@ -335,6 +335,28 @@ impl DapSamplerApp {
     }
 
     /// 记录一条错误消息（显示在底部状态栏，红色）
+    /// 状态栏内容（文字 + 错误排障悬停提示）
+    ///
+    /// 不加水平布局：多行错误消息需要按可用宽度换行铺满，
+    /// 放进 `horizontal` 会被压成不换行的单行并撑出面板宽度。
+    fn status_bar_ui(&self, ui: &mut egui::Ui) {
+        let Some(msg) = &self.status_text else {
+            return;
+        };
+        let color = if self.status_is_error {
+            egui::Color32::from_rgb(0xff, 0x55, 0x55)
+        } else {
+            ui.visuals().text_color()
+        };
+        let label =
+            ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).wrap());
+        if self.status_is_error {
+            label.on_hover_text(
+                "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。",
+            );
+        }
+    }
+
     /// 通道数上限弹窗（勾选超过 8 个变量时）
     ///
     /// 底部红字容易被忽略，用居中弹窗明确告知被拒绝的变量。
@@ -1140,12 +1162,17 @@ impl DapSamplerApp {
         }
 
         if !rejected.is_empty() {
+            let label = if rejected.len() == 1 {
+                "Unselected channel variable"
+            } else {
+                "Unselected channel variables"
+            };
             let msg = format!(
-                "At most 8 channels can be watched.\n\nUnchecked: {}",
+                "Only 8 channels can be watched at a time.\n{} (not added): {}",
+                label,
                 rejected.join(", ")
             );
-            // 状态栏红字 + 居中弹窗：弹窗更醒目，避免用户漏看而
-            // 误以为变量在监视中
+            // 状态栏与弹窗同文案：状态栏高度自适应（min_height），多行不会被截断
             self.set_error(msg.clone());
             self.channel_limit_warning = Some(msg);
         }
@@ -1494,27 +1521,13 @@ impl eframe::App for DapSamplerApp {
         // 先于 SidePanel::left 声明才能横跨全宽（含侧边栏下方）。
         // 堆叠语义：先声明的 bottom panel 在最底部，后声明的叠在它上方，
         // 因此状态栏先于 watch_panel 声明，紧贴窗口底边。
+        //
+        // 高度随内容自适应（min_height 保证单行时仍为 24px）：
+        // 错误消息可能是多行，固定高度会把后面的行截断。
         egui::TopBottomPanel::bottom("status_bar")
             .resizable(false)
-            .exact_height(24.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(msg) = &self.status_text {
-                        let color = if self.status_is_error {
-                            egui::Color32::from_rgb(0xff, 0x55, 0x55)
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        let label = ui.label(egui::RichText::new(msg).color(color));
-                        // 错误消息悬停时显示排障提示
-                        if self.status_is_error {
-                            label.on_hover_text(
-                                "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。"
-                            );
-                        }
-                    }
-                });
-            });
+            .min_height(24.0)
+            .show(ctx, |ui| self.status_bar_ui(ui));
 
         // ---- 左侧面板：变量浏览器 + 通道 + 光标（可展开/收起）----
         egui::SidePanel::left("sidebar")
@@ -2116,18 +2129,128 @@ mod channel_limit_tests {
         );
         // 必须有明确提示
         assert!(app.status_is_error, "超限勾选必须给出错误提示");
+        let status = app.status_text.as_deref().unwrap_or("");
         assert!(
-            app.status_text.as_deref().unwrap_or("").contains("At most 8 channels"),
-            "错误消息应说明通道上限，实际 {:?}",
+            status.contains("Only 8 channels") && status.contains("Unselected channel variable"),
+            "状态栏应说明通道上限与被取消的变量，实际 {:?}",
+            app.status_text
+        );
+        // 多行消息：状态栏高度自适应（min_height），不再固定 24px 截断
+        assert!(
+            status.contains('\n'),
+            "状态栏应保留多行排版，实际 {:?}",
             app.status_text
         );
         // 弹窗比底部红字醒目：必须同时挂出弹窗内容
         let popup = app.channel_limit_warning.as_deref().unwrap_or("");
         assert!(
-            popup.contains("At most 8 channels") && popup.contains("var8"),
+            popup.contains("Only 8 channels") && popup.contains("var8"),
             "应弹出提示并列出被拒绝的变量，实际 {:?}",
             app.channel_limit_warning
         );
+        assert!(
+            popup.contains("Unselected channel variable"),
+            "弹窗应使用 Unselected channel variable 措辞，实际 {:?}",
+            app.channel_limit_warning
+        );
+        assert_eq!(
+            status, popup,
+            "状态栏与弹窗应使用同一份多行文案"
+        );
+    }
+
+    /// 多行状态栏必须按内容撑高，不能被固定高度截断
+    #[test]
+    fn multiline_status_message_is_fully_rendered() {
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        app.apply_variable_changes(vec![("SystemCoreClock".to_string(), true)]);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx.set_visuals(egui::Visuals::light());
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        // 首帧测量、次帧定型：面板高度依赖上一帧内容矩形
+        let _ = ctx.run(raw.clone(), |ctx| {
+            egui::TopBottomPanel::bottom("status_bar")
+                .resizable(false)
+                .min_height(24.0)
+                .show(ctx, |ui| app.status_bar_ui(ui));
+        });
+        let out = ctx.run(raw, |ctx| {
+            egui::TopBottomPanel::bottom("status_bar")
+                .resizable(false)
+                .min_height(24.0)
+                .show(ctx, |ui| app.status_bar_ui(ui));
+        });
+
+        // 收集状态栏区域内的文字，确认两行都画出来了
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                texts.push(t.clone());
+            }
+        }
+        let rendered: String = texts
+            .iter()
+            .map(|t| t.galley.job.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            rendered.contains("Only 8 channels"),
+            "状态栏第一行应渲染，实际 {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains("SystemCoreClock"),
+            "状态栏第二行（被拒变量名）应渲染而不是被截断，实际 {:?}",
+            rendered
+        );
+
+        // 状态栏总高度应超过单行（约 24px）
+        let bar_height = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.pos.y),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            bar_height > 800.0,
+            "状态栏应位于底部且其内容行可见，实际最大 y={bar_height}"
+        );
+    }
+
+    #[test]
+    fn rejection_message_pluralizes_multiple_variables() {
+        // 一次勾选多个超限变量时，文案用复数形式
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        let extra: Vec<(String, bool)> = (0..2)
+            .map(|i| (format!("extra{i}"), true))
+            .collect();
+        app.apply_variable_changes(extra);
+
+        let popup = app.channel_limit_warning.as_deref().unwrap_or("");
+        assert!(
+            popup.contains("Unselected channel variables (not added)"),
+            "多个变量应用复数措辞，实际 {:?}",
+            app.channel_limit_warning
+        );
+        assert!(popup.contains("extra0") && popup.contains("extra1"));
     }
 
     #[test]

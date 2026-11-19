@@ -155,7 +155,7 @@ mod tests {
         // 容量参数生效：写入超过容量时覆盖最旧数据，保留最新 capacity 个点
         let ring = RingBuffer::new(100);
         for i in 0..150u64 {
-            ring.push(Sample::new(i, i as f64 * 0.001, &[1.0f32.to_bits()]));
+            ring.push(Sample::new(i, i as f64 * 0.001, &[u64::from(1.0f32.to_bits())]));
         }
         assert_eq!(ring.available(), 100);
         assert_eq!(ring.overwritten(), 50);

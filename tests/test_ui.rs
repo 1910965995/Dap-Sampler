@@ -8,7 +8,7 @@ use dap_sampler::pipeline::sample::{Sample, ValueType};
 // ============================================================
 
 fn make_sample(seq: u64, val: u32) -> Sample {
-    Sample::new(seq, seq as f64 * 0.001, &[val])
+    Sample::new(seq, seq as f64 * 0.001, &[u64::from(val)])
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn display_buffer_push_batch_exact_overflow() {
 
 /// 创建一个 Sample，值以 f32 bit pattern 存储
 fn make_float_sample(seq: u64, val: f32) -> Sample {
-    Sample::new(seq, seq as f64 * 0.001, &[val.to_bits()])
+    Sample::new(seq, seq as f64 * 0.001, &[u64::from(val.to_bits())])
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn sample_as_f64s_typed_float() {
 #[test]
 fn sample_as_f64s_typed_uint32() {
     // u32 值 42 应直接解释为 42.0
-    let s = Sample::new(0, 0.0, &[42u32]);
+    let s = Sample::new(0, 0.0, &[u64::from(42u32)]);
     let types = vec![ValueType::Uint32];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 42.0).abs() < 0.001);
@@ -215,7 +215,7 @@ fn sample_as_f64s_typed_int16() {
 #[test]
 fn sample_as_f64s_typed_mixed() {
     // 混合类型：float + uint32
-    let s = Sample::new(0, 0.0, &[3.25f32.to_bits(), 100u32]);
+    let s = Sample::new(0, 0.0, &[u64::from(3.25f32.to_bits()), u64::from(100u32)]);
     let types = vec![ValueType::Float, ValueType::Uint32];
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 3.25).abs() < 0.001);
@@ -225,7 +225,7 @@ fn sample_as_f64s_typed_mixed() {
 #[test]
 fn sample_as_f64s_typed_default_float() {
     // 类型列表短于 values 时，缺失位置默认 float
-    let s = Sample::new(0, 0.0, &[3.25f32.to_bits(), 100u32]);
+    let s = Sample::new(0, 0.0, &[u64::from(3.25f32.to_bits()), u64::from(100u32)]);
     let types = vec![ValueType::Float]; // 只有 1 个类型，但 values 有 2 个
     let result = s.as_f64s_typed(&types);
     assert!((result[0] - 3.25).abs() < 0.001);

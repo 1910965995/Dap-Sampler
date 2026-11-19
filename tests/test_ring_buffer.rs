@@ -3,7 +3,7 @@ use dap_sampler::pipeline::ring_buffer::RingBuffer;
 use dap_sampler::pipeline::sample::Sample;
 
 fn make_sample(seq: u64, val: u32) -> Sample {
-    Sample::new(seq, seq as f64 * 0.001, &[val])
+    Sample::new(seq, seq as f64 * 0.001, &[u64::from(val)])
 }
 
 // ================================================================
@@ -54,7 +54,7 @@ fn push_multiple_pop_all() {
     assert_eq!(n, 5);
     for (i, s) in buf.iter().enumerate().take(5) {
         assert_eq!(s.seq, i as u64);
-        assert_eq!(s.values()[0], i as u32 * 10);
+        assert_eq!(s.values()[0], u64::from(i as u32) * 10);
     }
 }
 
@@ -204,9 +204,9 @@ fn stress_large_volume() {
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 1024);
 
-    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values()[0]).collect();
+    let mut found: Vec<u64> = buf[..n].iter().map(|s| s.values()[0]).collect();
     found.sort();
-    let expected: Vec<u32> = (8976u32..10_000).collect();
+    let expected: Vec<u64> = (8976u32..10_000).map(u64::from).collect();
     assert_eq!(found, expected);
 }
 

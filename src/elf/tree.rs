@@ -189,6 +189,16 @@ fn expand_variable(
 
     match resolved {
         ResolvedType::Base(name, byte_size) => {
+            // 不支持的类型宽度：显式跳过并告警，而不是用错误宽度读出一串
+            // 垃圾值。当前只支持 1/2/4/8 字节的基类型（AHB-AP 以 32 位字
+            // 为单位访问，8 字节类型占两个字）。
+            if !matches!(*byte_size, 1 | 2 | 4 | 8) {
+                log::warn!(
+                    "跳过不支持的变量 '{}'：基类型 '{}' 为 {} 字节（仅支持 1/2/4/8 字节）",
+                    dv.name, name, byte_size
+                );
+                return false;
+            }
             // 全局叶子预算：防类型环/巨型嵌套产生的指数级展开
             if output.len() >= MAX_EXPANDED_LEAVES {
                 return true;

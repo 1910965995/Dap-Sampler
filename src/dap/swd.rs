@@ -335,17 +335,38 @@ impl SwdLink {
         Ok(())
     }
 
-    /// 写入一个变量（按字节大小 1/2/4）
+    /// 写入一个变量（按字节大小 1/2/4/8）
     ///
-    /// AHB-AP 不支持非对齐访问。子字变量（1/2 字节）读-改-写其所在的
-    /// 对齐整字，只更新变量的字节 lane，不破坏相邻变量。
-    pub fn write_variable(&self, address: u32, byte_size: u32, value: u32) -> Result<()> {
+    /// AHB-AP 不支持非对齐访问，也没有 64 位访问：
+    /// - 子字变量（1/2 字节）读-改-写其所在的对齐整字，只更新变量的
+    ///   字节 lane，不破坏相邻变量
+    /// - 8 字节变量拆成低/高两个 32 位字写（自然对齐时独占两个字）
+    pub fn write_variable(&self, address: u32, byte_size: u32, value: u64) -> Result<()> {
         let acc = MemAccess::from_addr_size(address, byte_size);
+        if acc.words > 1 {
+            if acc.aligned_addr & 7 != 0 {
+                return Err(Error::Other(format!(
+                    "8 字节变量地址 0x{:08X} 未 8 字节对齐，无法写入",
+                    acc.aligned_addr
+                )));
+            }
+            let (low, high) = MemAccess::split_wide(value);
+            let requests = [
+                TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
+                TransferRequest::write_ap(AP_REG_DRW, low),
+                TransferRequest::write_ap(AP_REG_DRW, high),
+            ];
+            let resp = self.dap.execute_transfer(self.usb(), &requests)?;
+            if resp.status != TRANSFER_OK {
+                return Err(Error::TransferFailed(resp.status, resp.count));
+            }
+            return Ok(());
+        }
         if acc.mask == u32::MAX {
-            return self.write_memory(address, value);
+            return self.write_memory(address, value as u32);
         }
         let current = self.read_memory(acc.aligned_addr)?;
-        let merged = acc.merge(current, value);
+        let merged = acc.merge(current, value as u32);
         self.write_memory(acc.aligned_addr, merged)
     }
 

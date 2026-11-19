@@ -57,8 +57,8 @@ mod tests {
     /// 2 个采样点：float 1.5/2.5（f32 可精确表示）+ int16 -123/-122
     fn make_samples() -> Vec<Sample> {
         vec![
-            Sample::new(0, 0.0, &[1.5f32.to_bits(), (-123i16) as u16 as u32]),
-            Sample::new(1, 0.0001, &[2.5f32.to_bits(), (-122i16) as u16 as u32]),
+            Sample::new(0, 0.0, &[u64::from(1.5f32.to_bits()), u64::from((-123i16) as u16)]),
+            Sample::new(1, 0.0001, &[u64::from(2.5f32.to_bits()), u64::from((-122i16) as u16)]),
         ]
     }
 
@@ -106,8 +106,8 @@ mod tests {
     #[test]
     fn nan_and_inf_output_as_is() {
         let samples = vec![
-            Sample::new(0, 0.0, &[f32::NAN.to_bits()]),
-            Sample::new(1, 0.0001, &[f32::INFINITY.to_bits()]),
+            Sample::new(0, 0.0, &[u64::from(f32::NAN.to_bits())]),
+            Sample::new(1, 0.0001, &[u64::from(f32::INFINITY.to_bits())]),
         ];
         let names = vec!["ch1".to_string()];
         let types = vec![ValueType::Float];
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn types_shorter_than_values_fall_back_to_float() {
         // types 只有 1 个（Int16），样本有 2 个值 → 第 2 个按默认 float 解释
-        let samples = vec![Sample::new(0, 0.0, &[(-5i16) as u16 as u32, 1.5f32.to_bits()])];
+        let samples = vec![Sample::new(0, 0.0, &[u64::from((-5i16) as u16), u64::from(1.5f32.to_bits())])];
         let names = vec!["a".to_string(), "b".to_string()];
         let types = vec![ValueType::Int16];
         let mut out = Vec::new();
@@ -153,5 +153,26 @@ mod tests {
         let body = text.trim_start_matches('\u{FEFF}');
         let lines: Vec<&str> = body.trim_end().split("\r\n").collect();
         assert_eq!(lines[1], "0,-5,1.5");
+    }
+
+    #[test]
+    fn exports_64bit_columns() {
+        // double + int64 + uint64 各一列，CSV 按类型格式化
+        let d = 2.5f64;
+        let samples = vec![Sample::new(
+            0,
+            0.0,
+            &[d.to_bits(), (-9i64) as u64, 18_446_744_073_709_551_615u64],
+        )];
+        let names = vec!["d".to_string(), "i".to_string(), "u".to_string()];
+        let types = vec![ValueType::Float64, ValueType::Int64, ValueType::Uint64];
+        let mut out = Vec::new();
+        write_csv(&mut out, &samples, &names, &types).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let body = text.trim_start_matches('\u{FEFF}');
+        let lines: Vec<&str> = body.trim_end().split("\r\n").collect();
+        assert_eq!(lines[0], "time_s,d,i,u");
+        // CSV 经 f64 中转：u64 超过 2^53 后无法精确表示（f64 精度上限）
+        assert_eq!(lines[1], "0,2.5,-9,18446744073709552000");
     }
 }

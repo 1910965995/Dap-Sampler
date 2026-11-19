@@ -74,16 +74,18 @@ pub struct PipelineEngine {
     dap: DapProtocol,
     /// 各变量的对齐访问信息（子字变量按所在对齐整字访问 + lane 提取）
     accesses: Vec<MemAccess>,
+    /// 各变量的类型（决定读取请求数与提取方式）
+    types: Vec<ValueType>,
     /// 目标采样间隔（微秒）
     interval_us: u64,
     /// 停止标志（主线程设为 false 时，子线程退出）
     running: Arc<AtomicBool>,
     /// 写入请求队列（主线程推送，提交线程消费）
-    /// 元素: (变量索引, 值)
-    write_queue: Arc<Mutex<VecDeque<(usize, u32)>>>,
-    /// 各变量所在对齐整字的最近一次原始值（接收线程更新，
-    /// 提交线程对子字变量做读-改-写时合并用）
-    last_words: Arc<Mutex<Vec<Option<u32>>>>,
+    /// 元素: (变量索引, 原始位模式)
+    write_queue: Arc<Mutex<VecDeque<(usize, u64)>>>,
+    /// 各变量的最近一次原始位模式（接收线程更新；提交线程对子字/64 位
+    /// 变量做读-改-写时取同批的旧值合并用）
+    last_words: Arc<Mutex<Vec<Option<u64>>>>,
     /// 每条已发出命令中的写入请求数（提交线程入队、接收线程出队）。
     /// 响应长度按 count + 该值动态计算（写入请求不返回数据）
     writes_per_cmd: Arc<Mutex<VecDeque<u8>>>,
@@ -119,6 +121,7 @@ impl PipelineEngine {
             usb,
             dap,
             accesses,
+            types: types.to_vec(),
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -136,6 +139,7 @@ impl PipelineEngine {
             usb: Arc::clone(&self.usb),
             dap: self.dap,
             accesses: self.accesses.clone(),
+            types: self.types.clone(),
             interval_us: (1_000_000.0 / rate_hz as f64) as u64,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
@@ -205,15 +209,20 @@ impl PipelineEngine {
         // 子字变量（u8/u16）写对齐字地址，读回整字后由接收线程按 lane 提取。
         // AHB-AP 不支持非对齐访问：对非字对齐地址发起 32 位 DRW 读行为
         // 不可预测（实际芯片通常回退到对齐字），必须对齐后 lane 提取。
+        // 每变量 = 写 TAR + 读 DRW × words。
+        // 32 位及更窄：1 次读；8 字节类型：2-3 次读（AHB-AP 无 64 位访问）。
         let requests: Vec<TransferRequest> = accesses
             .iter()
             .flat_map(|acc| {
-                vec![
-                    TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
-                    TransferRequest::read_ap(AP_REG_DRW),
-                ]
+                let mut reqs = vec![TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr)];
+                for _ in 0..acc.words {
+                    reqs.push(TransferRequest::read_ap(AP_REG_DRW));
+                }
+                reqs
             })
             .collect();
+
+
 
         let dap_index = self.dap.dap_index;
 
@@ -233,7 +242,7 @@ impl PipelineEngine {
         }
 
         // 循环外复用缓冲区，避免每采样周期堆分配
-        let mut pending_writes: Vec<(usize, u32)> = Vec::with_capacity(24);
+        let mut pending_writes: Vec<(usize, u64)> = Vec::with_capacity(24);
         let mut cmd: Vec<u8> = Vec::with_capacity(read_part.len() + 24 * 10);
 
         let handle = thread::Builder::new()
@@ -262,7 +271,8 @@ impl PipelineEngine {
                     // 检查是否有待写入的请求，有则附加到命令前部。
                     // 限制每轮消耗的写入数，确保 total_requests 不超过
                     // MAX_TRANSFER_REQUESTS（避免 u8 截断 + USB 包超限）。
-                    let max_writes = (MAX_TRANSFER_REQUESTS.saturating_sub(requests.len())) / 2;
+                    // 每次写入最多占 1 条写 TAR + 2 条写 DRW（64 位字需两次）
+                    let max_writes = (MAX_TRANSFER_REQUESTS.saturating_sub(requests.len())) / 3;
                     pending_writes.clear();
                     if let Ok(mut wq) = write_queue.lock() {
                         while pending_writes.len() < max_writes {
@@ -293,23 +303,61 @@ impl PipelineEngine {
                             log::warn!("写入请求被跳过：变量索引 {} 无对齐访问信息", var_idx);
                             continue;
                         };
-                        let write_data = if acc.mask == u32::MAX {
-                            value
-                        } else {
-                            let last = words_guard
-                                .as_ref()
-                                .and_then(|w| w.get(var_idx))
-                                .copied()
-                                .flatten();
-                            let Some(word) = last else {
+
+                        if acc.words > 1 {
+                            // 64 位变量：AHB-AP 无 64 位访问，拆成低/高两个
+                            // 32 位字写。自然对齐（8 字节）时变量独占两个字，
+                            // 无需读-改-写；未对齐时首尾字与相邻变量共享，
+                            // 无法安全写入 → 跳过并告警（ELF 的 double 恒为
+                            // 8 字节对齐，此分支仅防御畸形输入）。
+                            if acc.aligned_addr & 7 != 0 {
                                 log::warn!(
-                                    "写入请求被跳过：变量 {} 尚未采样到所在整字，无法读-改-写",
-                                    var_idx
+                                    "写入请求被跳过：变量 {} 的 8 字节数据未 8 字节对齐 (0x{:08X})",
+                                    var_idx, acc.aligned_addr
                                 );
                                 continue;
-                            };
-                            acc.merge(word, value)
+                            }
+                            let (low, high) = MemAccess::split_wide(value);
+                            let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
+                            let w_drw_lo = TransferRequest::write_ap(AP_REG_DRW, low);
+                            let w_drw_hi = TransferRequest::write_ap(AP_REG_DRW, high);
+                            cmd.push(w_tar.request_byte());
+                            cmd.extend_from_slice(&acc.aligned_addr.to_le_bytes());
+                            cmd.push(w_drw_lo.request_byte());
+                            cmd.extend_from_slice(&low.to_le_bytes());
+                            cmd.push(w_drw_hi.request_byte());
+                            cmd.extend_from_slice(&high.to_le_bytes());
+                            n_requests += 3;
+                            continue;
+                        }
+
+                        if acc.mask == u32::MAX {
+                            // 32 位整字：直接写，无需旧值
+                            let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
+                            let w_drw = TransferRequest::write_ap(AP_REG_DRW, value as u32);
+                            cmd.push(w_tar.request_byte());
+                            cmd.extend_from_slice(&acc.aligned_addr.to_le_bytes());
+                            cmd.push(w_drw.request_byte());
+                            cmd.extend_from_slice(&(value as u32).to_le_bytes());
+                            n_requests += 2;
+                            continue;
+                        }
+
+                        // 子字变量（u8/u16）：用最近一次采样的整字合并，
+                        // 只覆盖本变量 lane，不踩相邻变量
+                        let last = words_guard
+                            .as_ref()
+                            .and_then(|w| w.get(var_idx))
+                            .copied()
+                            .flatten();
+                        let Some(old) = last else {
+                            log::warn!(
+                                "写入请求被跳过：变量 {} 尚未采样到旧值，无法读-改-写",
+                                var_idx
+                            );
+                            continue;
                         };
+                        let write_data = acc.merge(old as u32, value as u32);
                         let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
                         let w_drw = TransferRequest::write_ap(AP_REG_DRW, write_data);
                         cmd.push(w_tar.request_byte());
@@ -504,21 +552,42 @@ impl PipelineEngine {
                         // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
                         let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
 
-                        // 记录各变量所在对齐整字的原始值（提交线程写子字变量
-                        // 时做读-改-写合并用），随后按 lane 提取变量值
-                        if let Ok(mut lw) = last_words.lock() {
-                            lw.resize(num_vars, None);
-                            for (i, &raw) in resp.values().iter().enumerate() {
-                                lw[i] = Some(raw);
+                        // 响应的数据区按“读请求的完成顺序”排列，而每个变量
+                        // 可能占 1-2 个读请求（64 位类型两次 DRW 读）。按
+                        // read_offsets 把读回的 32 位字归组后再拼成变量值。
+                        //
+                        // 注意：FAULT/WAIT 提前中止时，只有已完成的读请求
+                        // 携带数据，此时尾部变量缺失数据——用 0 填充并保持
+                        // 通道位置对齐（不做位移，否则波形通道会串号）。
+                        let mut vals = [0u64; MAX_VALUES];
+                        {
+                            // 数据区只包含成功完成的读请求，按变量顺序归组：
+                            // 每个变量消耗 reads_per_var 个 32 位字
+                            // （32 位及更窄 1 个，64 位 2 个）。
+                            // FAULT 提前中止时尾部变量无数据，保持 0 且
+                            // 不移位（否则通道会串号）。
+                            let words = resp.values();
+                            let mut wi = 0usize;
+                            let mut lw_guard = last_words.lock().ok();
+                            if let Some(lw) = lw_guard.as_mut() {
+                                lw.resize(num_vars, None);
+                            }
+                            for (vi, acc) in accesses.iter().enumerate().take(MAX_VALUES) {
+                                let need = acc.words as usize;
+                                if wi + need > words.len() {
+                                    // 该变量数据缺失：位置保持 0
+                                    continue;
+                                }
+                                let buf = &words[wi..wi + need];
+                                wi += need;
+                                vals[vi] = acc.extract_wide(buf);
+                                if let Some(lw) = lw_guard.as_mut() {
+                                    lw[vi] = Some(vals[vi]);
+                                }
                             }
                         }
-                        let mut vals = [0u32; MAX_VALUES];
-                        let n = resp.len.min(num_vars);
-                        for i in 0..n {
-                            vals[i] = accesses[i].extract(resp.data[i]);
-                        }
 
-                        // 定长数组写入：零堆分配
+                        let n = accesses.len().min(MAX_VALUES);
                         let sample = Sample::new(seq, timestamp_sec, &vals[..n]);
 
                         ring.push(sample);
@@ -556,7 +625,7 @@ pub struct PipelineHandle {
     collect_handle: JoinHandle<()>,
     ring_buffer: Arc<RingBuffer>,
     running: Arc<AtomicBool>,
-    write_queue: Arc<Mutex<VecDeque<(usize, u32)>>>,
+    write_queue: Arc<Mutex<VecDeque<(usize, u64)>>>,
 }
 
 impl PipelineHandle {
@@ -566,7 +635,7 @@ impl PipelineHandle {
     /// DAP_Transfer 命令，不影响正常采样。
     /// 子字变量（u8/u16）由提交线程读-改-写：用最近采样到的对齐整字
     /// 合并变量的字节 lane，不破坏相邻变量。
-    pub fn queue_write(&self, var_idx: usize, value: u32) {
+    pub fn queue_write(&self, var_idx: usize, value: u64) {
         if let Ok(mut wq) = self.write_queue.lock() {
             wq.push_back((var_idx, value));
         }
@@ -705,6 +774,80 @@ mod tests {
         let r2 = DapProtocol::parse_transfer_response(&frames[1]).unwrap();
         assert_eq!(r2.status, TRANSFER_OK);
         assert_eq!(r2.values(), &[0xBBBB_0001, 0xBBBB_0002]);
+    }
+
+    // ---- 64 位类型：请求布局与响应归组 ----
+
+    /// 计算读取块的请求数（每变量 写TAR + words×读DRW）
+    fn read_block_requests(types: &[ValueType]) -> usize {
+        types
+            .iter()
+            .map(|t| 1 + MemAccess::from_addr_size(0, t.byte_size()).words as usize)
+            .sum()
+    }
+
+    #[test]
+    fn read_block_scales_with_type_width() {
+        use ValueType::*;
+        assert_eq!(read_block_requests(&[Float, Float, Float, Float]), 8);
+        // 一个 double 多占一个读请求：1(写TAR)+2(读DRW) + 4×2 = 11
+        assert_eq!(read_block_requests(&[Float64, Float, Float, Float]), 3 + 6);
+    }
+
+    #[test]
+    fn response_values_group_by_variable_width() {
+        // 混合宽度响应：double(2 字) + float(1 字) + u16(1 字)
+        // 引擎按 accesses.words 顺序消费读回的字
+        let accesses = [
+            MemAccess::from_addr_size(0x2000_0000, 8),
+            MemAccess::from_addr_size(0x2000_0008, 4),
+            MemAccess::from_addr_size(0x2000_000E, 2),
+        ];
+        let d = 3.25f64;
+        let (d_low, d_high) = MemAccess::split_wide(d.to_bits());
+        let words = [d_low, d_high, 1.5f32.to_bits(), 0x2222_1111];
+
+        let mut vals = [0u64; 3];
+        let mut wi = 0usize;
+        for (vi, acc) in accesses.iter().enumerate() {
+            let need = acc.words as usize;
+            let buf = &words[wi..wi + need];
+            wi += need;
+            vals[vi] = acc.extract_wide(buf);
+        }
+        assert_eq!(ValueType::Float64.to_f64(vals[0]), 3.25);
+        assert_eq!(ValueType::Float.to_f64(vals[1]), 1.5);
+        // 变量位于字内高 16 位（addr+2）：extract 后低位对齐
+        assert_eq!(vals[2], 0x0000_2222);
+        assert_eq!(ValueType::Uint16.to_f64(vals[2]), 0x2222u64 as f64);
+    }
+
+    #[test]
+    fn truncated_response_keeps_channel_positions() {
+        // FAULT 提前中止：只返回了第一个变量（double 的两个字）
+        // 后续变量必须保持 0 且不位移，否则波形通道会串号
+        let accesses = [
+            MemAccess::from_addr_size(0x2000_0000, 8),
+            MemAccess::from_addr_size(0x2000_0008, 4),
+        ];
+        let d = 1.5f64;
+        let (lo, hi) = MemAccess::split_wide(d.to_bits());
+        // 只回了一个字（高字缺失）→ 该变量数据不完整，也按缺失处理
+        let words = [lo, hi];
+
+        let mut vals = [0u64; 2];
+        let mut wi = 0usize;
+        for (vi, acc) in accesses.iter().enumerate() {
+            let need = acc.words as usize;
+            if wi + need > words.len() {
+                continue; // 保持 0
+            }
+            vals[vi] = acc.extract_wide(&words[wi..wi + need]);
+            wi += need;
+        }
+        assert_eq!(ValueType::Float64.to_f64(vals[0]), 1.5);
+        // 通道 1 无数据但位置保持（值为 0），不是把通道 2 的数据填到通道 1
+        assert_eq!(vals[1], 0u64);
     }
 
     #[test]

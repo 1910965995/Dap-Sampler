@@ -40,7 +40,7 @@ fn e2e_single_variable_read_flow() {
     assert_eq!(resp.values()[0], 0x40490FDB);
 
     // Step 3: 包装为 Sample
-    let sample = Sample::new(0, 0.0, resp.values());
+    let sample = Sample::new(0, 0.0, &resp.values().iter().map(|&v| u64::from(v)).collect::<Vec<_>>());
     assert_eq!(sample.values()[0], 0x40490FDB);
     let floats = sample.as_floats();
     let expected = f32::from_bits(0x40490FDB);
@@ -77,7 +77,7 @@ fn e2e_multi_variable_read_flow() {
     assert_eq!(resp.values().len(), 4);
     assert_eq!(resp.values(), &values[..]);
 
-    let sample = Sample::new(5, 0.00025, resp.values());
+    let sample = Sample::new(5, 0.00025, &resp.values().iter().map(|&v| u64::from(v)).collect::<Vec<_>>());
     // 验证时间戳字段
     assert!((sample.timestamp_sec - 0.00025).abs() < 1e-9);
 }
@@ -95,7 +95,7 @@ fn e2e_ring_buffer_pipeline_simulation() {
         let sample = Sample::new(
             seq,
             seq as f64 * 0.00005,
-            &[seq as u32 * 10, seq as u32 * 20, seq as u32 * 30, seq as u32 * 40],
+            &[u64::from(seq as u32 * 10), u64::from(seq as u32 * 20), u64::from(seq as u32 * 30), u64::from(seq as u32 * 40)],
         );
         rb.push(sample);
     }
@@ -202,7 +202,7 @@ fn stress_ring_buffer_200k() {
 
     // Fill beyond capacity
     for i in 0..300_000u64 {
-        rb.push(Sample::new(i, i as f64 * 0.00005, &[i as u32]));
+        rb.push(Sample::new(i, i as f64 * 0.00005, &[u64::from(i as u32)]));
     }
 
     // Overwrite semantics: buffer keeps the NEWEST 200k samples.
@@ -221,8 +221,8 @@ fn stress_ring_buffer_200k() {
     }
 
     // Should contain exactly the expected set of values.
-    let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values()[0]).collect();
+    let mut found: Vec<u64> = buf[..n].iter().map(|s| s.values()[0]).collect();
     found.sort();
-    let expected: Vec<u32> = (100_000u32..300_000).collect();
+    let expected: Vec<u64> = (100_000u32..300_000).map(u64::from).collect();
     assert_eq!(found, expected);
 }

@@ -595,11 +595,11 @@ fn cmd_sample(
             // 直接遍历定长切片，避免 as_floats 的每样本分配
             if as_float {
                 for &v in sample.values() {
-                    write!(writer, ",{}", f32::from_bits(v))?;
+                    write!(writer, ",{}", f32::from_bits(v as u32))?;
                 }
             } else {
                 for &v in sample.values() {
-                    write!(writer, ",0x{:08X}", v)?;
+                    write!(writer, ",0x{:08X}", v as u32)?;
                 }
             }
             writeln!(writer)?;

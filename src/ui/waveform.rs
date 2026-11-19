@@ -632,7 +632,7 @@ mod tests {
         panel
     }
 
-    fn make_buffer(seqs: u64, vals: &[u32]) -> Vec<Sample> {
+    fn make_buffer(seqs: u64, vals: &[u64]) -> Vec<Sample> {
         (0..seqs)
             .map(|i| Sample::new(i, i as f64 * 0.001, vals))
             .collect()
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn rebuild_cache_applies_transform() {
         let mut panel = make_panel(vec![("CH1", 10.0, 2.0)]);
-        let buffer = make_buffer(1, &[3.0f32.to_bits()]);
+        let buffer = make_buffer(1, &[u64::from(3.0f32.to_bits())]);
         panel.rebuild_cache(&buffer);
         // displayed_y = 3.0 * 2.0 + 10.0 = 16.0
         assert_eq!(panel.cached_points[0].len(), 1);
@@ -652,7 +652,7 @@ mod tests {
     fn rescan_y_uses_raw_not_transformed() {
         // rescan 统计 raw 值，不应受 offset/scale 影响
         let mut panel = make_panel(vec![("CH1", 1.0e6, 1.0)]);
-        let buffer = make_buffer(1, &[1.0f32.to_bits()]);
+        let buffer = make_buffer(1, &[u64::from(1.0f32.to_bits())]);
         panel.rescan_y_max(&buffer, 0.0, 0.001);
         // raw_f = 1.0, 不应受 offset 影响
         assert!((panel.auto_y_max_abs - 1.0).abs() < 1e-6);
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn set_channel_transform_marks_dirty() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        let buffer = make_buffer(1, &[1.0f32.to_bits()]);
+        let buffer = make_buffer(1, &[u64::from(1.0f32.to_bits())]);
         panel.rebuild_cache(&buffer);
         // rebuild_cache 后所有脏标志应被清除
         assert!(panel.dirty_channels.iter().all(|d| !d));
@@ -677,7 +677,7 @@ mod tests {
         let n = 5000_usize;
         // 每个样本一个值,值 = i as f32
         let buffer: Vec<Sample> = (0..n)
-            .map(|i| Sample::new(i as u64, i as f64 * 0.001, &[(i as f32).to_bits()]))
+            .map(|i| Sample::new(i as u64, i as f64 * 0.001, &[u64::from((i as f32).to_bits())]))
             .collect();
         panel.rebuild_cache(&buffer);
         assert_eq!(panel.cached_points[0].len(), n);
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn incremental_update_trims_and_appends() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        let buf1 = make_buffer(10, &[1.0f32.to_bits()]); // 10 点，raw=1.0
+        let buf1 = make_buffer(10, &[u64::from(1.0f32.to_bits())]); // 10 点，raw=1.0
         panel.rebuild_cache(&buf1);
         panel.cache_buffer_len = buf1.len();
         panel.cache_offset = 0;
@@ -715,7 +715,7 @@ mod tests {
         // 模拟窗口滑动：头部丢弃 3 点（offset=3），尾部追加 4 点（raw=2.0）
         let mut buf2: Vec<Sample> = buf1[3..].to_vec();
         for k in 0..4u64 {
-            buf2.push(Sample::new(10 + k, (10 + k) as f64 * 0.001, &[2.0f32.to_bits()]));
+            buf2.push(Sample::new(10 + k, (10 + k) as f64 * 0.001, &[u64::from(2.0f32.to_bits())]));
         }
 
         panel.incremental_update(&buf2, 3, 3, buf1.len() - 3);
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn incremental_update_applies_transform_to_new_points() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0), ("CH2", 100.0, 0.5)]);
-        let buf1 = make_buffer(5, &[4.0f32.to_bits(), 4.0f32.to_bits()]);
+        let buf1 = make_buffer(5, &[u64::from(4.0f32.to_bits()), u64::from(4.0f32.to_bits())]);
         panel.rebuild_cache(&buf1);
         panel.cache_buffer_len = 5;
         panel.cache_offset = 0;
@@ -747,7 +747,7 @@ mod tests {
         // 追加 2 个新点（raw=8.0）
         let mut buf2 = buf1.clone();
         for k in 0..2u64 {
-            buf2.push(Sample::new(5 + k, (5 + k) as f64 * 0.001, &[8.0f32.to_bits(), 8.0f32.to_bits()]));
+            buf2.push(Sample::new(5 + k, (5 + k) as f64 * 0.001, &[u64::from(8.0f32.to_bits()), u64::from(8.0f32.to_bits())]));
         }
 
         panel.incremental_update(&buf2, 0, 0, 5);
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn incremental_update_window_shrink_only_trims() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        let buf1 = make_buffer(10, &[1.0f32.to_bits()]);
+        let buf1 = make_buffer(10, &[u64::from(1.0f32.to_bits())]);
         panel.rebuild_cache(&buf1);
         panel.cache_buffer_len = 10;
         panel.cache_offset = 0;
@@ -785,8 +785,8 @@ mod tests {
     #[test]
     fn append_has_non_finite_detects_nan() {
         let panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        let mut buf = make_buffer(2, &[1.0f32.to_bits()]);
-        buf.push(Sample::new(2, 0.002, &[f32::NAN.to_bits()]));
+        let mut buf = make_buffer(2, &[u64::from(1.0f32.to_bits())]);
+        buf.push(Sample::new(2, 0.002, &[u64::from(f32::NAN.to_bits())]));
         // 追加区（keep=2 起）含 NaN → true
         assert!(panel.append_has_non_finite(&buf, 2));
         // 前 2 点正常 → false
@@ -797,7 +797,7 @@ mod tests {
     fn rescan_y_max_resets_drifted_scale() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
         panel.auto_y_max_abs = 100.0; // 人为抬高（模拟峰值已移出视野）
-        let buf = make_buffer(5, &[3.0f32.to_bits()]);
+        let buf = make_buffer(5, &[u64::from(3.0f32.to_bits())]);
         panel.rescan_y_max(&buf, 0.0, 0.005);
         assert!((panel.auto_y_max_abs - 3.0).abs() < 1e-9);
     }
@@ -805,15 +805,15 @@ mod tests {
     #[test]
     fn rebuild_cache_tracks_nan_in_stream() {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
-        let mut buf = make_buffer(3, &[1.0f32.to_bits()]);
-        buf.push(Sample::new(3, 0.003, &[f32::INFINITY.to_bits()]));
+        let mut buf = make_buffer(3, &[u64::from(1.0f32.to_bits())]);
+        buf.push(Sample::new(3, 0.003, &[u64::from(f32::INFINITY.to_bits())]));
         panel.rebuild_cache(&buf);
         assert!(panel.nan_in_stream);
         // NaN/Inf 点被跳过：3 个有效点
         assert_eq!(panel.cached_points[0].len(), 3);
 
         // 非有限值离开 buffer 后，重扫应复位标志
-        let clean = make_buffer(3, &[1.0f32.to_bits()]);
+        let clean = make_buffer(3, &[u64::from(1.0f32.to_bits())]);
         panel.rebuild_cache(&clean);
         assert!(!panel.nan_in_stream);
     }
@@ -849,7 +849,7 @@ mod tests {
         let buffer: Vec<Sample> = (0..4u64)
             .map(|i| {
                 let v: f32 = if i < 2 { 100.0 } else { 3.0 };
-                Sample::new(i, i as f64 * 0.001, &[v.to_bits()])
+                Sample::new(i, i as f64 * 0.001, &[u64::from(v.to_bits())])
             })
             .collect();
         // 初始人为抬高，验证重扫会修正

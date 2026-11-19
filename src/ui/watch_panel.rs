@@ -7,7 +7,8 @@ use crate::pipeline::sample::ValueType;
 /// 名字则在采集快照中稳定对应唯一的地址。
 pub struct WriteRequest {
     pub channel_name: String,
-    pub raw_value: u32,
+    /// 原始位模式（64 位类型按位模式携带，32 位及更窄只用低 32 位）
+    pub raw_value: u64,
 }
 
 /// Watch 面板中显示的单个变量条目
@@ -220,7 +221,7 @@ impl WatchPanel {
     /// 更新变量值（每收到一个采样点调用一次）
     /// values: 本次采样点的变量值列表（与 entries 一一对应）
     /// sample_rate: 当前采样率（Hz），用于将秒转换为采样点数
-    pub fn update_values(&mut self, values: &[u32], sample_rate: u32) {
+    pub fn update_values(&mut self, values: &[u64], sample_rate: u32) {
         for (i, entry) in self.entries.iter_mut().enumerate() {
             // 编辑中不更新显示值
             if entry.editing {
@@ -671,7 +672,7 @@ fn draw_column_resizers(
 /// - Int16: "-100"
 /// - Uint8: "200"
 /// - Int8: "-1"
-fn parse_value(s: &str, vt: ValueType) -> Option<u32> {
+fn parse_value(s: &str, vt: ValueType) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -680,49 +681,68 @@ fn parse_value(s: &str, vt: ValueType) -> Option<u32> {
     match vt {
         ValueType::Float => {
             let f: f32 = s.parse().ok()?;
+            Some(u64::from(f.to_bits()))
+        }
+        ValueType::Float64 => {
+            let f: f64 = s.parse().ok()?;
             Some(f.to_bits())
         }
-        ValueType::Uint32 => s.parse::<u32>().ok(),
+        ValueType::Uint32 => Some(u64::from(s.parse::<u32>().ok()?)),
         ValueType::Int32 => {
             let v: i32 = s.parse().ok()?;
-            Some(v as u32)
+            Some(u64::from(v as u32))
         }
         ValueType::Uint16 => {
             let v: u16 = s.parse().ok()?;
-            Some(v as u32)
+            Some(u64::from(v))
         }
         ValueType::Int16 => {
             let v: i16 = s.parse().ok()?;
-            Some(v as u32)
+            Some(u64::from(v as u16))
         }
         ValueType::Uint8 => {
             let v: u8 = s.parse().ok()?;
-            Some(v as u32)
+            Some(u64::from(v))
         }
         ValueType::Int8 => {
             let v: i8 = s.parse().ok()?;
-            Some(v as u32)
+            Some(u64::from(v as u8))
+        }
+        ValueType::Uint64 => s.parse::<u64>().ok(),
+        ValueType::Int64 => {
+            let v: i64 = s.parse().ok()?;
+            Some(v as u64)
         }
     }
 }
 
 /// 格式化变量值（只显示 10 进制）
-fn format_value(raw: u32, vt: ValueType) -> String {
+fn format_value(raw: u64, vt: ValueType) -> String {
     match vt {
         ValueType::Float => {
-            let f = f32::from_bits(raw);
+            let f = f32::from_bits(raw as u32);
             if f.is_finite() {
                 format!("{:.6}", f)
             } else {
                 "NaN/Inf".to_string()
             }
         }
-        ValueType::Uint32 => format!("{}", raw),
-        ValueType::Int32 => format!("{}", raw as i32),
-        ValueType::Uint16 => format!("{}", raw & 0xFFFF),
-        ValueType::Int16 => format!("{}", (raw & 0xFFFF) as i16),
-        ValueType::Uint8 => format!("{}", raw & 0xFF),
-        ValueType::Int8 => format!("{}", (raw & 0xFF) as i8),
+        ValueType::Float64 => {
+            let f = f64::from_bits(raw);
+            if f.is_finite() {
+                format!("{:.6}", f)
+            } else {
+                "NaN/Inf".to_string()
+            }
+        }
+        ValueType::Uint32 => format!("{}", raw as u32),
+        ValueType::Int32 => format!("{}", raw as u32 as i32),
+        ValueType::Uint16 => format!("{}", raw as u16),
+        ValueType::Int16 => format!("{}", raw as u16 as i16),
+        ValueType::Uint8 => format!("{}", raw as u8),
+        ValueType::Int8 => format!("{}", raw as u8 as i8),
+        ValueType::Uint64 => format!("{}", raw),
+        ValueType::Int64 => format!("{}", raw as i64),
     }
 }
 

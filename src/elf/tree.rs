@@ -94,6 +94,7 @@ pub fn build_from_dwarf(
 
     // 4. 去重（同名同地址的变量只保留一个）
     result.dedup_by(|a, b| a.path == b.path && a.address == b.address);
+    disambiguate_duplicate_paths(&mut result);
     Ok(result)
 }
 
@@ -123,8 +124,57 @@ pub fn build_from_symbols_only(
             source_file: None,
         });
     }
-    result.sort_by(|a, b| a.path.cmp(&b.path));
+    // 先按 (path, address) 排序去重（符号表可能含同名同地址的重复条目），
+    // 再对同 path 不同地址的残留冲突消歧
+    result.sort_by(|a, b| {
+        a.path.cmp(&b.path)
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    result.dedup_by(|a, b| a.path == b.path && a.address == b.address);
+    disambiguate_duplicate_paths(&mut result);
     Ok(result)
+}
+
+/// 为「同 path 不同地址」的重复变量消歧（两个 .c 文件的同名 static）。
+///
+/// 浏览器树、通道名、工程文件、写入解析全部以 path 为唯一标识：
+/// 重复 path 会让第二个变量永远无法被选中，且 UI 无从分辨两个条目。
+/// 优先用源文件名消歧（文件名中的 '.' 替换为 '_'，避免被树路径分段
+/// `split_var_path` 拆开）；文件名不可用或消歧后仍冲突时退回地址后缀
+/// （地址在去重后必然互不相同，因此后缀一定唯一）。
+fn disambiguate_duplicate_paths(vars: &mut [ElfVariable]) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for v in vars.iter() {
+        *counts.entry(v.path.clone()).or_insert(0) += 1;
+    }
+    // 已占用集合：包含全部现有 path（含未冲突变量），保证消歧结果
+    // 不会与任何其它变量的 path 撞车
+    let mut used: HashSet<String> = vars.iter().map(|v| v.path.clone()).collect();
+    for v in vars.iter_mut() {
+        if counts.get(v.path.as_str()).copied().unwrap_or(0) <= 1 {
+            continue;
+        }
+        let base = v.path.clone();
+        // 首选：源文件名后缀，如 "status (a_c)"
+        let candidate = v.source_file.as_deref().map(|f| {
+            let file = f
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(f)
+                .replace('.', "_");
+            format!("{} ({})", base, file)
+        });
+        match candidate {
+            Some(c) if used.insert(c.clone()) => v.path = c,
+            _ => {
+                // 兜底：地址后缀，如 "status @0x20000010"
+                // （地址在去重后必然互不相同，因此后缀一定唯一）
+                let c = format!("{} @0x{:08X}", base, v.address);
+                used.insert(c.clone());
+                v.path = c;
+            }
+        }
+    }
 }
 
 /// 沿 typedef/const/volatile 链找到最终类型
@@ -453,5 +503,90 @@ mod tests {
         assert_eq!(out[0].path, "v.x");
         assert_eq!(out[1].path, "v.arr[0]");
         assert_eq!(out[2].path, "v.arr[1]");
+    }
+
+    /// 构造测试用 ElfVariable（path 与 name 初始相同）
+    fn ev(path: &str, address: u32, source_file: Option<&str>) -> ElfVariable {
+        ElfVariable {
+            name: path.to_string(),
+            path: path.to_string(),
+            address,
+            byte_size: 4,
+            value_type: ValueType::Float,
+            parent_path: None,
+            source_file: source_file.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn duplicate_paths_disambiguated_by_source_file() {
+        // 两个 .c 文件的同名 static：path 相同、地址不同（原缺陷 ⑦，
+        // 第二个变量此前永远不可达且 UI 无从分辨）
+        let mut vars = vec![
+            ev("status", 0x2000_0010, Some("./src/motor_a.c")),
+            ev("status", 0x2000_0020, Some("./src/motor_b.c")),
+        ];
+        disambiguate_duplicate_paths(&mut vars);
+        assert_eq!(vars[0].path, "status (motor_a_c)");
+        assert_eq!(vars[1].path, "status (motor_b_c)");
+        // 裸名保留不变（供 elf_var_matches 顶层兜底）
+        assert_eq!(vars[0].name, "status");
+        assert_eq!(vars[1].name, "status");
+        // 文件名中的 '.' 替换为 '_'，不能被树路径分段拆开
+        let segs = crate::ui::variable_browser::split_var_path(&vars[0].path);
+        assert_eq!(segs.len(), 1, "消歧后缀不得产生子节点: {:?}", segs);
+    }
+
+    #[test]
+    fn duplicate_paths_without_source_file_use_address_suffix() {
+        let mut vars = vec![
+            ev("status", 0x2000_0010, None),
+            ev("status", 0x2000_0020, None),
+        ];
+        disambiguate_duplicate_paths(&mut vars);
+        assert_eq!(vars[0].path, "status @0x20000010");
+        assert_eq!(vars[1].path, "status @0x20000020");
+    }
+
+    #[test]
+    fn duplicate_paths_same_basename_fall_back_to_address() {
+        // 两个目录下的同名文件：文件名后缀撞车——先占位者拿到文件名
+        // 后缀，后者退回地址后缀，保证最终 path 一定互不相同
+        let mut vars = vec![
+            ev("status", 0x10, Some("d1/a.c")),
+            ev("status", 0x20, Some("d2/a.c")),
+        ];
+        disambiguate_duplicate_paths(&mut vars);
+        assert_eq!(vars[0].path, "status (a_c)");
+        assert_eq!(vars[1].path, "status @0x00000020");
+        assert_ne!(vars[0].path, vars[1].path);
+    }
+
+    #[test]
+    fn unique_paths_are_left_untouched() {
+        let mut vars = vec![
+            ev("status", 0x10, Some("a.c")),
+            ev("speed", 0x14, None),
+        ];
+        disambiguate_duplicate_paths(&mut vars);
+        assert_eq!(vars[0].path, "status");
+        assert_eq!(vars[1].path, "speed");
+    }
+
+    #[test]
+    fn build_from_symbols_only_dedups_and_disambiguates() {
+        use crate::elf::parser::ElfSymbolRaw;
+        let symbols = vec![
+            ElfSymbolRaw { name: "status".to_string(), address: 0x10, size: 4 },
+            // 符号表常见的同名同地址重复条目：应去重而不是消歧
+            ElfSymbolRaw { name: "status".to_string(), address: 0x10, size: 4 },
+            ElfSymbolRaw { name: "status".to_string(), address: 0x20, size: 4 },
+            ElfSymbolRaw { name: "speed".to_string(), address: 0x30, size: 4 },
+        ];
+        let vars = build_from_symbols_only(&symbols).unwrap();
+        let status: Vec<&ElfVariable> = vars.iter().filter(|v| v.name == "status").collect();
+        assert_eq!(status.len(), 2, "同名同地址去重后剩 2 个不同地址实例");
+        let paths: Vec<&str> = status.iter().map(|v| v.path.as_str()).collect();
+        assert!(paths[0] != paths[1], "两个实例的 path 必须可区分: {:?}", paths);
     }
 }

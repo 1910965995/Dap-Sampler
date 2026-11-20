@@ -143,14 +143,19 @@ struct ElfSyncPrompt {
     missing: Vec<String>,
 }
 
-/// ELF 变量是否匹配给定名称（path 或 name 相等）
+/// ELF 变量是否匹配给定名称（工程/通道里存的是浏览器树中的完整路径）
+///
+/// 主匹配是 path 精确相等；裸名兜底仅限**顶层变量**（parent_path 为
+/// None）。struct 成员的裸名会与全局变量重名（全局 `status` 与成员
+/// `s.status`），且 path 排序使成员叶子排在前面——若按裸名兜底匹配
+/// 成员，全局变量 `status` 的通道会绑定到成员地址（原缺陷 ⑦）。
 fn elf_var_matches(ev: &ElfVariable, name: &str) -> bool {
-    ev.path == name || ev.name == name
+    ev.path == name || (ev.parent_path.is_none() && ev.name == name)
 }
 
 /// 比较工程变量与 ELF 变量：地址不同或 ELF 中缺失 → 返回差异；无差异 → None
 ///
-/// 匹配规则与 collect_channel_addresses 一致：path 或 name 相等即匹配。
+/// 匹配规则与 collect_channel_addresses 一致（见 elf_var_matches）。
 /// 将写入请求的通道名解析为采集快照中的变量索引
 ///
 /// 名字是 Watch 写入的稳定标识：通道增删后表格行号整体移位，
@@ -162,7 +167,7 @@ fn resolve_channel_index(names: &[String], name: &str) -> Option<usize> {
 
 /// 比较工程变量与 ELF 变量：地址不同或 ELF 中缺失 → 返回差异；无差异 → None
 ///
-/// 匹配规则与 collect_channel_addresses 一致：path 或 name 相等即匹配。
+/// 匹配规则与 collect_channel_addresses 一致（见 elf_var_matches）。
 fn compute_elf_diffs(
     project_vars: &[ProjectVariable],
     elf_vars: &[ElfVariable],
@@ -711,22 +716,7 @@ impl DapSamplerApp {
         }
 
         // 4. 覆盖 Watch 配置字段（y_offset/y_scale/refresh/remark 以工程为准）
-        if self.watch_panel.entries.len() != file.variables.len() {
-            log::warn!(
-                "工程变量数与通道数不一致（{} vs {}），多余变量被忽略",
-                file.variables.len(),
-                self.watch_panel.entries.len()
-            );
-        }
-        for (entry, pv) in self.watch_panel.entries.iter_mut().zip(&file.variables) {
-            entry.name = pv.name.clone();
-            entry.address = pv.address;
-            entry.value_type = pv.value_type();
-            entry.refresh_period_s = pv.refresh_period_s;
-            entry.y_offset = pv.y_offset;
-            entry.y_scale = pv.y_scale;
-            entry.remark = pv.remark.clone();
-        }
+        self.restore_watch_config(&file.variables);
         // 4.5 恢复 Watch 列宽（旧版工程无此字段时为默认宽度；非法值在面板内夹紧）
         self.watch_panel.set_col_widths(&file.watch_col_widths);
 
@@ -758,6 +748,36 @@ impl DapSamplerApp {
         self.project_path = Some(path.display().to_string());
         if !self.status_is_error {
             self.set_status(format!("Project opened: {}", path.display()));
+        }
+    }
+
+    /// 用工程变量按**名字**回查，恢复 Watch 行的地址/类型/显示配置
+    ///
+    /// 必须按名字回查，不能按位置 zip：ELF 模式下缺失变量不会恢复成
+    /// 通道（Watch 行数 = 工程变量数 − 缺失数），按位置 zip 会把缺失
+    /// 变量之后的行整体错位——比如工程变量 [A, B, C] 而 B 缺失时，
+    /// 行 [A, C] 的第 2 行会被改成 B 的名字/地址/类型（原缺陷 ⑧）。
+    /// 错位行可交互、可写入：写入会命中错误的 MCU 地址，破坏目标内存。
+    fn restore_watch_config(&mut self, file_vars: &[ProjectVariable]) {
+        let unmatched = self
+            .watch_panel
+            .entries
+            .iter()
+            .filter(|e| !file_vars.iter().any(|pv| pv.name == e.name))
+            .count();
+        if unmatched > 0 {
+            log::warn!("{} 个 Watch 行在工程变量中找不到对应项，保留当前配置", unmatched);
+        }
+        for entry in self.watch_panel.entries.iter_mut() {
+            let Some(pv) = file_vars.iter().find(|pv| pv.name == entry.name) else {
+                continue;
+            };
+            entry.address = pv.address;
+            entry.value_type = pv.value_type();
+            entry.refresh_period_s = pv.refresh_period_s;
+            entry.y_offset = pv.y_offset;
+            entry.y_scale = pv.y_scale;
+            entry.remark = pv.remark.clone();
         }
     }
 
@@ -1497,6 +1517,26 @@ impl eframe::App for DapSamplerApp {
             && self.elf_warning.is_none()
         {
             self.check_elf_changed();
+        }
+        // 子线程健康检查：USB 写失败、设备拔出导致的致命错误/线程退出
+        // 在此兜底——否则 UI 会永远显示 Running，只有日志文件里有记录
+        //（原缺陷 ⑨⑩）。先停止再报错，避免 set_status 覆盖错误信息。
+        if self.controls.state != AcquisitionState::Idle {
+            let fatal = if let Some(ref handle) = self.pipeline {
+                handle.thread_error().or_else(|| {
+                    if handle.threads_alive() {
+                        None
+                    } else {
+                        Some("acquisition thread exited unexpectedly".to_string())
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(msg) = fatal {
+                self.stop_acquisition();
+                self.set_error(format!("Acquisition aborted: {}", msg));
+            }
         }
         self.drain_pipeline();
 
@@ -2664,5 +2704,90 @@ mod elf_sync_tests {
         app.check_elf_changed();
         assert!(!app.status_is_error, "快照更新后不应重复报错");
         assert!(app.elf_mtime.is_none(), "快照应更新为 None（文件不存在）");
+    }
+
+    #[test]
+    fn elf_var_matches_member_does_not_shadow_global() {
+        // 全局 status 与 struct 成员 s.status 裸名相同，且 path 排序使
+        // 成员在前（"s.status" < "status"）：裸名兜底若命中成员，全局
+        // 通道会绑定到成员地址（原缺陷 ⑦）
+        let mut member = elf_var("status", 0x2000_0010);
+        member.path = "s.status".to_string();
+        member.parent_path = Some("s".to_string());
+        let global = elf_var("status", 0x2000_0020);
+
+        // 成员只能按完整 path 匹配，不得响应裸名
+        assert!(elf_var_matches(&member, "s.status"));
+        assert!(!elf_var_matches(&member, "status"), "成员裸名不得匹配全局名");
+        // 顶层变量裸名兜底仍然有效
+        assert!(elf_var_matches(&global, "status"));
+
+        // 端到端：collect_channel_addresses 用同一匹配规则，工程名 "status"
+        // 必须解析到全局变量地址，而不是排在变量列表前面的成员叶子
+        let elf = ElfContext {
+            file_path: "C:/fw/fw.elf".to_string(),
+            variables: vec![member, global],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.channel_panel.add_channel("status".to_string(), egui::Color32::RED, ValueType::Float);
+        let addrs = app.collect_channel_addresses();
+        assert_eq!(
+            addrs,
+            vec![0x2000_0020],
+            "应绑定全局 status (0x20000020) 而非排在前面成员 s.status (0x20000010)"
+        );
+    }
+
+    #[test]
+    fn restore_watch_config_keeps_rows_aligned_when_project_has_missing_vars() {
+        // 工程变量 [A, B, C]，B 在 ELF 中缺失 → 通道/Watch 只有 [A, C]。
+        // 旧实现按位置 zip（entries zip 完整工程列表）会把 C 行改成 B
+        // 的名字/地址/类型，错位行可交互、可写入真实 MCU 地址（原缺陷 ⑧）
+        let mut va = project_var("A", 0x100);
+        va.y_scale = 1.5;
+        let mut vb = project_var("B", 0x104);
+        vb.y_scale = 2.5;
+        let mut vc = project_var("C", 0x108);
+        vc.y_scale = 3.5;
+        vc.remark = "keep me".to_string();
+
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1);
+        app.channel_panel.add_channel("A".to_string(), egui::Color32::RED, ValueType::Float);
+        app.channel_panel.add_channel("C".to_string(), egui::Color32::GREEN, ValueType::Float);
+        app.watch_panel.sync_from_channels(
+            &["A".to_string(), "C".to_string()],
+            &[ValueType::Float, ValueType::Float],
+            &[0x100, 0x108],
+        );
+
+        app.restore_watch_config(&[va, vb, vc]);
+
+        assert_eq!(app.watch_panel.entries.len(), 2, "缺失变量不得产生新行");
+        let a = app.watch_panel.entries.iter().find(|e| e.name == "A").unwrap();
+        let c = app.watch_panel.entries.iter().find(|e| e.name == "C").unwrap();
+        assert!((a.y_scale - 1.5).abs() < 1e-9, "A 行应恢复自己的配置");
+        assert!((c.y_scale - 3.5).abs() < 1e-9, "C 行应恢复自己的配置，不得错位成 B 的");
+        assert_eq!(c.address, 0x108, "C 行地址不得被 B 的地址覆盖");
+        assert_eq!(c.remark, "keep me");
+        assert!(
+            app.watch_panel.entries.iter().all(|e| e.name != "B"),
+            "缺失变量不得改名任何行"
+        );
+    }
+
+    #[test]
+    fn restore_watch_config_falls_back_gracefully_for_unknown_rows() {
+        // Watch 行在工程变量中找不到对应项：保留当前配置，不 panic、不错位
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1);
+        app.channel_panel.add_channel("X".to_string(), egui::Color32::RED, ValueType::Float);
+        app.watch_panel.sync_from_channels(
+            &["X".to_string()],
+            &[ValueType::Float],
+            &[0x42],
+        );
+        app.restore_watch_config(&[project_var("A", 0x100)]);
+        let x = app.watch_panel.entries.iter().find(|e| e.name == "X").unwrap();
+        assert_eq!(x.address, 0x42, "找不到对应工程变量的行应保留当前配置");
+        assert_eq!(x.value_type, ValueType::Float);
     }
 }

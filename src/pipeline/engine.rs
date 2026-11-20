@@ -253,13 +253,18 @@ impl PipelineEngine {
         let ring = Arc::new(RingBuffer::new(capacity));
         let start_time = Instant::now();
 
+        // 子线程致命错误槽（USB 写失败、设备拔出等）。此前子线程直接
+        // break 退出且无任何上报通道，UI 会永远显示 Running（原缺陷 ⑨）。
+        // UI 每帧轮询 thread_error() / threads_alive() 触发自动停止。
+        let thread_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         // 时间戳完全由接收线程的 seq 计算：
         //   timestamp = seq * interval_us / 1_000_000
         // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
         // 保证显示的采样间隔严格一致。无需跨线程队列传递。
 
-        let submit = self.spawn_submit_thread(start_time)?;
-        let collect = self.spawn_collect_thread(Arc::clone(&ring))?;
+        let submit = self.spawn_submit_thread(start_time, Arc::clone(&thread_error))?;
+        let collect = self.spawn_collect_thread(Arc::clone(&ring), Arc::clone(&thread_error))?;
 
         Ok(PipelineHandle {
             submit_handle: submit,
@@ -267,6 +272,7 @@ impl PipelineEngine {
             ring_buffer: ring,
             running: Arc::clone(&self.running),
             write_queue: Arc::clone(&self.write_queue),
+            thread_error,
         })
     }
 
@@ -274,6 +280,7 @@ impl PipelineEngine {
     fn spawn_submit_thread(
         &self,
         start_time: Instant,
+        thread_error: Arc<Mutex<Option<String>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
@@ -471,14 +478,63 @@ impl PipelineEngine {
                             pending_writes.len(), seq
                         );
                     }
-                    if let Err(e) = usb.write_nonblock(&cmd) {
-                        if !running.load(Ordering::Relaxed) {
-                            // 停止中遇到的超时/错误，正常退出
-                            log::info!("提交线程收到停止信号，退出");
+                    match usb.write_nonblock(&cmd) {
+                        Ok(n) if n == cmd.len() => {} // 发送成功
+                        Ok(n) => {
+                            // 短写：只有部分命令字节到达设备，设备按不完整
+                            // 命令解析，响应流必然失步。按致命错误处理并
+                            // 上报 UI（此前短写被当作成功，协议从此错乱）。
+                            let msg = format!(
+                                "USB short write: {}/{} bytes",
+                                n, cmd.len()
+                            );
+                            log::error!("提交线程 {} (seq={})，退出", msg, seq);
+                            if running.load(Ordering::Relaxed) {
+                                if let Ok(mut slot) = thread_error.lock() {
+                                    slot.get_or_insert(msg);
+                                }
+                            }
                             break;
                         }
-                        log::error!("提交线程 USB 写失败 (seq={}): {}", seq, e);
-                        break;
+                        Err(Error::Usb(rusb::Error::Timeout)) => {
+                            // 写超时（0 字节发出）：设备忙或已拔出。本周期
+                            // 没有命令发出、也就没有对应响应，直接跳过；
+                            // 未消费的写入请求重新入队。单次超时不应终止
+                            // 采集（此前任何写错误都会让线程静默退出）。
+                            if !running.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            log::warn!("提交线程写超时 (seq={})，跳过本周期", seq);
+                            if !pending_writes.is_empty() {
+                                if let Ok(mut wq) = write_queue.lock() {
+                                    for (idx, v) in pending_writes.iter().rev() {
+                                        wq.push_front((*idx, *v));
+                                    }
+                                }
+                            }
+                            seq += 1;
+                            let target = start + Duration::from_micros(interval_us * seq);
+                            let now = Instant::now();
+                            if now < target {
+                                spin_sleep::sleep(target - now);
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            if !running.load(Ordering::Relaxed) {
+                                // 停止中遇到的超时/错误，正常退出
+                                log::info!("提交线程收到停止信号，退出");
+                                break;
+                            }
+                            // 致命错误（设备拔出、管道错误等）：上报 UI
+                            // 后退出，不再无声死亡（原缺陷 ⑨）
+                            let msg = format!("USB write failed: {}", e);
+                            log::error!("提交线程 USB 写失败 (seq={}): {}，退出", seq, e);
+                            if let Ok(mut slot) = thread_error.lock() {
+                                slot.get_or_insert(msg);
+                            }
+                            break;
+                        }
                     }
                     // 命令已发出：记录本条命令**实际**的写请求数（接收线程
                     // 按它计算响应长度），在途 +1。必须用 write_reqs 而不是
@@ -513,6 +569,7 @@ impl PipelineEngine {
     fn spawn_collect_thread(
         &self,
         ring: Arc<RingBuffer>,
+        thread_error: Arc<Mutex<Option<String>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
@@ -534,17 +591,36 @@ impl PipelineEngine {
                 // 拼接缓冲：循环外复用，避免每轮堆分配
                 let mut data: Vec<u8> = Vec::with_capacity(4096);
                 let mut seq: u64 = 0;
+                // 致命错误日志限频：拔线后每次读都会立即失败，不限频会
+                // 每秒打出数十万条 warn 刷爆日志文件（原缺陷 ⑩）
+                let mut last_err_log: Option<Instant> = None;
 
                 while running.load(Ordering::Relaxed) {
                     // 读取 USB 响应（超时 200ms，允许优雅退出）
                     let n = match usb.read_timeout(&mut buf, Duration::from_millis(200)) {
                         Ok(n) => n,
+                        Err(Error::Usb(rusb::Error::Timeout)) => {
+                            // rusb 对 0 字节超时返回 Err(Timeout)：设备暂无
+                            // 响应的例行空转，静默继续（read_timeout 阻塞
+                            // 至多 200ms，天然限速）
+                            continue;
+                        }
                         Err(e) => {
-                            // 超时可能只是暂无数据，检查运行标志后继续。
-                            // 设备拔出等错误同样在此处记录——UI 侧仍显示
-                            // Running，由用户手动停止（见 README 已知限制）。
+                            // 设备拔出 / 管道错误等致命错误：上报 UI（触发
+                            // 自动停止并提示）、限频日志、短暂休眠避免忙转。
+                            // 循环继续检查 running 标志以便优雅退出。
                             if running.load(Ordering::Relaxed) {
-                                log::warn!("接收线程读失败: {}", e);
+                                if let Ok(mut slot) = thread_error.lock() {
+                                    slot.get_or_insert(format!("USB read failed: {}", e));
+                                }
+                                let now = Instant::now();
+                                if last_err_log
+                                    .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+                                {
+                                    log::warn!("接收线程 USB 读失败（采集将自动停止）: {}", e);
+                                    last_err_log = Some(now);
+                                }
+                                thread::sleep(Duration::from_millis(50));
                             }
                             continue;
                         }
@@ -724,6 +800,8 @@ pub struct PipelineHandle {
     ring_buffer: Arc<RingBuffer>,
     running: Arc<AtomicBool>,
     write_queue: Arc<Mutex<VecDeque<(usize, u64)>>>,
+    /// 子线程致命错误槽（第一个错误的描述）。Some = 采集无法继续
+    thread_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PipelineHandle {
@@ -737,6 +815,21 @@ impl PipelineHandle {
         if let Ok(mut wq) = self.write_queue.lock() {
             wq.push_back((var_idx, value));
         }
+    }
+
+    /// 子线程致命错误（USB 写失败、设备拔出等）
+    ///
+    /// Some = 采集无法继续，UI 应停止采集并向用户展示原因。
+    pub fn thread_error(&self) -> Option<String> {
+        self.thread_error.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// 两个工作线程是否都仍在运行
+    ///
+    /// 子线程异常退出（panic、无法恢复的错误）的兜底检测：即便没有
+    /// 走 thread_error 通道，UI 也能发现「线程没了但状态还是 Running」。
+    pub fn threads_alive(&self) -> bool {
+        !self.submit_handle.is_finished() && !self.collect_handle.is_finished()
     }
 
     /// 从环形缓冲区批量读取采样点
@@ -1073,5 +1166,52 @@ mod tests {
         // 字节流失步时响应头不是 0x05：必须显式报错而非解析出垃圾数据
         let bad = vec![0x06u8, 2, 1, 0, 0, 0, 0];
         assert!(DapProtocol::parse_transfer_response(&bad).is_err());
+    }
+
+    #[test]
+    fn pipeline_handle_exposes_thread_health_and_error() {
+        // UI 依赖两个信号做兜底检测（原缺陷 ⑨：线程死了 UI 仍显示 Running）：
+        // thread_error（致命错误槽）与 threads_alive（is_finished 兜底）
+        use std::sync::mpsc;
+
+        let (tx1, rx1) = mpsc::channel::<()>();
+        let (tx2, rx2) = mpsc::channel::<()>();
+        let j1 = thread::spawn(move || {
+            let _ = rx1.recv();
+        });
+        let j2 = thread::spawn(move || {
+            let _ = rx2.recv();
+        });
+        let te: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let handle = PipelineHandle {
+            submit_handle: j1,
+            collect_handle: j2,
+            ring_buffer: Arc::new(RingBuffer::new(16)),
+            running: Arc::new(AtomicBool::new(true)),
+            write_queue: Arc::new(Mutex::new(VecDeque::new())),
+            thread_error: Arc::clone(&te),
+        };
+
+        // 两个线程都阻塞在 recv 上：必须判定为存活
+        assert!(handle.threads_alive(), "运行中的线程不应被判定为退出");
+        assert!(handle.thread_error().is_none(), "无错误时错误槽应为空");
+
+        // 子线程通过槽上报致命错误，UI 读取到完整描述
+        *te.lock().unwrap() = Some("USB read failed: boom".to_string());
+        assert_eq!(handle.thread_error().as_deref(), Some("USB read failed: boom"));
+
+        // 线程退出后 is_finished 兜底检测生效（未走错误通道的死法也能发现）
+        drop(tx1);
+        drop(tx2);
+        for _ in 0..100 {
+            if !handle.threads_alive() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!handle.threads_alive(), "线程退出后不应被判定为存活");
+        // join 回收线程资源（join 消费句柄，故放在断言之后）
+        let _ = handle.submit_handle.join();
+        let _ = handle.collect_handle.join();
     }
 }

@@ -1203,9 +1203,31 @@ impl DapSamplerApp {
         self.set_error("Stop acquisition before changing watched variables");
     }
 
+    /// 为新通道选色：取调色板中最靠前的、当前未被任何通道占用的颜色
+    ///
+    /// 不能按「当前通道数取模」分配：删除中间通道后按数量取模会重复
+    /// 分配尾部颜色——4 通道（红绿蓝黄）删掉第一个后再添加，count=3
+    /// 仍取第 4 色，与现存通道撞色。按未占用色选取还天然复用被释放
+    /// 的颜色：删除红色后，新通道优先拿回红色。
+    /// 兜底分支仅在通道数超过调色板长度时才会走到（当前上限 8 =
+    /// 调色板长度，正常不可达），此时退回按数量取模。
+    fn pick_channel_color(&self) -> egui::Color32 {
+        let used: Vec<egui::Color32> = self
+            .channel_panel
+            .channels
+            .iter()
+            .map(|c| c.color)
+            .collect();
+        CHANNEL_COLORS
+            .iter()
+            .copied()
+            .find(|c| !used.contains(c))
+            .unwrap_or(CHANNEL_COLORS[self.channel_panel.channel_count() % CHANNEL_COLORS.len()])
+    }
+
     fn apply_variable_changes(&mut self, changes: Vec<(String, bool)>) {
-        // 超限勾选必须回滚：复选框在渲染层已先行置位，若这里静默跳过，
-        // 「勾上了但没有通道」的状态会永久脱节（用户以为在监视，实际没采）。
+        // 超限勾选必须回滚：复选框在渲染层点击时已先行置位，若这里静默跳过，
+        // 「勾上了但没有通道」的状态会永久脱节。
         let mut rejected: Vec<String> = Vec::new();
 
         for (path, is_checked) in changes {
@@ -1218,7 +1240,7 @@ impl DapSamplerApp {
                         rejected.push(path);
                         continue;
                     }
-                    let color = CHANNEL_COLORS[ch_count % CHANNEL_COLORS.len()];
+                    let color = self.pick_channel_color();
                     let value_type = self.elf_ctx.as_ref()
                         .and_then(|ctx| ctx.variables.iter().find(|v| v.path == path))
                         .map(|v| v.value_type)
@@ -2366,6 +2388,85 @@ mod channel_limit_tests {
             app.warning_popup.is_none(),
             "成功加入时不应弹窗"
         );
+    }
+
+    /// 任意时刻所有通道颜色必须互不相同（用户报告：删第一个通道后再
+    /// 添加，新通道仍是第 4 色，与现存撞色）
+    fn assert_colors_all_distinct(app: &DapSamplerApp, context: &str) {
+        let colors: Vec<egui::Color32> = app
+            .channel_panel
+            .channels
+            .iter()
+            .map(|c| c.color)
+            .collect();
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    colors[i], colors[j],
+                    "{context}: 通道 {} 与 {} 颜色重复 ({:?})",
+                    i, j, colors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_channel_after_delete_gets_unused_color() {
+        // 复现用户操作序列：加 4 个变量（红绿蓝黄）→ ×掉第 1 个（红）→
+        // 新增变量。旧逻辑按通道数取模：count=3 仍取第 4 色（黄），
+        // 与现存黄通道撞色；再删蓝再加，又是黄
+        let mut app = make_app();
+        let initial: Vec<(String, bool)> = (0..4)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(initial);
+        assert_eq!(app.channel_panel.channel_count(), 4);
+        // 初始四色 = 调色板前 4 个，互不相同
+        for (i, ch) in app.channel_panel.channels.iter().enumerate() {
+            assert_eq!(ch.color, CHANNEL_COLORS[i], "初始第 {i} 个通道应为调色板第 {i} 色");
+        }
+        assert_colors_all_distinct(&app, "初始");
+
+        // ×掉第 1 个（红），新增变量：新通道应拿回被释放的红色，
+        // 不得与现存绿/蓝/黄重复
+        app.apply_variable_changes(vec![("var0".to_string(), false)]);
+        assert_eq!(app.channel_panel.channel_count(), 3);
+        app.apply_variable_changes(vec![("var4".to_string(), true)]);
+        assert_eq!(app.channel_panel.channel_count(), 4);
+        assert_colors_all_distinct(&app, "删红后新增");
+        let new_ch = app
+            .channel_panel
+            .channels
+            .iter()
+            .find(|c| c.name == "var4")
+            .expect("var4 应已加入通道");
+        assert_eq!(new_ch.color, CHANNEL_COLORS[0], "新通道应复用被释放的红色");
+
+        // 再删蓝（var2），新增变量：同样不得撞色
+        app.apply_variable_changes(vec![("var2".to_string(), false)]);
+        assert_eq!(app.channel_panel.channel_count(), 3);
+        app.apply_variable_changes(vec![("var5".to_string(), true)]);
+        assert_eq!(app.channel_panel.channel_count(), 4);
+        assert_colors_all_distinct(&app, "删蓝后新增");
+        let new_ch = app
+            .channel_panel
+            .channels
+            .iter()
+            .find(|c| c.name == "var5")
+            .expect("var5 应已加入通道");
+        assert_eq!(new_ch.color, CHANNEL_COLORS[2], "新通道应复用被释放的蓝色");
+    }
+
+    #[test]
+    fn batch_add_colors_are_distinct() {
+        // 一次勾选多个变量时逐个取未占用色，不得重复
+        let mut app = make_app();
+        let batch: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(batch);
+        assert_eq!(app.channel_panel.channel_count(), 8);
+        assert_colors_all_distinct(&app, "一次加入 8 个");
     }
 
     #[test]

@@ -60,13 +60,13 @@ fn apply_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
         style.spacing.scroll = egui::style::ScrollStyle {
-            // 闲置 3px 细灰线（25%→45% 不透明度，靠近滚动区时加深），
-            // 悬停展开到 8px，拖动 55% 中灰
+            // 闲置 3px 细灰线（25% 不透明度，靠近滚动区加深到 35%），
+            // 悬停展开到 8px，拖动 35%
             bar_width: 8.0,
             floating_width: 3.0,
             dormant_handle_opacity: 0.25,
-            active_handle_opacity: 0.45,
-            interact_handle_opacity: 0.55,
+            active_handle_opacity: 0.35,
+            interact_handle_opacity: 0.35,
             dormant_background_opacity: 0.0,
             active_background_opacity: 0.2,
             interact_background_opacity: 0.3,

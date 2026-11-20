@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "dap-sampler", about = "CMSIS-DAP v2 High-Speed Variable Sampler")]
 struct Cli {
-    /// 将日志同时写入文件（GUI 下日志默认不可见，排查连接问题用，如 --log-file dap-sampler.log）
+    /// Also write logs to a file (logs are invisible in the GUI; use this to troubleshoot connection issues, e.g. --log-file dap-sampler.log)
     #[arg(long, global = true)]
     log_file: Option<String>,
 
@@ -20,119 +20,119 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 列出所有连接的 CMSIS-DAP 设备
+    /// List all connected CMSIS-DAP devices
     List,
-    /// 解析 ELF 文件并打印变量树（调试用）
+    /// Parse an ELF file and print the variable tree (debug)
     Dump {
-        /// ELF 文件路径
+        /// ELF file path
         elf: String,
     },
-    /// 连接设备并显示调试信息
+    /// Connect to the device and show debug info
     Info {
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
-    /// 诊断 CMSIS-DAP USB 连接、接口、端点和可选 claim
+    /// Diagnose CMSIS-DAP USB connection, interfaces, endpoints and optional claim
     Diag {
-        /// 尝试 claim CMSIS-DAP interface 后立即释放（用于检查驱动/权限/占用）
+        /// Claim the CMSIS-DAP interface and release it immediately (checks driver/permissions/occupancy)
         #[arg(long)]
         claim: bool,
     },
-    /// 读取指定内存地址的值
+    /// Read the value at a memory address
     Read {
-        /// 内存地址（十六进制，如 0x20000100）
+        /// Memory address (hex, e.g. 0x20000100)
         address: String,
-        /// 解析为 float 类型
+        /// Parse the value as float
         #[arg(long)]
         float: bool,
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
-    /// 写入指定内存地址的值
+    /// Write a value to a memory address
     Write {
-        /// 内存地址（十六进制，如 0x20000100）
+        /// Memory address (hex, e.g. 0x20000100)
         address: String,
-        /// 要写入的值（u32 十六进制/十进制，或 float 当 --float 时）
+        /// Value to write (u32 hex/decimal, or float when --float is set)
         #[arg(long)]
         value: String,
-        /// 将值解析为 float 类型
+        /// Parse the value as float
         #[arg(long)]
         float: bool,
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
-    /// 连续监视内存地址
+    /// Watch a memory address continuously
     Monitor {
-        /// 内存地址（十六进制）
+        /// Memory address (hex)
         address: String,
-        /// 采样率 (Hz)
+        /// Sample rate (Hz)
         #[arg(long, default_value = "5000")]
         rate: u32,
-        /// 采样次数（默认无限次）
+        /// Number of samples (default: unlimited)
         #[arg(long)]
         count: Option<u32>,
-        /// 解析为 float 类型
+        /// Parse the value as float
         #[arg(long)]
         float: bool,
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
-    /// 高速流水线采样（P2），支持多变量
+    /// High-speed pipeline sampling (P2) with multiple variables
     Sample {
-        /// 内存地址列表（十六进制，逗号分隔，如 0x20000100,0x20000104）
+        /// Memory address list (hex, comma-separated, e.g. 0x20000100,0x20000104)
         #[arg(long, value_delimiter = ',')]
         addresses: Vec<String>,
 
-        /// 采样率 (Hz)
+        /// Sample rate (Hz)
         #[arg(long, default_value = "5000")]
         rate: u32,
 
-        /// 采样次数（默认无限）
+        /// Number of samples (default: unlimited)
         #[arg(long)]
         count: Option<u64>,
 
-        /// 解析为 float 类型（所有变量）
+        /// Parse all values as float
         #[arg(long)]
         float: bool,
 
-        /// 输出 CSV 文件路径（默认输出到 stdout）
+        /// Output CSV file path (default: stdout)
         #[arg(long)]
         output: Option<String>,
 
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
-    /// 启动 GUI 波形显示（P3/P4）
+    /// Launch the GUI waveform display (P3/P4)
     Gui {
-        /// 内存地址列表（十六进制，逗号分隔）
+        /// Memory address list (hex, comma-separated)
         #[arg(long, value_delimiter = ',')]
         addresses: Vec<String>,
 
-        /// 采样率 (Hz)
+        /// Sample rate (Hz)
         #[arg(long, default_value = "5000")]
         rate: u32,
 
-        /// 采样次数（默认无限）
+        /// Number of samples (default: unlimited)
         #[arg(long)]
         count: Option<u64>,
 
-        /// 变量类型列表（逗号分隔，如 float,int32,uint32）
+        /// Variable type list (comma-separated, e.g. float,int32,uint32)
         ///
-        /// 每个地址对应一个类型，默认全部 float。
-        /// 支持: float, int32, uint32, int16, uint16, int8, uint8
+        /// One type per address, all default to float.
+        /// Supported: float, int32, uint32, int16, uint16, int8, uint8
         #[arg(long, value_delimiter = ',')]
         r#type: Option<Vec<String>>,
 
-        /// ELF 固件文件路径（P4: 启用变量浏览器）
+        /// ELF firmware file path (P4: enables the variable browser)
         #[arg(long)]
         elf: Option<String>,
 
-        /// SWD 时钟频率（MHz，1-50）
+        /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
     },
@@ -159,12 +159,12 @@ fn main() -> anyhow::Result<()> {
                 })));
                 log_path = Some(path.to_string());
             }
-            Err(e) => eprintln!("警告: 无法打开日志文件 '{}': {}", path, e),
+            Err(e) => eprintln!("warning: failed to open log file '{}': {}", path, e),
         }
     }
     logger.init();
     if let Some(path) = log_path {
-        log::info!("日志将同时写入: {}", path);
+        log::info!("logs will also be written to: {}", path);
     }
 
     match cli.command.unwrap_or(Command::Gui {
@@ -265,11 +265,11 @@ impl std::io::Write for TeeWriter {
 fn cmd_dump(elf_path: &str) -> anyhow::Result<()> {
     use dap_sampler::elf::ElfParser;
 
-    println!("📦 解析 ELF: {}", elf_path);
+    println!("📦 Parsing ELF: {}", elf_path);
     let ctx = ElfParser::load(elf_path)
-        .map_err(|e| anyhow::anyhow!("ELF 加载失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("ELF load failed: {}", e))?;
 
-    println!("变量总数: {}", ctx.variables.len());
+    println!("total variables: {}", ctx.variables.len());
     for var in &ctx.variables {
         println!(
             "  {:<40} addr=0x{:08X} size={:<4} type={:?}  src={:?}",
@@ -282,18 +282,18 @@ fn cmd_dump(elf_path: &str) -> anyhow::Result<()> {
 fn cmd_list() -> anyhow::Result<()> {
     let devices = dap_sampler::usb::device::list_devices()?;
     if devices.is_empty() {
-        println!("⚠️  未找到 CMSIS-DAP v2 设备");
-        println!("  请确保 DAP-Link 已通过 USB 连接");
+        println!("⚠️  No CMSIS-DAP v2 device found");
+        println!("  Make sure the DAP-Link is connected via USB");
         println!();
-        println!("  提示: 设备需支持 CMSIS-DAP v2 (Bulk 传输)");
-        println!("  可通过设备管理器检查是否识别为 WinUSB 设备");
+        println!("  Note: the device must support CMSIS-DAP v2 (bulk transfers)");
+        println!("  Check Device Manager to see whether it is recognized as a WinUSB device");
     } else {
-        println!("🔍 找到 {} 个 CMSIS-DAP v2 设备:\n", devices.len());
+        println!("🔍 Found {} CMSIS-DAP v2 device(s):\n", devices.len());
         for (i, dev) in devices.iter().enumerate() {
-            println!("  [{}] {:04X}:{:04X}  总线={} 地址={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
-            println!("       厂商:   {}", if dev.manufacturer.is_empty() { "(无)" } else { &dev.manufacturer });
-            println!("       产品:   {}", if dev.product.is_empty() { "(无)" } else { &dev.product });
-            println!("       序列号: {}", if dev.serial.is_empty() { "(无)" } else { &dev.serial });
+            println!("  [{}] {:04X}:{:04X}  bus={} addr={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
+            println!("       Manufacturer: {}", if dev.manufacturer.is_empty() { "(none)" } else { &dev.manufacturer });
+            println!("       Product:      {}", if dev.product.is_empty() { "(none)" } else { &dev.product });
+            println!("       Serial:       {}", if dev.serial.is_empty() { "(none)" } else { &dev.serial });
             println!();
         }
     }
@@ -303,28 +303,28 @@ fn cmd_list() -> anyhow::Result<()> {
 fn cmd_diag(claim: bool) -> anyhow::Result<()> {
     let diagnostics = dap_sampler::usb::device::diagnose_devices(claim)?;
 
-    println!("🔎 CMSIS-DAP USB 诊断");
-    println!("   claim 测试: {}", if claim { "开启" } else { "关闭（使用 --claim 可检查驱动/权限/占用）" });
+    println!("🔎 CMSIS-DAP USB diagnostics");
+    println!("   claim test: {}", if claim { "enabled" } else { "disabled (use --claim to check driver/permissions/occupancy)" });
     println!();
 
     if diagnostics.is_empty() {
-        println!("⚠️  未发现 CMSIS-DAP 候选设备");
-        println!("   建议：检查 USB 连接、设备管理器中是否识别到 DAP-Link；");
-        println!("   如果设备是 CMSIS-DAP v1 HID，本工具当前只支持 CMSIS-DAP v2 Bulk。\n");
+        println!("⚠️  No CMSIS-DAP candidate device found");
+        println!("   Check the USB connection and whether the DAP-Link shows up in Device Manager;");
+        println!("   if the device is CMSIS-DAP v1 HID, this tool only supports CMSIS-DAP v2 bulk.\n");
         return Ok(());
     }
 
     for (i, dev) in diagnostics.iter().enumerate() {
-        println!("[{}] {:04X}:{:04X}  总线={} 地址={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
+        println!("[{}] {:04X}:{:04X}  bus={} addr={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
         println!("    known VID/PID: {}", yes_no(dev.known_vid_pid));
         println!("    open:          {}", yes_no(dev.open_ok));
         if let Some(e) = &dev.open_error {
             println!("      error: {}", e);
             println!("      hint:  {}", usb_error_hint(e));
         }
-        println!("    厂商:          {}", empty_or(&dev.manufacturer));
-        println!("    产品:          {}", empty_or(&dev.product));
-        println!("    序列号:        {}", empty_or(&dev.serial));
+        println!("    Manufacturer:  {}", empty_or(&dev.manufacturer));
+        println!("    Product:       {}", empty_or(&dev.product));
+        println!("    Serial:        {}", empty_or(&dev.serial));
         println!("    product CMSIS: {}", yes_no(dev.product_has_cmsis_dap));
         println!("    Bulk interface:{}", yes_no(dev.has_bulk_candidate));
         if let Some(e) = &dev.config_error {
@@ -337,7 +337,7 @@ fn cmd_diag(claim: bool) -> anyhow::Result<()> {
                 println!("      endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
             }
             _ => {
-                println!("      interface: (未找到 CMSIS-DAP v2 Bulk 接口)");
+                println!("      interface: (no CMSIS-DAP v2 bulk interface found)");
             }
         }
 
@@ -351,54 +351,54 @@ fn cmd_diag(claim: bool) -> anyhow::Result<()> {
         println!();
     }
 
-    println!("诊断结论参考：");
-    println!("  - open=false：常见原因是 WinUSB 驱动未安装、权限问题、设备被占用或已断开。");
-    println!("  - Bulk interface=false：可能是 CMSIS-DAP v1 HID，或固件/接口模式不是 CMSIS-DAP v2 Bulk。");
-    println!("  - claim=false：通常是被 Keil/OpenOCD/pyOCD/另一个 dap-sampler 实例占用，或驱动不匹配。");
-    println!("  - USB/claim 正常但 GUI 仍初始化失败：重点检查目标板供电、SWDIO/SWCLK/GND/RESET 接线、芯片读保护、SWD Clock。\n");
+    println!("Diagnostics summary:");
+    println!("  - open=false: usually the WinUSB driver is missing, permissions are lacking, or the device is occupied/disconnected.");
+    println!("  - bulk interface=false: the device may be CMSIS-DAP v1 HID, or the firmware/interface is not CMSIS-DAP v2 bulk.");
+    println!("  - claim=false: usually occupied by Keil/OpenOCD/pyOCD or another dap-sampler instance, or a driver mismatch.");
+    println!("  - USB/claim OK but GUI still fails to init: check target power, SWDIO/SWCLK/GND/RESET wiring, chip read protection, and the SWD clock.\n");
 
     Ok(())
 }
 
 fn yes_no(v: bool) -> &'static str {
-    if v { "是" } else { "否" }
+    if v { "yes" } else { "no" }
 }
 
 fn empty_or(s: &str) -> &str {
-    if s.is_empty() { "(无/无法读取)" } else { s }
+    if s.is_empty() { "(none/unreadable)" } else { s }
 }
 
 fn usb_error_hint(error: &str) -> &'static str {
     let lower = error.to_lowercase();
-    if lower.contains("access") || lower.contains("权限") || lower.contains("denied") {
-        "检查 Windows 驱动是否为 WinUSB，或是否有权限访问该 USB 接口。"
+    if lower.contains("access") || lower.contains("denied") {
+        "Check that the Windows driver is WinUSB and that you have permission to access the USB interface."
     } else if lower.contains("busy") {
-        "设备接口可能被 Keil/OpenOCD/pyOCD/其他程序占用，请关闭后重试。"
+        "The device interface may be occupied by Keil/OpenOCD/pyOCD or another program; close it and retry."
     } else if lower.contains("no device") || lower.contains("not found") {
-        "设备可能已断开、重枚举，或接口/端点不匹配。"
+        "The device may be disconnected or re-enumerated, or the interface/endpoint may not match."
     } else if lower.contains("timeout") || lower.contains("timed out") {
-        "设备无响应；检查 USB 线缆、DAP-Link 固件、目标板供电，或尝试重新插拔。"
+        "Device not responding; check the USB cable, DAP-Link firmware and target power, or replug the device."
     } else if lower.contains("pipe") {
-        "USB 管道错误；可能是端点不匹配、设备固件异常或接口被占用。"
+        "USB pipe error; possibly an endpoint mismatch, device firmware fault, or an occupied interface."
     } else {
-        "请对比好/坏 DAP-Link 的 diag --claim 输出；重点看 open、Bulk interface、claim 三项。"
+        "Compare diag --claim output between a good and a bad DAP-Link; focus on open, bulk interface and claim."
     }
 }
 
 fn cmd_info(swd_clock_mhz: u32) -> anyhow::Result<()> {
-    println!("🔌 正在连接 DAP-Link...");
+    println!("🔌 Connecting to DAP-Link...");
     let mut swd = SwdLink::new()?;
-    println!("⚡ 正在初始化 SWD @ {} MHz ...", swd_clock_mhz);
+    println!("⚡ Initializing SWD @ {} MHz ...", swd_clock_mhz);
     let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
     let device_info = swd.init_with_clock(clock_hz)?;
 
     println!();
-    println!("✅ 连接成功!");
-    println!("  目标: {}", device_info.target_info);
+    println!("✅ Connected!");
+    println!("  Target: {}", device_info.target_info);
     println!("  DPIDR = 0x{:08X}", device_info.dpidr);
     println!("  AP0 IDR = 0x{:08X}", device_info.ap_idr);
     println!();
-    println!("  可以使用 read 命令读取内存:");
+    println!("  Use the read command to read memory:");
     println!("  dap-sampler read 0x20000000");
 
     Ok(())
@@ -407,17 +407,17 @@ fn cmd_info(swd_clock_mhz: u32) -> anyhow::Result<()> {
 fn cmd_read(address: &str, as_float: bool, swd_clock_mhz: u32) -> anyhow::Result<()> {
     let addr = parse_address(address)?;
 
-    println!("🔌 正在连接 DAP-Link...");
+    println!("🔌 Connecting to DAP-Link...");
     let mut swd = SwdLink::new()?;
     let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
     swd.init_with_clock(clock_hz)?;
 
     if as_float {
         let value = swd.read_float(addr)?;
-        println!("📊 地址 0x{:08X} = {} (float)", addr, value);
+        println!("📊 Address 0x{:08X} = {} (float)", addr, value);
     } else {
         let value = swd.read_memory(addr)?;
-        println!("📊 地址 0x{:08X} = 0x{:08X} (u32)", addr, value);
+        println!("📊 Address 0x{:08X} = 0x{:08X} (u32)", addr, value);
         let as_f32 = f32::from_bits(value);
         println!("                   ≈ {} (float)", as_f32);
     }
@@ -431,20 +431,20 @@ fn cmd_write(address: &str, value: &str, as_float: bool, swd_clock_mhz: u32) -> 
     let (raw_value, display) = if as_float {
         let v: f32 = value
             .parse()
-            .map_err(|e| anyhow::anyhow!("无效的 float 值 '{}': {}", value, e))?;
+            .map_err(|e| anyhow::anyhow!("invalid float value '{}': {}", value, e))?;
         (v.to_bits(), format!("{} (float)", v))
     } else {
         let v = parse_address(value)?;
         (v, format!("0x{:08X} ({})", v, v))
     };
 
-    println!("🔌 正在连接 DAP-Link...");
+    println!("🔌 Connecting to DAP-Link...");
     let mut swd = SwdLink::new()?;
     let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
     swd.init_with_clock(clock_hz)?;
 
     swd.write_memory(addr, raw_value)?;
-    println!("✅ 已写入: 0x{:08X} = {}", addr, display);
+    println!("✅ Written: 0x{:08X} = {}", addr, display);
 
     Ok(())
 }
@@ -453,18 +453,18 @@ fn cmd_monitor(address: &str, rate: u32, count: Option<u32>, as_float: bool, swd
     let addr = parse_address(address)?;
     let interval_us = (1_000_000.0 / rate as f64) as u64;
 
-    println!("🔌 正在连接 DAP-Link...");
+    println!("🔌 Connecting to DAP-Link...");
     let mut swd = SwdLink::new()?;
     let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
     swd.init_with_clock(clock_hz)?;
 
-    println!("📈 开始监视 0x{:08X} @ {} Hz (间隔 {} us)", addr, rate, interval_us);
+    println!("📈 Watching 0x{:08X} @ {} Hz (interval {} us)", addr, rate, interval_us);
     if as_float {
-        println!("   格式: float");
+        println!("   format: float");
     } else {
-        println!("   格式: u32");
+        println!("   format: u32");
     }
-    println!("   序号 | 时间 (ms) | 值");
+    println!("   seq | time (ms) | value");
     println!("   {}", "-".repeat(45));
 
     let max_samples = count.unwrap_or(u32::MAX);
@@ -501,7 +501,7 @@ fn parse_address(s: &str) -> anyhow::Result<u32> {
     // 如果以 0x/0X 开头，按十六进制解析
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         return u32::from_str_radix(hex, 16)
-            .map_err(|e| anyhow::anyhow!("无效的地址格式 '{}': {}", s, e));
+            .map_err(|e| anyhow::anyhow!("invalid address format '{}': {}", s, e));
     }
     // 否则先尝试十进制（PowerShell 会把 0x0000000c 转成十进制 "12"），
     // 再回退到十六进制
@@ -509,7 +509,7 @@ fn parse_address(s: &str) -> anyhow::Result<u32> {
         return Ok(v);
     }
     u32::from_str_radix(s, 16)
-        .map_err(|e| anyhow::anyhow!("无效的地址格式 '{}': {}", s, e))
+        .map_err(|e| anyhow::anyhow!("invalid address format '{}': {}", s, e))
 }
 
 fn cmd_sample(
@@ -530,13 +530,13 @@ fn cmd_sample(
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     if addresses.is_empty() {
-        anyhow::bail!("至少需要指定一个内存地址");
+        anyhow::bail!("at least one memory address is required");
     }
     if addresses.len() > 8 {
-        anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
+        anyhow::bail!("at most 8 variables supported, got: {}", addresses.len());
     }
 
-    println!("\u{1f50c} 正在连接 DAP-Link...");
+    println!("\u{1f50c} Connecting to DAP-Link...");
     let mut swd = SwdLink::new()?;
     let clock_hz = swd_clock_mhz.saturating_mul(1_000_000);
     swd.init_with_clock(clock_hz)?;
@@ -544,15 +544,15 @@ fn cmd_sample(
     let (usb, dap) = swd.into_parts();
 
     let interval_us = 1_000_000.0 / rate as f64;
-    println!("\u{1f680} 启动流水线采集:");
-    println!("   变量数: {}", addresses.len());
+    println!("\u{1f680} Starting pipeline capture:");
+    println!("   variables: {}", addresses.len());
     for (i, &addr) in addresses.iter().enumerate() {
         println!("   [{}] 0x{:08X}", i, addr);
     }
-    println!("   采样率: {} Hz (间隔 {:.0} us)", rate, interval_us);
-    println!("   模式:   {}", if as_float { "float" } else { "u32 (hex)" });
+    println!("   rate: {} Hz (interval {:.0} us)", rate, interval_us);
+    println!("   mode:   {}", if as_float { "float" } else { "u32 (hex)" });
     if let Some(path) = output_path {
-        println!("   输出:   {}", path);
+        println!("   output: {}", path);
     }
 
     // 创建引擎并启动（CLI 模式无类型概念，全部按 u32 整字访问）
@@ -614,7 +614,7 @@ fn cmd_sample(
         if total_collected / (rate as u64) > last_progress {
             last_progress = total_collected / (rate as u64);
             log::info!(
-                "已采集 {} 个采样点 ({:.1}s), 缓冲区可用 {}",
+                "captured {} samples ({:.1}s), {} available in buffer",
                 total_collected,
                 total_collected as f64 / rate as f64,
                 handle.available_samples()
@@ -626,10 +626,10 @@ fn cmd_sample(
     handle.stop();
 
     let actual_count = total_collected;
-    println!("\n\u{2705} 采集完成: {} 个采样点", actual_count);
+    println!("\n\u{2705} capture finished: {} samples", actual_count);
     if actual_count > 0 {
         let actual_duration = actual_count as f64 / rate as f64;
-        println!("   实际时长: {:.3}s", actual_duration);
+        println!("   actual duration: {:.3}s", actual_duration);
     }
 
     Ok(())
@@ -648,8 +648,8 @@ fn cmd_gui(
 
     // 加载 ELF（如果提供）
     let elf_ctx = if let Some(path) = elf_path {
-        println!("📦 正在加载 ELF: {}", path);
-        Some(ElfParser::load(path).map_err(|e| anyhow::anyhow!("ELF 加载失败: {}", e))?)
+        println!("📦 Loading ELF: {}", path);
+        Some(ElfParser::load(path).map_err(|e| anyhow::anyhow!("ELF load failed: {}", e))?)
     } else {
         None
     };
@@ -663,7 +663,7 @@ fn cmd_gui(
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         if addresses.len() > 8 {
-            anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
+            anyhow::bail!("at most 8 variables supported, got: {}", addresses.len());
         }
         addresses
     } else {
@@ -732,7 +732,7 @@ fn load_window_icon() -> egui::IconData {
             }
         }
         Err(e) => {
-            log::error!("加载窗口图标失败: {}", e);
+            log::error!("failed to load window icon: {}", e);
             egui::IconData::default()
         }
     }

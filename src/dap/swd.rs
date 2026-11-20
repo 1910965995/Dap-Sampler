@@ -51,7 +51,7 @@ impl SwdLink {
     ///
     /// `swd_clock_hz` 为目标 SWD 时钟频率（Hz），常用值：1M/2M/5M/10M/20M/30M/50M。
     pub fn init_with_clock(&mut self, swd_clock_hz: u32) -> Result<DeviceInfo> {
-        info!("=== SWD 初始化开始 ===");
+        info!("=== SWD init start ===");
 
         // 0. 先断开之前可能残留的连接（清理 DAP-Link 状态）
         let mut buf = [0u8; 64];
@@ -73,7 +73,7 @@ impl SwdLink {
         self.usb.write(&cmd)?;
         let n = self.usb.read(&mut buf)?;
         DapProtocol::parse_clock_response(&buf[..n])?;
-        info!("SWD 时钟: {} MHz", clock as f32 / 1_000_000.0);
+        info!("SWD clock: {} MHz", clock as f32 / 1_000_000.0);
 
         // 4. DAP_TransferConfigure (idle=0, wait_retry=100, match_retry=0)
         let cfg_cmd = DapProtocol::build_transfer_configure_request(0, 100, 0);
@@ -121,7 +121,7 @@ impl SwdLink {
         let select_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
         let resp = self.dap.execute_transfer(self.usb(), &[select_req])?;
         if resp.status != TRANSFER_OK {
-            return Err(Error::Swd("写 SELECT 失败".into()));
+            return Err(Error::Swd("failed to write DP SELECT".into()));
         }
 
         // 12. 扫描 AP
@@ -130,11 +130,11 @@ impl SwdLink {
 
         // 13. 验证内存读取（读向量表地址 0x00000000）
         match self.read_memory(0x00000000) {
-            Ok(v) => info!("验证读取 (0x00000000) = 0x{:08X} ✓", v),
-            Err(e) => warn!("验证读取失败: {}", e),
+            Ok(v) => info!("verify read (0x00000000) = 0x{:08X} ✓", v),
+            Err(e) => warn!("verify read failed: {}", e),
         }
 
-        info!("=== SWD 初始化完成 ===");
+        info!("=== SWD init done ===");
         Ok(DeviceInfo {
             dpidr,
             ap_idr,
@@ -150,41 +150,41 @@ impl SwdLink {
     /// SWD 连接
     fn swd_connect(&self) -> Result<()> {
         let cmd = self.dap.build_connect_request(CONNECT_MODE_SWD);
-        info!("DAP_Connect 请求: {:02X?}", cmd);
+        info!("DAP_Connect request: {:02X?}", cmd);
         self.usb.write(&cmd)?;
         let mut buf = [0u8; 64];
         let n = self.usb.read(&mut buf)?;
-        info!("DAP_Connect 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        info!("DAP_Connect response ({} bytes): {:02X?}", n, &buf[..n]);
         let mode = DapProtocol::parse_connect_response(&buf[..n])?;
-        info!("DAP_Connect 返回: {}", mode);
+        info!("DAP_Connect returned: {}", mode);
         Ok(())
     }
 
     /// SWD 线复位 + JTAG-to-SWD 切换
     /// SWD 线复位（精确匹配 Keil 抓包序列：Line Reset + JTAG-to-SWD + Line Reset）
     fn swd_line_reset(&self) -> Result<()> {
-        info!("发送 SWD 初始化序列...");
+        info!("sending SWD init sequence...");
         let mut buf = [0u8; 64];
 
         // 1. Line Reset: 51 bits TMS=1 (Keil: 12 33 FF FF FF FF FF FF FF)
         let cmd1 = vec![DAP_SWJ_SEQUENCE, 51, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         self.usb.write(&cmd1)?;
         let n = self.usb.read(&mut buf)?;
-        info!("SWJ Line Reset 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        info!("SWJ Line Reset response ({} bytes): {:02X?}", n, &buf[..n]);
 
         // 2. JTAG-to-SWD 切换: 16 bits (Keil: 12 10 9E E7)
         let cmd2 = vec![DAP_SWJ_SEQUENCE, 16, 0x9E, 0xE7];
         self.usb.write(&cmd2)?;
         let n = self.usb.read(&mut buf)?;
-        info!("SWJ JTAG-to-SWD 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        info!("SWJ JTAG-to-SWD response ({} bytes): {:02X?}", n, &buf[..n]);
 
         // 3. Line Reset: 51 bits TMS=1 (Keil: 12 33 FF FF FF FF FF FF FF)
         let cmd3 = vec![DAP_SWJ_SEQUENCE, 51, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         self.usb.write(&cmd3)?;
         let n = self.usb.read(&mut buf)?;
-        info!("SWJ Line Reset 2 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        info!("SWJ Line Reset 2 response ({} bytes): {:02X?}", n, &buf[..n]);
 
-        info!("SWD 序列完成");
+        info!("SWD sequence done");
         Ok(())
     }
 
@@ -222,7 +222,7 @@ impl SwdLink {
         let req1 = TransferRequest::write_dp(DP_REG_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ);
         let resp = self.dap.execute_transfer(self.usb(), &[req1])?;
         if resp.status != TRANSFER_OK {
-            return Err(Error::Swd(format!("电源上电请求失败: status={}, count={}", resp.status, resp.count)));
+            return Err(Error::Swd(format!("debug power-up request failed: status={}, count={}", resp.status, resp.count)));
         }
 
         // 读 CTRL/STAT 确认电源就绪（此 DAP-Link 无流水线延迟，直接返回）
@@ -235,9 +235,9 @@ impl SwdLink {
         let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
 
         if (ctrl_stat & (CSYSPWRUPACK | CDBGPWRUPACK)) != (CSYSPWRUPACK | CDBGPWRUPACK) {
-            return Err(Error::Swd(format!("调试电源未就绪: CTRL/STAT=0x{:08X}", ctrl_stat)));
+            return Err(Error::Swd(format!("debug power not ready: CTRL/STAT=0x{:08X}", ctrl_stat)));
         }
-        info!("调试电源已就绪: CTRL/STAT=0x{:08X}", ctrl_stat);
+        info!("debug power ready: CTRL/STAT=0x{:08X}", ctrl_stat);
         Ok(())
     }
 
@@ -247,7 +247,7 @@ impl SwdLink {
         let req = TransferRequest::write_dp(DP_REG_SELECT, (ap as u32) << 24);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
         if resp.status != TRANSFER_OK {
-            return Err(Error::Swd(format!("选择 AP{} 失败", ap)));
+            return Err(Error::Swd(format!("failed to select AP{}", ap)));
         }
         Ok(())
     }
@@ -264,7 +264,7 @@ impl SwdLink {
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
 
         if resp.status != TRANSFER_OK || resp.len == 0 {
-            return Err(Error::Swd("AP 扫描失败".into()));
+            return Err(Error::Swd("AP scan failed".into()));
         }
 
         self.ap_index = 0;
@@ -349,7 +349,7 @@ impl SwdLink {
             // 无法安全写入（需要跨字读-改-写）
             if acc.aligned_addr & 3 != 0 {
                 return Err(Error::Other(format!(
-                    "8 字节变量地址 0x{:08X} 未 4 字节对齐，无法写入",
+                    "8-byte variable at 0x{:08X} is not 4-byte aligned, cannot write",
                     address
                 )));
             }

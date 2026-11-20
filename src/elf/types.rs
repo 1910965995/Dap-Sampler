@@ -42,7 +42,7 @@ pub fn map_dwarf_type(name: &str, byte_size: u32) -> ValueType {
             return vt;
         }
         log::debug!(
-            "类型名 '{}' 映射为 {:?}（{} 字节）与实际大小 {} 不符，按宽度回退",
+            "type name '{}' maps to {:?} ({} bytes) but DWARF size is {}, falling back by width",
             name,
             vt,
             vt.byte_size(),

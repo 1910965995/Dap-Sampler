@@ -39,7 +39,7 @@ const CHANNEL_COLORS: [egui::Color32; 8] = [
 ];
 
 /// 连接类故障的排障建议（仅随 USB/SWD 连接失败类错误显示）
-const CONNECTION_HINT: &str = "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。";
+const CONNECTION_HINT: &str = "Note: Check that the DAP-Link is connected, the WinUSB driver is installed, the device is not occupied by Keil/OpenOCD/pyOCD or other programs, the target board is powered, and the SWD wiring is correct; or try a lower SWD clock.";
 
 /// 统一浅色主题与滚动条风格（每帧应用，覆盖 egui 默认值）
 ///
@@ -687,7 +687,7 @@ impl DapSamplerApp {
                     self.elf_sync_prompt = compute_elf_diffs(&file.variables, &ctx.variables);
                     self.elf_sync_open = self.elf_sync_prompt.is_some();
                     self.elf_ctx = Some(ctx);
-                    log::info!("ELF 已加载: {}", elf_path);
+                    log::info!("ELF loaded: {}", elf_path);
                     true
                 }
                 Err(e) => {
@@ -831,7 +831,7 @@ impl DapSamplerApp {
             .filter(|e| !file_vars.iter().any(|pv| pv.name == e.name))
             .count();
         if unmatched > 0 {
-            log::warn!("{} 个 Watch 行在工程变量中找不到对应项，保留当前配置", unmatched);
+            log::warn!("{} watch rows have no matching project variable, keeping current config", unmatched);
         }
         for entry in self.watch_panel.entries.iter_mut() {
             let Some(pv) = file_vars.iter().find(|pv| pv.name == entry.name) else {
@@ -1106,9 +1106,9 @@ impl DapSamplerApp {
 
     fn stop_pipeline(&mut self) {
         if let Some(handle) = self.pipeline.take() {
-            log::info!("开始停止流水线，等待子线程退出...");
+            log::info!("stopping pipeline, waiting for worker threads to exit...");
             handle.stop();
-            log::info!("流水线停止完成");
+            log::info!("pipeline stop complete");
         }
         self.acquisition_start = None;
         self.controls.actual_rate_hz = 0.0;
@@ -1173,7 +1173,7 @@ impl DapSamplerApp {
         }
 
         if self.current_names.is_empty() {
-            log::warn!("写入请求被忽略：无采集通道");
+            log::warn!("write request ignored: no sampling channels");
             return;
         }
 
@@ -1187,13 +1187,13 @@ impl DapSamplerApp {
                         let addr = self.current_addresses[idx];
                         handle.queue_write(idx, w.raw_value);
                         log::info!(
-                            "已排队写入通道 {} ({}): 0x{:08X} → 0x{:08X}",
+                            "queued write for channel {} ({}): 0x{:08X} → 0x{:08X}",
                             idx, w.channel_name, w.raw_value, addr
                         );
                     }
                     None => {
                         log::warn!(
-                            "写入请求被丢弃：通道 '{}' 不在当前采集集合中",
+                            "write request dropped: channel '{}' not in the current sampling set",
                             w.channel_name
                         );
                     }
@@ -1206,7 +1206,7 @@ impl DapSamplerApp {
                 Ok(mut swd) => {
                     let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
                     if let Err(e) = swd.init_with_clock(clock_hz) {
-                        log::error!("写入前 SWD initialization failed: {}", e);
+                        log::error!("SWD initialization failed before write: {}", e);
                         return;
                     }
                     for w in &writes {
@@ -1217,23 +1217,23 @@ impl DapSamplerApp {
                             .find(|e| e.name == w.channel_name)
                         else {
                             log::warn!(
-                                "写入请求被丢弃：通道 '{}' 不在 Watch 列表中",
+                                "write request dropped: channel '{}' not in the Watch list",
                                 w.channel_name
                             );
                             continue;
                         };
                         match swd.write_variable(entry.address, entry.value_type.byte_size(), w.raw_value) {
                             Ok(()) => log::info!(
-                                "已写入通道 '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
+                                "wrote channel '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
                                 w.channel_name, w.raw_value, entry.address, entry.value_type.byte_size()
                             ),
                             Err(e) => log::error!(
-                                "写入通道 '{}' 失败: {}", w.channel_name, e
+                                "failed to write channel '{}': {}", w.channel_name, e
                             ),
                         }
                     }
                 }
-                Err(e) => log::error!("写入时Failed to connect to DAP-Link: {}", e),
+                Err(e) => log::error!("failed to connect to DAP-Link for write: {}", e),
             }
         }
     }
@@ -1437,7 +1437,7 @@ impl DapSamplerApp {
             // 而不是静默不显示读数
             ui.separator();
             let range_text = if self.display_buf.is_empty() {
-                "(缓冲已清空)".to_string()
+                "(buffer cleared)".to_string()
             } else {
                 format!(
                     "[{} ~ {}]",
@@ -1447,7 +1447,7 @@ impl DapSamplerApp {
             };
             ui.colored_label(
                 egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                format!("⚠ Cursor 1 @ seq {} 已滑出缓冲范围 {}", seq, range_text),
+                format!("⚠ Cursor 1 @ seq {} slid out of buffer range {}", seq, range_text),
             );
         }
 
@@ -1468,7 +1468,7 @@ impl DapSamplerApp {
             ui.separator();
             ui.colored_label(
                 egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                "⚠ Cursor 2 已滑出缓冲范围",
+                "⚠ Cursor 2 slid out of buffer range",
             );
         }
     }
@@ -1528,7 +1528,7 @@ impl DapSamplerApp {
                 (
                     egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
                     Some(
-                        "DAP-Link 吞吐量不足，实际采样率低于目标。\n波形时间轴已使用真实时间戳，波形形状应正确。\n降低采样率可获得更均匀的采样间隔。",
+                        "DAP-Link throughput insufficient, actual sample rate is below target.\nThe waveform time axis uses real timestamps, so the shape should be correct.\nLower the sample rate for more uniform sampling intervals.",
                     ),
                 )
             } else {
@@ -1561,7 +1561,7 @@ impl DapSamplerApp {
                     format!("Overwritten: {}", overwritten),
                     egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
                     Some(
-                        "UI 消费速度低于采样速度，环形缓冲区已覆盖旧采样点（数据丢失）。\n通常由窗口拖拽、对话框阻塞或采样率过高引起。",
+                        "UI consumption is slower than sampling, the ring buffer has overwritten old samples (data loss).\nUsually caused by window dragging, modal dialogs or an overly high sample rate.",
                     ),
                 ));
             }
@@ -2974,7 +2974,7 @@ mod status_theme_tests {
         app.set_error("Only 8 channels can be watched at a time. Unselected channel variable: s_uartIrqId[1]");
         let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
         assert!(
-            !tip.contains("请检查") && !tip.contains("DAP-Link"),
+            !tip.contains("Note:") && !tip.contains("DAP-Link"),
             "UI 类错误不得附带连接排障建议，实际 {tip:?}"
         );
         assert!(!tip.contains('\n'), "无建议时悬停提示就是消息本身: {tip:?}");
@@ -2983,7 +2983,7 @@ mod status_theme_tests {
         app.set_error_with_hint("SWD initialization failed: timeout", CONNECTION_HINT);
         let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
         assert!(tip.starts_with("SWD initialization failed: timeout"));
-        assert!(tip.contains("\n\n请检查：DAP-Link"), "连接类错误应附带排障建议: {tip:?}");
+        assert!(tip.contains("\n\nNote: Check that the DAP-Link"), "connection errors should carry the hint: {tip:?}");
     }
 
     #[test]
@@ -2996,7 +2996,7 @@ mod status_theme_tests {
         app.set_status("Acquisition stopped");
         assert!(app.status_hint.is_none(), "set_status 应清掉旧建议");
         let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
-        assert!(!tip.contains("请检查"));
+        assert!(!tip.contains("Note:"));
 
         app.set_error("Only 8 channels can be watched at a time");
         assert!(app.status_hint.is_none(), "set_error 应清掉旧建议");

@@ -43,13 +43,13 @@ pub fn build_from_dwarf(
         .collect();
 
     log::info!(
-        "交叉验证: ELF符号={}, DWARF变量={}, 通过验证={} (被过滤: 名称不匹配或地址为0)",
+        "cross-validation: ELF symbols={}, DWARF variables={}, validated={} (filtered: name mismatch or address=0)",
         elf_symbols.len(),
         dwarf.variables.len(),
         valid_dwarf_vars.len()
     );
     if !dwarf.variables.is_empty() && valid_dwarf_vars.is_empty() {
-        log::warn!("DWARF 有 {} 个变量但无一个匹配 ELF 符号表, 请检查编译选项 (可能需要 -g 并保留符号表)", dwarf.variables.len());
+        log::warn!("DWARF has {} variables but none match the ELF symbol table, check build options (-g and keep the symbol table)", dwarf.variables.len());
     }
 
     // 2. 对每个变量，解析类型链并展开
@@ -65,7 +65,7 @@ pub fn build_from_dwarf(
         // （仅在入口检查 output.len() 无法阻止分支递归继续空转）
         if expand_variable(dv, &resolved, &dwarf.types, "", &mut result, 0, &mut node_budget) {
             log::warn!(
-                "展开预算耗尽（节点上限 {} / 叶子上限 {}），剩余 {} 个变量未展开",
+                "expansion budget exhausted (node limit {} / leaf limit {}), {} variables left unexpanded",
                 MAX_EXPAND_NODES,
                 MAX_EXPANDED_LEAVES,
                 valid_dwarf_vars.len() - skipped - 1
@@ -75,13 +75,13 @@ pub fn build_from_dwarf(
         if result.len() == before {
             skipped += 1;
             log::warn!(
-                "变量 '{}' 展开失败 (type_offset=0x{:X}), 跳过",
+                "failed to expand variable '{}' (type_offset=0x{:X}), skipped",
                 dv.name, dv.type_offset
             );
         }
     }
     log::info!(
-        "类型展开: 输入 {} 个变量, 输出 {} 个叶子, 跳过 {} 个",
+        "type expansion: {} variables in, {} leaves out, {} skipped",
         valid_dwarf_vars.len(), result.len(), skipped
     );
 
@@ -228,7 +228,7 @@ fn expand_variable(
     }
     *budget -= 1;
     if depth > MAX_EXPAND_DEPTH {
-        log::warn!("类型展开深度超过 {MAX_EXPAND_DEPTH}，截断: {}", dv.name);
+        log::warn!("type expansion depth exceeds {MAX_EXPAND_DEPTH}, truncated: {}", dv.name);
         return false;
     }
     let path = if parent_path.is_empty() {
@@ -244,7 +244,7 @@ fn expand_variable(
             // 为单位访问，8 字节类型占两个字）。
             if !matches!(*byte_size, 1 | 2 | 4 | 8) {
                 log::warn!(
-                    "跳过不支持的变量 '{}'：基类型 '{}' 为 {} 字节（仅支持 1/2/4/8 字节）",
+                    "skipping unsupported variable '{}': base type '{}' is {} bytes (only 1/2/4/8 supported)",
                     dv.name, name, byte_size
                 );
                 return false;

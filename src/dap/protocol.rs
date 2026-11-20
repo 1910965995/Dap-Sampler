@@ -30,7 +30,7 @@ impl DapProtocol {
 
     pub fn parse_info_response(data: &[u8]) -> Result<(u8, Vec<u8>)> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_Info 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_Info response too short".into()));
         }
         // CMSIS-DAP 响应格式: [命令回显(0x00), 状态, 内容...]
         let status = data[1];
@@ -47,7 +47,7 @@ impl DapProtocol {
 
     pub fn parse_connect_response(data: &[u8]) -> Result<u8> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_Connect 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_Connect response too short".into()));
         }
         // CMSIS-DAP 响应格式: [命令回显(0x02), 端口值]
         // 端口值: 0=未连接, 1=SWD, 2=JTAG
@@ -65,7 +65,7 @@ impl DapProtocol {
 
     pub fn parse_clock_response(data: &[u8]) -> Result<u8> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_SWJ_Clock 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_SWJ_Clock response too short".into()));
         }
         // CMSIS-DAP 响应格式: [命令回显(0x11), 状态(0=成功)]
         Ok(data[1])
@@ -87,10 +87,10 @@ impl DapProtocol {
 
     pub fn parse_transfer_configure_response(data: &[u8]) -> Result<()> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_TransferConfigure 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_TransferConfigure response too short".into()));
         }
         if data[1] != 0 {
-            return Err(Error::InvalidResponse(format!("DAP_TransferConfigure 失败: 状态={}", data[1])));
+            return Err(Error::InvalidResponse(format!("DAP_TransferConfigure failed: status={}", data[1])));
         }
         Ok(())
     }
@@ -106,10 +106,10 @@ impl DapProtocol {
 
     pub fn parse_swd_configure_response(data: &[u8]) -> Result<()> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_SWD_Configure 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_SWD_Configure response too short".into()));
         }
         if data[1] != 0 {
-            return Err(Error::InvalidResponse(format!("DAP_SWD_Configure 失败: 状态={}", data[1])));
+            return Err(Error::InvalidResponse(format!("DAP_SWD_Configure failed: status={}", data[1])));
         }
         Ok(())
     }
@@ -126,7 +126,7 @@ impl DapProtocol {
 
     pub fn parse_host_status_response(data: &[u8]) -> Result<()> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_HostStatus 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_HostStatus response too short".into()));
         }
         // 忽略状态，某些 DAP-Link 可能不支持
         Ok(())
@@ -147,7 +147,7 @@ impl DapProtocol {
 
     pub fn parse_pins_response(data: &[u8]) -> Result<u8> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_SWJ_PINS 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_SWJ_PINS response too short".into()));
         }
         Ok(data[1]) // 引脚状态
     }
@@ -166,7 +166,7 @@ impl DapProtocol {
 
     pub fn parse_swj_sequence_response(data: &[u8]) -> Result<u8> {
         if data.len() < 2 {
-            return Err(Error::InvalidResponse("DAP_SWJ_Sequence 响应过短".into()));
+            return Err(Error::InvalidResponse("DAP_SWJ_Sequence response too short".into()));
         }
         Ok(data[1])
     }
@@ -199,12 +199,12 @@ impl DapProtocol {
     pub fn parse_transfer_response(data: &[u8]) -> Result<TransferResponse> {
         if data.len() < 3 {
             return Err(Error::InvalidResponse(format!(
-                "DAP_Transfer 响应过短: {} 字节", data.len()
+                "DAP_Transfer response too short: {} bytes", data.len()
             )));
         }
         if data[0] != DAP_TRANSFER {
             return Err(Error::InvalidResponse(format!(
-                "响应头不是 DAP_Transfer 回显: 0x{:02X}（字节流失步）",
+                "response header is not a DAP_Transfer echo: 0x{:02X} (byte stream desync)",
                 data[0]
             )));
         }
@@ -224,7 +224,7 @@ impl DapProtocol {
             let offset = i * 4;
             let bytes: [u8; 4] = data_bytes[offset..offset + 4]
                 .try_into()
-                .map_err(|_| Error::InvalidResponse("数据解析错误".into()))?;
+                .map_err(|_| Error::InvalidResponse("data parse error".into()))?;
             *slot = u32::from_le_bytes(bytes);
         }
 
@@ -238,11 +238,11 @@ impl DapProtocol {
         requests: &[TransferRequest],
     ) -> Result<TransferResponse> {
         let cmd = self.build_transfer_request(requests);
-        log::debug!(">>> DAP_Transfer 请求 ({} 字节): {:02X?}", cmd.len(), cmd);
+        log::debug!(">>> DAP_Transfer request ({} bytes): {:02X?}", cmd.len(), cmd);
         usb.write(&cmd)?;
         let mut buf = vec![0u8; 1024];
         let n = usb.read(&mut buf)?;
-        log::debug!("<<< DAP_Transfer 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        log::debug!("<<< DAP_Transfer response ({} bytes): {:02X?}", n, &buf[..n]);
         DapProtocol::parse_transfer_response(&buf[..n])
     }
 

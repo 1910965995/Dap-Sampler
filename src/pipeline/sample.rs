@@ -33,7 +33,7 @@ impl ValueType {
             "int64" | "i64" | "long long" => Ok(ValueType::Int64),
             "uint64" | "u64" | "unsigned long long" => Ok(ValueType::Uint64),
             _ => Err(format!(
-                "未知类型: {}（支持: float, int32, uint32, int16, uint16, int8, uint8, double, int64, uint64）",
+                "unknown type: {} (supported: float, int32, uint32, int16, uint16, int8, uint8, double, int64, uint64)",
                 s
             )),
         }

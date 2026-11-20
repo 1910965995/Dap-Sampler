@@ -20,7 +20,7 @@ impl BulkTransfer {
     pub fn open() -> Result<Self> {
         let (handle, interface_num) = device::open_first_device()?;
         let (ep_out, ep_in) = device::find_bulk_endpoints(&handle)?;
-        log::info!("Bulk 端点: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
+        log::info!("bulk endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
         let transfer = Self {
             handle,
             ep_out,
@@ -59,14 +59,14 @@ impl BulkTransfer {
             }
         }
         if drain_count > 0 {
-            log::info!("排空 {} 个残留 USB 响应", drain_count);
+            log::info!("drained {} stale USB responses", drain_count);
         }
 
         // 2. 发送 DAP_Disconnect 命令，清理 CMSIS-DAP 连接状态
-        log::info!("发送 DAP_Disconnect 命令");
+        log::info!("sending DAP_Disconnect command");
         let disconnect_cmd = [crate::dap::commands::DAP_DISCONNECT];
         if let Err(e) = self.handle.write_bulk(self.ep_out, &disconnect_cmd, Duration::from_millis(200)) {
-            log::warn!("DAP_Disconnect 发送失败: {}", e);
+            log::warn!("DAP_Disconnect send failed: {}", e);
         } else {
             // 读取 DAP_Disconnect 响应
             let _ = self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(200));
@@ -79,12 +79,12 @@ impl BulkTransfer {
         }
 
         // 4. 释放 USB 接口
-        log::info!("显式释放 USB 接口 {}", self.interface_num);
+        log::info!("releasing USB interface {}", self.interface_num);
         if let Err(e) = self.handle.release_interface(self.interface_num) {
-            log::warn!("release_interface 失败: {}", e);
+            log::warn!("release_interface failed: {}", e);
         }
 
-        log::info!("DAP-Link 释放完成");
+        log::info!("DAP-Link released");
     }
 
     /// 设置超时
@@ -94,7 +94,7 @@ impl BulkTransfer {
 
     /// Bulk 写（发送命令）
     pub fn write(&self, data: &[u8]) -> Result<usize> {
-        log::debug!("USB OUT ({} 字节): {:02X?}", data.len(), data);
+        log::debug!("USB OUT ({} bytes): {:02X?}", data.len(), data);
         let n = self.handle.write_bulk(self.ep_out, data, self.timeout)?;
         Ok(n)
     }
@@ -112,7 +112,7 @@ impl BulkTransfer {
     /// Bulk 读（接收响应）
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         let n = self.handle.read_bulk(self.ep_in, buf, self.timeout)?;
-        log::debug!("USB IN: {} 字节", n);
+        log::debug!("USB IN: {} bytes", n);
         Ok(n)
     }
 
@@ -133,7 +133,7 @@ impl BulkTransfer {
             flushed += n;
         }
         if flushed > 0 {
-            log::info!("已清空 USB 缓冲区残留数据: {} 字节", flushed);
+            log::info!("cleared {} bytes of stale USB buffer data", flushed);
         }
     }
 }
@@ -149,7 +149,7 @@ impl Drop for BulkTransfer {
     /// USB 接口也能在最后一个引用释放时被正确释放，避免 DAP-Link 卡死。
     fn drop(&mut self) {
         if !self.released {
-            log::warn!("BulkTransfer 未显式 release，Drop 时自动释放");
+            log::warn!("BulkTransfer not explicitly released, auto-releasing on Drop");
             self.release();
         }
     }

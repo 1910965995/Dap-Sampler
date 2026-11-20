@@ -37,7 +37,7 @@ impl ElfParser {
     /// 加载 ELF 文件，解析符号表和 DWARF 信息
     pub fn load<P: AsRef<Path>>(path: P) -> Result<ElfContext, String> {
         let path = path.as_ref();
-        let data = fs::read(path).map_err(|e| format!("无法读取文件: {}", e))?;
+        let data = fs::read(path).map_err(|e| format!("failed to read file: {}", e))?;
 
         // 先尝试 ELF32，失败再尝试 ELF64
         if object::read::elf::ElfFile32::<object::Endianness>::parse(&data).is_ok() {
@@ -51,7 +51,7 @@ impl ElfParser {
         use object::read::elf::ElfFile32;
 
         let elf = ElfFile32::<object::Endianness>::parse(data)
-            .map_err(|e| format!("ELF32 解析失败: {}", e))?;
+            .map_err(|e| format!("ELF32 parse failed: {}", e))?;
 
         let elf_symbols = Self::extract_symbols_object(&elf)?;
         let sections = Self::extract_dwarf_sections(&elf)?;
@@ -67,7 +67,7 @@ impl ElfParser {
         use object::read::elf::ElfFile64;
 
         let elf = ElfFile64::<object::Endianness>::parse(data)
-            .map_err(|e| format!("ELF64 解析失败: {}", e))?;
+            .map_err(|e| format!("ELF64 parse failed: {}", e))?;
 
         let elf_symbols = Self::extract_symbols_object(&elf)?;
         let sections = Self::extract_dwarf_sections(&elf)?;
@@ -97,12 +97,12 @@ impl ElfParser {
                 sections.get(".debug_addr").map(|v| v.as_slice()).unwrap_or(&[]),
             )?;
             log::info!(
-                "DWARF 解析: {} 个变量, {} 个类型定义, {} 个源文件",
+                "DWARF parse: {} variables, {} type definitions, {} source files",
                 dr.variables.len(), dr.types.len(), dr.source_files.len()
             );
             Some(dr)
         } else {
-            log::info!("无 DWARF 调试信息, 使用纯符号表模式");
+            log::info!("no DWARF debug info, falling back to symbol-table-only mode");
             None
         };
 
@@ -112,7 +112,7 @@ impl ElfParser {
             tree::build_from_symbols_only(elf_symbols)?
         };
 
-        log::info!("最终变量列表: {} 个 (展开后)", variables.len());
+        log::info!("final variable list: {} (after expansion)", variables.len());
 
         Ok(variables)
     }
@@ -154,7 +154,7 @@ impl ElfParser {
         }
 
         log::info!(
-            "ELF 符号表: 总计 {} 个符号, Data 类型保留 {} 个 (跳过: 类型不符={}, undefined={}, addr=0={})",
+            "ELF symbol table: {} symbols total, {} Data symbols kept (skipped: wrong type={}, undefined={}, addr=0={})",
             total_syms, symbols.len(), skipped_kind, skipped_undef, skipped_addr
         );
 

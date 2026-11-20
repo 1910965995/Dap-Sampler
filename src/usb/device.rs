@@ -263,7 +263,7 @@ pub fn diagnose_devices(try_claim: bool) -> Result<Vec<UsbDeviceDiagnostic>> {
                     Ok(()) => {
                         claim_ok = Some(true);
                         if let Err(e) = h.release_interface(iface) {
-                            claim_error = Some(format!("release interface {} 失败: {}", iface, e));
+                            claim_error = Some(format!("release interface {} failed: {}", iface, e));
                         }
                     }
                     Err(e) => {
@@ -273,11 +273,11 @@ pub fn diagnose_devices(try_claim: bool) -> Result<Vec<UsbDeviceDiagnostic>> {
                 },
                 (None, _) => {
                     claim_ok = Some(false);
-                    claim_error = open_error.clone().or_else(|| Some("设备无法打开，无法 claim interface".to_string()));
+                    claim_error = open_error.clone().or_else(|| Some("device cannot be opened, cannot claim interface".to_string()));
                 }
                 (_, None) => {
                     claim_ok = Some(false);
-                    claim_error = Some("未找到 CMSIS-DAP v2 Bulk interface，无法 claim".to_string());
+                    claim_error = Some("no CMSIS-DAP v2 bulk interface found, cannot claim".to_string());
                 }
             }
         }

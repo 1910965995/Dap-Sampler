@@ -2,28 +2,28 @@
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("USB 错误: {0}")]
+    #[error("USB error: {0}")]
     Usb(#[from] rusb::Error),
 
-    #[error("未找到 CMSIS-DAP v2 设备")]
+    #[error("no CMSIS-DAP v2 device found")]
     DeviceNotFound,
 
-    #[error("非预期的 DAP 响应: {0}")]
+    #[error("unexpected DAP response: {0}")]
     InvalidResponse(String),
 
-    #[error("DAP Transfer 失败: 状态={0}, 完成数={1}")]
+    #[error("DAP Transfer failed: status={0}, count={1}")]
     TransferFailed(u8, u8),
 
-    #[error("SWD 错误: {0}")]
+    #[error("SWD error: {0}")]
     Swd(String),
 
-    #[error("操作超时")]
+    #[error("operation timed out")]
     Timeout,
 
-    #[error("流水线线程启动失败: {0}")]
+    #[error("failed to start pipeline thread: {0}")]
     PipelineThread(String),
 
-    #[error("流水线已停止")]
+    #[error("pipeline stopped")]
     PipelineStopped,
 
     #[error("{0}")]

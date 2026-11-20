@@ -394,7 +394,7 @@ impl PipelineEngine {
                     let mut write_reqs = 0usize;
                     for &(var_idx, value) in &pending_writes {
                         let Some(acc) = accesses.get(var_idx) else {
-                            log::warn!("写入请求被跳过：变量索引 {} 无对齐访问信息", var_idx);
+                            log::warn!("write request skipped: variable index {} has no aligned-access info", var_idx);
                             continue;
                         };
 
@@ -405,7 +405,7 @@ impl PipelineEngine {
                             // 与相邻变量共享，需要跨字读-改-写，直接拒绝。
                             if acc.aligned_addr & 3 != 0 {
                                 log::warn!(
-                                    "写入请求被跳过：变量 {} 的 8 字节数据未 4 字节对齐 (0x{:08X})",
+                                    "write request skipped: 8-byte data of variable {} is not 4-byte aligned (0x{:08X})",
                                     var_idx, acc.aligned_addr
                                 );
                                 continue;
@@ -447,7 +447,7 @@ impl PipelineEngine {
                             .flatten();
                         let Some(old) = last else {
                             log::warn!(
-                                "写入请求被跳过：变量 {} 尚未采样到旧值，无法读-改-写",
+                                "write request skipped: variable {} has no sampled old value for read-modify-write",
                                 var_idx
                             );
                             continue;
@@ -474,7 +474,7 @@ impl PipelineEngine {
                     // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
                     if !pending_writes.is_empty() {
                         log::info!(
-                            "提交线程注入 {} 个写入请求 (seq={})",
+                            "submit thread injecting {} write requests (seq={})",
                             pending_writes.len(), seq
                         );
                     }
@@ -488,7 +488,7 @@ impl PipelineEngine {
                                 "USB short write: {}/{} bytes",
                                 n, cmd.len()
                             );
-                            log::error!("提交线程 {} (seq={})，退出", msg, seq);
+                            log::error!("submit thread {} (seq={}), exiting", msg, seq);
                             if running.load(Ordering::Relaxed) {
                                 if let Ok(mut slot) = thread_error.lock() {
                                     slot.get_or_insert(msg);
@@ -504,7 +504,7 @@ impl PipelineEngine {
                             if !running.load(Ordering::Relaxed) {
                                 break;
                             }
-                            log::warn!("提交线程写超时 (seq={})，跳过本周期", seq);
+                            log::warn!("submit thread write timeout (seq={}), skipping this cycle", seq);
                             if !pending_writes.is_empty() {
                                 if let Ok(mut wq) = write_queue.lock() {
                                     for (idx, v) in pending_writes.iter().rev() {
@@ -523,13 +523,13 @@ impl PipelineEngine {
                         Err(e) => {
                             if !running.load(Ordering::Relaxed) {
                                 // 停止中遇到的超时/错误，正常退出
-                                log::info!("提交线程收到停止信号，退出");
+                                log::info!("submit thread received stop signal, exiting");
                                 break;
                             }
                             // 致命错误（设备拔出、管道错误等）：上报 UI
                             // 后退出，不再无声死亡（原缺陷 ⑨）
                             let msg = format!("USB write failed: {}", e);
-                            log::error!("提交线程 USB 写失败 (seq={}): {}，退出", seq, e);
+                            log::error!("submit thread USB write failed (seq={}): {}, exiting", seq, e);
                             if let Ok(mut slot) = thread_error.lock() {
                                 slot.get_or_insert(msg);
                             }
@@ -558,7 +558,7 @@ impl PipelineEngine {
                     }
                 }
 
-                log::info!("提交线程退出，共提交 {} 个请求", seq);
+                log::info!("submit thread exited, {} requests submitted in total", seq);
             })
             .map_err(|e| Error::PipelineThread(e.to_string()))?;
 
@@ -617,7 +617,7 @@ impl PipelineEngine {
                                 if last_err_log
                                     .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
                                 {
-                                    log::warn!("接收线程 USB 读失败（采集将自动停止）: {}", e);
+                                    log::warn!("collect thread USB read failed (acquisition will stop): {}", e);
                                     last_err_log = Some(now);
                                 }
                                 thread::sleep(Duration::from_millis(50));
@@ -648,7 +648,7 @@ impl PipelineEngine {
                         // 并复位在途计数，等待重新对齐。
                         if data[offset] != DAP_TRANSFER {
                             log::error!(
-                                "接收线程协议失步：响应头 0x{:02X} 不是 DAP_Transfer，丢弃 {} 字节重新同步",
+                                "collect thread protocol desync: response header 0x{:02X} is not DAP_Transfer, dropping {} bytes to resync",
                                 data[offset], data.len() - offset
                             );
                             offset = data.len();
@@ -664,7 +664,7 @@ impl PipelineEngine {
                         // 只 peek——响应可能跨多次 USB 读，完整消费后才出队。
                         let write_reqs = write_counts_front(&writes_per_cmd);
                         let Some(write_reqs) = write_reqs else {
-                            log::error!("接收线程写入数队列为空，丢弃 {} 字节重新同步", data.len() - offset);
+                            log::error!("collect thread write-count queue empty, dropping {} bytes to resync", data.len() - offset);
                             offset = data.len();
                             if let Ok(mut q) = writes_per_cmd.lock() {
                                 q.clear();
@@ -676,7 +676,7 @@ impl PipelineEngine {
                         let total_requests = write_reqs + read_layout.len();
                         if count > total_requests {
                             log::error!(
-                                "接收线程协议失步：count={} 超过命令请求数 {}，丢弃 {} 字节重新同步",
+                                "collect thread protocol desync: count={} exceeds command request count {}, dropping {} bytes to resync",
                                 count, total_requests, data.len() - offset
                             );
                             offset = data.len();
@@ -704,7 +704,7 @@ impl PipelineEngine {
                         let resp = match DapProtocol::parse_transfer_response(chunk) {
                             Ok(r) => r,
                             Err(e) => {
-                                log::error!("接收线程解析失败 (seq={}): {}", seq, e);
+                                log::error!("collect thread parse failed (seq={}): {}", seq, e);
                                 seq += 1;
                                 continue;
                             }
@@ -712,7 +712,7 @@ impl PipelineEngine {
 
                         if resp.status != TRANSFER_OK {
                             log::warn!(
-                                "接收线程收到非 OK 状态 (seq={}): status={}, count={}",
+                                "collect thread got non-OK status (seq={}): status={}, count={}",
                                 seq, resp.status, resp.count
                             );
                             seq += 1;
@@ -772,13 +772,13 @@ impl PipelineEngine {
                     if offset < data.len() {
                         carry.extend_from_slice(&data[offset..]);
                         log::debug!(
-                            "接收线程保留 {} 字节不完整响应到下次解析",
+                            "collect thread kept {} bytes of incomplete response for next parse",
                             data.len() - offset
                         );
                     }
                 }
 
-                log::info!("接收线程退出，共接收 {} 个采样点", seq);
+                log::info!("collect thread exited, {} samples received in total", seq);
             })
             .map_err(|e| Error::PipelineThread(e.to_string()))?;
 
@@ -861,13 +861,13 @@ impl PipelineHandle {
     /// 设置停止标志，等待两个子线程退出。
     pub fn stop(self) {
         self.running.store(false, Ordering::SeqCst);
-        log::info!("等待提交线程退出...");
+        log::info!("waiting for submit thread to exit...");
         let _ = self.submit_handle.join();
-        log::info!("提交线程已退出");
-        log::info!("等待接收线程退出...");
+        log::info!("submit thread exited");
+        log::info!("waiting for collect thread to exit...");
         let _ = self.collect_handle.join();
-        log::info!("接收线程已退出");
-        log::info!("流水线已停止");
+        log::info!("collect thread exited");
+        log::info!("pipeline stopped");
     }
 }
 

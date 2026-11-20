@@ -87,7 +87,7 @@ pub fn parse_dwarf_sections<'a>(
             _ => Ok(EndianSlice::new(&[], le)),
         }
     })
-    .map_err(|e| format!("加载 DWARF sections 失败: {}", e))?;
+    .map_err(|e| format!("failed to load DWARF sections: {}", e))?;
 
     let mut result = DwarfResult {
         variables: Vec::new(),
@@ -96,8 +96,8 @@ pub fn parse_dwarf_sections<'a>(
     };
 
     let mut units = dwarf.units();
-    while let Some(header) = units.next().map_err(|e| format!("遍历 unit 失败: {}", e))? {
-        let unit = dwarf.unit(header).map_err(|e| format!("读取 unit 失败: {}", e))?;
+    while let Some(header) = units.next().map_err(|e| format!("failed to iterate units: {}", e))? {
+        let unit = dwarf.unit(header).map_err(|e| format!("failed to read unit: {}", e))?;
 
         // 提取源文件列表
         if let Some(ref program) = unit.line_program {
@@ -134,7 +134,7 @@ fn collect_flat_entries<'a>(
     };
 
     let mut entries = unit.entries();
-    while let Some((delta, entry)) = entries.next_dfs().map_err(|e| format!("遍历 DIE 失败: {}", e))? {
+    while let Some((delta, entry)) = entries.next_dfs().map_err(|e| format!("failed to iterate DIEs: {}", e))? {
         // 统一使用 .debug_info 全局 offset 作为 key，避免跨 unit 的 DebugInfoRef 无法匹配
         let offset = unit_base + entry.offset().0 as u64;
         let tag = entry.tag();
@@ -203,7 +203,7 @@ fn collect_flat_entries<'a>(
         .filter(|d| d.tag == DW_TAG_variable && d.address.is_some())
         .count();
     log::info!(
-        "DWARF DIE: DW_TAG_variable 共 {} 个, 有地址 {} 个, 无地址 {} 个",
+        "DWARF DIE: {} DW_TAG_variable entries, {} with address, {} without",
         var_total, var_with_addr, var_total - var_with_addr
     );
     process_raw_dies(&raw_dies, result);

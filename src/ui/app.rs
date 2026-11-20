@@ -19,6 +19,13 @@ use crate::project::{ProjectFile, ProjectVariable, PROJECT_VERSION};
 /// Idle 状态下 ELF 文件变化检测的轮询间隔
 const ELF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// 居中警告弹窗（标题 + 多行正文）
+#[derive(Debug, Clone)]
+struct WarningPopup {
+    title: &'static str,
+    message: String,
+}
+
 /// 示波器风格通道色板（v1.1.0 配色：红/绿/蓝/橙/品红/青/灰/粉）
 const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(255, 68, 68),   // 红
@@ -99,8 +106,11 @@ pub struct DapSamplerApp {
     elf_warning: Option<String>,
     /// 警告弹窗是否显示（右上角 X 关闭）
     show_elf_warning: bool,
-    /// 通道数上限弹窗内容（Some = 显示；勾选超过 8 个变量时弹出）
-    channel_limit_warning: Option<String>,
+    /// 居中警告弹窗内容（Some = 显示）
+    ///
+    /// 两处来源：通道数超限（Channel Limit）、运行/暂停中变更 Watch 变量
+    /// （Acquisition Running）。标题随来源不同，正文为多行红色文本。
+    warning_popup: Option<WarningPopup>,
     /// 打开工程时的 ELF 同步询问（Some = 弹窗挂起等待用户选择）
     elf_sync_prompt: Option<ElfSyncPrompt>,
     /// Idle 状态下检测 ELF 文件变化的弹窗（文件 mtime 变化）
@@ -325,7 +335,7 @@ impl DapSamplerApp {
             show_about: false,
             elf_warning: None,
             show_elf_warning: false,
-            channel_limit_warning: None,
+            warning_popup: None,
             elf_sync_prompt: None,
             elf_change_prompt: false,
             elf_mtime: initial_elf_mtime,
@@ -366,12 +376,12 @@ impl DapSamplerApp {
     ///
     /// 底部红字容易被忽略，用居中弹窗明确告知被拒绝的变量。
     /// 右上角 X 关闭；vscroll(false) 防止内容区撑高窗口。
-    fn show_channel_limit_popup(&mut self, ctx: &egui::Context) {
-        let Some(msg) = self.channel_limit_warning.clone() else {
+    fn show_warning_popup(&mut self, ctx: &egui::Context) {
+        let Some(popup) = self.warning_popup.clone() else {
             return;
         };
         let mut open = true;
-        egui::Window::new("Channel Limit")
+        egui::Window::new(popup.title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -380,12 +390,12 @@ impl DapSamplerApp {
             .show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.label(
-                    egui::RichText::new(msg)
+                    egui::RichText::new(popup.message)
                         .color(egui::Color32::from_rgb(0xd0, 0x50, 0x50)),
                 );
             });
         if !open {
-            self.channel_limit_warning = None;
+            self.warning_popup = None;
         }
     }
 
@@ -1136,6 +1146,43 @@ impl DapSamplerApp {
         }
     }
 
+    /// 运行/暂停中收到变量勾选变更：引擎快照固定，一律拒绝
+    ///
+    /// 复选框在渲染层点击时已先行翻转 `checked_paths`，若只报错不回滚，
+    /// 「勾上了但实际没采」的状态会永久脱节。这里把每条变更取反恢复，
+    /// 并用与通道超限一致的弹窗强度提醒（底部红字不够醒目）。
+    fn reject_variable_changes_while_running(&mut self, changes: &[(String, bool)]) {
+        for (path, is_checked) in changes {
+            // 变更记录的是点击后的新状态，回滚即取反
+            if *is_checked {
+                self.variable_browser.checked_paths.remove(path);
+            } else {
+                self.variable_browser.checked_paths.insert(path.clone());
+            }
+        }
+
+        let label = if changes.len() == 1 {
+            "Changed variable"
+        } else {
+            "Changed variables"
+        };
+        let names = changes
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // 弹窗：多行，信息完整
+        self.warning_popup = Some(WarningPopup {
+            title: "Acquisition Running",
+            message: format!(
+                "Stop acquisition before changing watched variables.\n{}: {}",
+                label, names
+            ),
+        });
+        // 状态栏：单行，超宽由 Label::truncate 显示省略号
+        self.set_error("Stop acquisition before changing watched variables");
+    }
+
     fn apply_variable_changes(&mut self, changes: Vec<(String, bool)>) {
         // 超限勾选必须回滚：复选框在渲染层已先行置位，若这里静默跳过，
         // 「勾上了但没有通道」的状态会永久脱节（用户以为在监视，实际没采）。
@@ -1174,10 +1221,13 @@ impl DapSamplerApp {
             };
             let names = rejected.join(", ");
             // 弹窗：多行，信息完整
-            self.channel_limit_warning = Some(format!(
-                "Only 8 channels can be watched at a time.\n{}: {}",
-                label, names
-            ));
+            self.warning_popup = Some(WarningPopup {
+                title: "Channel Limit",
+                message: format!(
+                    "Only 8 channels can be watched at a time.\n{}: {}",
+                    label, names
+                ),
+            });
             // 状态栏：单行，超宽由 Label::truncate 显示省略号
             self.set_error(format!(
                 "Only 8 channels can be watched at a time. {}: {}",
@@ -1560,9 +1610,7 @@ impl eframe::App for DapSamplerApp {
                                     // 采集中通道集合被引擎快照固定：增删会破坏
                                     // Watch 行与采样数据的对应关系，必须先停止
                                     if self.controls.state != AcquisitionState::Idle {
-                                        self.set_error(
-                                            "Stop acquisition before changing watched variables",
-                                        );
+                                        self.reject_variable_changes_while_running(&changes);
                                     } else {
                                         self.apply_variable_changes(changes);
                                     }
@@ -1909,7 +1957,7 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
-        self.show_channel_limit_popup(ctx);
+        self.show_warning_popup(ctx);
 
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
@@ -2150,21 +2198,21 @@ mod channel_limit_tests {
             app.status_text
         );
         // 弹窗多行，且列出被拒变量
-        let popup = app.channel_limit_warning.as_deref().unwrap_or("");
+        let popup = app.warning_popup.as_ref().map(|w| w.message.as_str()).unwrap_or("");
         assert!(
             popup.contains("Only 8 channels") && popup.contains("var8"),
             "弹窗应列出被拒绝的变量，实际 {:?}",
-            app.channel_limit_warning
+            app.warning_popup
         );
         assert!(
             popup.contains('\n'),
             "弹窗应保留多行排版，实际 {:?}",
-            app.channel_limit_warning
+            app.warning_popup
         );
         assert!(
             popup.contains("Unselected channel variable"),
             "弹窗应使用 Unselected channel variable 措辞，实际 {:?}",
-            app.channel_limit_warning
+            app.warning_popup
         );
         // "(not added)" 措辞已移除
         assert!(
@@ -2187,7 +2235,7 @@ mod channel_limit_tests {
 
         // 数据层：状态栏单行、弹窗多行
         let status = app.status_text.as_deref().unwrap_or("");
-        let popup = app.channel_limit_warning.as_deref().unwrap_or("");
+        let popup = app.warning_popup.as_ref().map(|w| w.message.as_str()).unwrap_or("");
         assert!(!status.contains('\n'), "状态栏必须是单行: {status:?}");
         assert!(popup.contains('\n'), "弹窗应是多行: {popup:?}");
 
@@ -2248,11 +2296,11 @@ mod channel_limit_tests {
             .collect();
         app.apply_variable_changes(extra);
 
-        let popup = app.channel_limit_warning.as_deref().unwrap_or("");
+        let popup = app.warning_popup.as_ref().map(|w| w.message.as_str()).unwrap_or("");
         assert!(
             popup.contains("Unselected channel variables:"),
             "多个变量应用复数措辞，实际 {:?}",
-            app.channel_limit_warning
+            app.warning_popup
         );
         assert!(popup.contains("extra0") && popup.contains("extra1"));
     }
@@ -2275,7 +2323,7 @@ mod channel_limit_tests {
         assert!(app.variable_browser.checked_paths.contains("var8"));
         assert!(!app.status_is_error, "腾出位置后不应报错");
         assert!(
-            app.channel_limit_warning.is_none(),
+            app.warning_popup.is_none(),
             "成功加入时不应弹窗"
         );
     }
@@ -2289,11 +2337,77 @@ mod channel_limit_tests {
             .collect();
         app.apply_variable_changes(first8);
         app.apply_variable_changes(vec![("var9".to_string(), true)]);
-        assert!(app.channel_limit_warning.is_some());
+        assert!(app.warning_popup.is_some());
 
         // 模拟关闭
-        app.channel_limit_warning = None;
-        assert!(app.channel_limit_warning.is_none());
+        app.warning_popup = None;
+        assert!(app.warning_popup.is_none());
+    }
+
+    #[test]
+    fn running_check_is_rejected_rolled_back_and_popup_shown() {
+        // 回归：运行态勾选变更只发底部红字——复选框不回滚（勾上了但实际
+        // 没采）、也没有弹窗提醒，与通道超限的提醒强度不一致
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        assert_eq!(app.channel_panel.channel_count(), 8);
+
+        // 模拟运行态：渲染层点击已先行翻转 checked_paths，随后上报变更
+        app.controls.state = AcquisitionState::Running;
+        app.variable_browser.checked_paths.insert("var8".to_string());
+        app.reject_variable_changes_while_running(&[("var8".to_string(), true)]);
+
+        // 勾选状态必须回滚
+        assert!(
+            !app.variable_browser.checked_paths.contains("var8"),
+            "运行态勾选必须回滚复选框状态"
+        );
+        // 通道集合不变
+        assert_eq!(app.channel_panel.channel_count(), 8);
+        // 状态栏：单行错误提示
+        assert!(app.status_is_error, "运行态变更必须给出错误提示");
+        let status = app.status_text.as_deref().unwrap_or("");
+        assert!(
+            status.contains("Stop acquisition before changing watched variables"),
+            "状态栏应说明需先停止采集，实际 {:?}",
+            app.status_text
+        );
+        assert!(!status.contains('\n'), "状态栏必须单行，实际 {:?}", status);
+        // 弹窗：标题 + 多行正文，列出被拒绝的变量
+        let popup = app.warning_popup.as_ref().expect("运行态拒绝必须弹窗");
+        assert_eq!(popup.title, "Acquisition Running");
+        assert!(
+            popup.message.contains("Stop acquisition") && popup.message.contains("var8"),
+            "弹窗应说明原因并列出变量，实际 {:?}",
+            popup.message
+        );
+        assert!(popup.message.contains('\n'), "弹窗应保留多行排版");
+    }
+
+    #[test]
+    fn running_uncheck_is_rolled_back_too() {
+        // 运行态取消勾选同样是结构性变更：通道保留，复选框恢复勾选
+        let mut app = make_app();
+        let first8: Vec<(String, bool)> = (0..8)
+            .map(|i| (format!("var{i}"), true))
+            .collect();
+        app.apply_variable_changes(first8);
+        assert!(app.variable_browser.checked_paths.contains("var0"));
+
+        app.controls.state = AcquisitionState::Running;
+        // 渲染层点击已把 var0 从勾选集中移除，随后上报变更
+        app.variable_browser.checked_paths.remove("var0");
+        app.reject_variable_changes_while_running(&[("var0".to_string(), false)]);
+
+        assert!(
+            app.variable_browser.checked_paths.contains("var0"),
+            "运行态取消勾选必须回滚复选框状态"
+        );
+        assert_eq!(app.channel_panel.channel_count(), 8, "通道不得被移除");
+        assert!(app.warning_popup.is_some(), "运行态拒绝必须弹窗");
     }
 }
 

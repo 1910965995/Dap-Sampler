@@ -38,6 +38,43 @@ const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(255, 150, 150), // 粉
 ];
 
+/// 连接类故障的排障建议（仅随 USB/SWD 连接失败类错误显示）
+const CONNECTION_HINT: &str = "请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。";
+
+/// 统一浅色主题与滚动条风格（每帧应用，覆盖 egui 默认值）
+///
+/// 滚动条：egui 默认悬停/拖动手柄取 widgets.fg_stroke（浅色主题下是
+/// 纯黑），10px 粗黑条与浅色主题不搭。改用浮动条 + 不透明度调灰——
+/// 手柄颜色仍是主题的 fg_stroke，半透明叠在白底上呈现为灰阶；闲置
+/// 时是常显的细灰线，悬停展开、拖动半透明中灰。不透明度字段只作用于
+/// 滚动条，不会牵动按钮/文字等其它控件配色（fg_stroke 本身未改）。
+fn apply_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = egui::Color32::WHITE;
+    visuals.window_fill = egui::Color32::WHITE;
+    // 整体背景变白后，按钮/输入框默认底色（230 灰）显得突兀，调浅至接近白
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(246);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(246);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(236);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(236);
+    ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.spacing.scroll = egui::style::ScrollStyle {
+            // 闲置 3px 细灰线（25%→45% 不透明度，靠近滚动区时加深），
+            // 悬停展开到 8px，拖动 55% 中灰
+            bar_width: 8.0,
+            floating_width: 3.0,
+            dormant_handle_opacity: 0.25,
+            active_handle_opacity: 0.45,
+            interact_handle_opacity: 0.55,
+            dormant_background_opacity: 0.0,
+            active_background_opacity: 0.2,
+            interact_background_opacity: 0.3,
+            ..egui::style::ScrollStyle::floating()
+        };
+    });
+}
+
 /// DAP Sampler 主应用
 pub struct DapSamplerApp {
     pipeline: Option<PipelineHandle>,
@@ -90,6 +127,13 @@ pub struct DapSamplerApp {
     status_text: Option<String>,
     /// 状态消息是否为错误（错误显示红色）
     status_is_error: bool,
+    /// 状态栏错误附带的排障建议（悬停时显示）
+    ///
+    /// 仅连接类错误（USB 打开失败、SWD 初始化失败、采集异常中止）设置，
+    /// 其余错误不带——「检查 DAP-Link 连接」对通道超限这类 UI 错误毫无
+    /// 意义，无差别拼接会误导排查方向。每条新消息（set_error/set_status/
+    /// 直接清空）都会清掉上一条的附带建议。
+    status_hint: Option<String>,
     /// 侧栏选中的通道（波形加粗高亮；再次点击取消）
     selected_channel: Option<usize>,
     /// 当前工程文件路径（None = 未保存过；保存时已有路径则直接覆盖）
@@ -332,6 +376,7 @@ impl DapSamplerApp {
             // 启动时状态栏默认显示 Ready
             status_text: Some("Ready".to_string()),
             status_is_error: false,
+            status_hint: None,
             selected_channel: None,
             project_path: None,
             hover_menu: None,
@@ -365,16 +410,22 @@ impl DapSamplerApp {
         };
         let label =
             ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).truncate());
-        // 被截断时悬停显示完整消息；错误消息再附排障建议
-        let tip = if self.status_is_error {
-            format!(
-                "{}\n\n请检查：DAP-Link 是否连接、是否安装 WinUSB 驱动、是否被 Keil/OpenOCD/pyOCD/其他程序占用、目标板是否供电、SWD 接线是否正确，或尝试降低 SWD Clock。",
-                msg
-            )
-        } else {
-            msg.clone()
-        };
+        // 被截断时悬停显示完整消息；仅连接类错误附带排障建议
+        // （按错误类型，不再无差别拼接——通道超限等 UI 错误与连接无关）
+        let tip = self.status_tooltip(msg);
         label.on_hover_text(tip);
+    }
+
+    /// 状态栏悬停提示：仅连接类错误（status_hint 已设置）附带排障建议
+    fn status_tooltip(&self, msg: &str) -> String {
+        if self.status_is_error {
+            match &self.status_hint {
+                Some(hint) => format!("{}\n\n{}", msg, hint),
+                None => msg.to_string(),
+            }
+        } else {
+            msg.to_string()
+        }
     }
 
     /// 通道数上限弹窗（勾选超过 8 个变量时）
@@ -409,6 +460,17 @@ impl DapSamplerApp {
         log::error!("{}", message);
         self.status_text = Some(message);
         self.status_is_error = true;
+        // 每条新消息都不继承上一条的排障建议
+        self.status_hint = None;
+    }
+
+    /// 记录连接类错误：悬停状态栏时附带排障建议
+    ///
+    /// 仅 USB/SWD 连接失败、采集异常中止这类硬件相关错误使用；
+    /// 排障建议全部围绕 DAP-Link 连接，拼到无关错误上会误导排查方向。
+    fn set_error_with_hint(&mut self, message: impl Into<String>, hint: impl Into<String>) {
+        self.set_error(message);
+        self.status_hint = Some(hint.into());
     }
 
     /// 记录一条普通状态消息（显示在底部状态栏，默认文字色）
@@ -417,12 +479,14 @@ impl DapSamplerApp {
         log::info!("{}", message);
         self.status_text = Some(message);
         self.status_is_error = false;
+        self.status_hint = None;
     }
 
     /// 新建工程：清空当前全部配置，参数回默认值
     fn new_project(&mut self) {
         self.status_text = None;
         self.status_is_error = false;
+        self.status_hint = None;
         self.elf_warning = None;
         self.show_elf_warning = false;
         self.elf_sync_prompt = None;
@@ -584,6 +648,7 @@ impl DapSamplerApp {
     fn open_project(&mut self, path: &std::path::Path) {
         self.status_text = None;
         self.status_is_error = false;
+        self.status_hint = None;
         self.elf_warning = None;
         self.show_elf_warning = false;
         self.elf_sync_prompt = None;
@@ -909,6 +974,7 @@ impl DapSamplerApp {
     fn start_acquisition(&mut self) {
         self.status_text = None;
         self.status_is_error = false;
+        self.status_hint = None;
         // 1. 确定要采集的地址和通道信息
         let (addresses, channel_names, channel_colors, types) =
             if !self.manual_addresses.is_empty() {
@@ -967,13 +1033,19 @@ impl DapSamplerApp {
             let mut swd = match SwdLink::new() {
                 Ok(s) => s,
                 Err(e) => {
-                    self.set_error(format!("Failed to connect to DAP-Link: {}", e));
+                    self.set_error_with_hint(
+                        format!("Failed to connect to DAP-Link: {}", e),
+                        CONNECTION_HINT,
+                    );
                     return;
                 }
             };
             let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
             if let Err(e) = swd.init_with_clock(clock_hz) {
-                self.set_error(format!("SWD initialization failed: {}", e));
+                self.set_error_with_hint(
+                    format!("SWD initialization failed: {}", e),
+                    CONNECTION_HINT,
+                );
                 return;
             }
             let (usb, _) = swd.into_parts();
@@ -1521,16 +1593,8 @@ impl DapSamplerApp {
 
 impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 统一浅色主题（与 Watch/通道面板的浅色风格一致）；面板/窗口底色改为纯白
-        let mut visuals = egui::Visuals::light();
-        visuals.panel_fill = egui::Color32::WHITE;
-        visuals.window_fill = egui::Color32::WHITE;
-        // 整体背景变白后，按钮/输入框默认底色（230 灰）显得突兀，调浅至接近白
-        visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(246);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(246);
-        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(236);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(236);
-        ctx.set_visuals(visuals);
+        // 统一浅色主题 + 滚动条灰色风格（见 apply_theme 注释）
+        apply_theme(ctx);
         // Idle 状态检测 ELF 文件变化（无其他弹窗占用时）
         if self.controls.state == AcquisitionState::Idle
             && self.elf_ctx.is_some()
@@ -1557,7 +1621,8 @@ impl eframe::App for DapSamplerApp {
             };
             if let Some(msg) = fatal {
                 self.stop_acquisition();
-                self.set_error(format!("Acquisition aborted: {}", msg));
+                // 中止原因基本是 USB 读/写失败（设备拔出等），附带连接排障建议
+                self.set_error_with_hint(format!("Acquisition aborted: {}", msg), CONNECTION_HINT);
             }
         }
         self.drain_pipeline();
@@ -2890,5 +2955,74 @@ mod elf_sync_tests {
         let x = app.watch_panel.entries.iter().find(|e| e.name == "X").unwrap();
         assert_eq!(x.address, 0x42, "找不到对应工程变量的行应保留当前配置");
         assert_eq!(x.value_type, ValueType::Float);
+    }
+}
+
+#[cfg(test)]
+mod status_theme_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn status_tooltip_appends_hint_only_when_set() {
+        // 通道超限这类 UI 错误不带连接排障建议——「检查 DAP-Link 连接」
+        // 对它们毫无意义，无差别拼接会误导排查方向（用户报告）
+        let mut app = make_app();
+        app.set_error("Only 8 channels can be watched at a time. Unselected channel variable: s_uartIrqId[1]");
+        let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
+        assert!(
+            !tip.contains("请检查") && !tip.contains("DAP-Link"),
+            "UI 类错误不得附带连接排障建议，实际 {tip:?}"
+        );
+        assert!(!tip.contains('\n'), "无建议时悬停提示就是消息本身: {tip:?}");
+
+        // 连接类错误附带排障建议
+        app.set_error_with_hint("SWD initialization failed: timeout", CONNECTION_HINT);
+        let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
+        assert!(tip.starts_with("SWD initialization failed: timeout"));
+        assert!(tip.contains("\n\n请检查：DAP-Link"), "连接类错误应附带排障建议: {tip:?}");
+    }
+
+    #[test]
+    fn new_message_clears_previous_hint() {
+        let mut app = make_app();
+        app.set_error_with_hint("Failed to connect to DAP-Link: no device", CONNECTION_HINT);
+        assert!(app.status_hint.is_some());
+
+        // 换成普通状态/普通错误后，旧建议不得残留
+        app.set_status("Acquisition stopped");
+        assert!(app.status_hint.is_none(), "set_status 应清掉旧建议");
+        let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
+        assert!(!tip.contains("请检查"));
+
+        app.set_error("Only 8 channels can be watched at a time");
+        assert!(app.status_hint.is_none(), "set_error 应清掉旧建议");
+    }
+
+    #[test]
+    fn apply_theme_configures_gray_scrollbars() {
+        // 滚动条悬停/拖动手柄默认取 widgets.fg_stroke（浅色主题纯黑），
+        // 主题改为浮动条 + 半透明灰阶
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let style = ctx.style();
+        let scroll = &style.spacing.scroll;
+        assert!(scroll.floating, "应启用浮动滚动条");
+        assert_eq!(scroll.bar_width, 8.0, "悬停展开宽度");
+        assert_eq!(scroll.floating_width, 3.0, "闲置细条宽度");
+        assert!(
+            scroll.dormant_handle_opacity > 0.0,
+            "闲置时应显示细灰线而不是完全隐藏"
+        );
+        assert!(
+            scroll.interact_handle_opacity < 1.0,
+            "悬停/拖动手柄应为半透明灰而非纯黑实心"
+        );
+        // 浅色主题基础仍然生效
+        assert!(!style.visuals.dark_mode);
+        assert_eq!(style.visuals.panel_fill, egui::Color32::WHITE);
     }
 }

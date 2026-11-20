@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use crate::pipeline::sample::Sample;
 use crate::pipeline::sample::ValueType;
-use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
+use crate::pipeline::engine::{PipelineEngine, PipelineHandle, PipelineNotice};
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::swd::SwdLink;
@@ -456,12 +456,7 @@ impl DapSamplerApp {
     }
 
     fn set_error(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        log::error!("{}", message);
-        self.status_text = Some(message);
-        self.status_is_error = true;
-        // 每条新消息都不继承上一条的排障建议
-        self.status_hint = None;
+        self.set_error_fields(message.into(), None);
     }
 
     /// 记录连接类错误：悬停状态栏时附带排障建议
@@ -469,8 +464,29 @@ impl DapSamplerApp {
     /// 仅 USB/SWD 连接失败、采集异常中止这类硬件相关错误使用；
     /// 排障建议全部围绕 DAP-Link 连接，拼到无关错误上会误导排查方向。
     fn set_error_with_hint(&mut self, message: impl Into<String>, hint: impl Into<String>) {
-        self.set_error(message);
-        self.status_hint = Some(hint.into());
+        self.set_error_fields(message.into(), Some(hint.into()));
+    }
+
+    /// 写入错误状态，并弹出通用错误弹窗
+    ///
+    /// 只看底部提示很容易漏掉故障（尤其采集中视线在波形上），所以每条
+    /// 错误都弹窗提醒。覆盖语义：后发生的错误替换弹窗内容，保证最新
+    /// 故障可见；需要专属标题/文案的调用方（通道超限、运行态拒绝）在
+    /// set_error 之后自行覆盖 warning_popup。
+    fn set_error_fields(&mut self, message: String, hint: Option<String>) {
+        log::error!("{}", message);
+        self.status_text = Some(message.clone());
+        self.status_is_error = true;
+        // 每条新消息都不继承上一条的排障建议
+        self.status_hint = hint.clone();
+        let message = match hint {
+            Some(h) => format!("{}\n\n{}", message, h),
+            None => message,
+        };
+        self.warning_popup = Some(WarningPopup {
+            title: "Error",
+            message,
+        });
     }
 
     /// 记录一条普通状态消息（显示在底部状态栏，默认文字色）
@@ -692,7 +708,12 @@ impl DapSamplerApp {
                 }
                 Err(e) => {
                     self.elf_ctx = None;
-                    self.set_error(format!("ELF load failed, continuing with saved variable addresses: {}", e));
+                    // 只写状态栏不弹通用错误弹窗：下方 elf_warning 已是
+                    // 专属弹窗，两个弹窗叠加反而干扰
+                    log::error!("ELF load failed, continuing with saved variable addresses: {}", e);
+                    self.status_text = Some(format!("ELF load failed, continuing with saved variable addresses: {}", e));
+                    self.status_is_error = true;
+                    self.status_hint = None;
                     // 弹窗警告：状态栏红字容易被忽略，ELF 缺失是打开工程的关键异常
                     self.elf_warning = Some(format!(
                         "ELF file not found or failed to load:\n{}\n\nThe project will continue with saved variable addresses.",
@@ -1162,6 +1183,16 @@ impl DapSamplerApp {
         self.process_pending_writes();
     }
 
+    /// 生成「写入被跳过」的用户提示（引擎只报变量索引，这里映射为通道名）
+    fn write_skip_message(&self, var_idx: usize, reason: &str) -> String {
+        let name = self
+            .current_names
+            .get(var_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("channel #{}", var_idx));
+        format!("Write to '{}' was skipped: {}", name, reason)
+    }
+
     /// 处理 Watch 表格中的值写入请求
     ///
     /// 通过 pipeline 的写入队列注入，不停止采集。
@@ -1174,29 +1205,40 @@ impl DapSamplerApp {
 
         if self.current_names.is_empty() {
             log::warn!("write request ignored: no sampling channels");
+            self.set_error("Write failed: no sampling channels");
             return;
         }
 
-        if let Some(ref handle) = self.pipeline {
+        if self.pipeline.is_some() {
             // 采集中：按通道名解析为引擎快照中的变量索引。
             // 名字是稳定标识——通道增删后行号会整体移位，按行号写入会命中
             // 错误的地址；名字解析失败说明该通道不在本次采集集合中，丢弃。
+            // 先解析并报错（set_error 需要可变借用 self），最后再取
+            // handle 入队（handle 借用 self.pipeline，两者不能交叉）
+            let mut resolved = Vec::with_capacity(writes.len());
             for w in &writes {
                 match resolve_channel_index(&self.current_names, &w.channel_name) {
-                    Some(idx) => {
-                        let addr = self.current_addresses[idx];
-                        handle.queue_write(idx, w.raw_value);
-                        log::info!(
-                            "queued write for channel {} ({}): 0x{:08X} → 0x{:08X}",
-                            idx, w.channel_name, w.raw_value, addr
-                        );
-                    }
+                    Some(idx) => resolved.push((idx, w)),
                     None => {
                         log::warn!(
                             "write request dropped: channel '{}' not in the current sampling set",
                             w.channel_name
                         );
+                        self.set_error(format!(
+                            "Write failed: channel '{}' is not in the current sampling set",
+                            w.channel_name
+                        ));
                     }
+                }
+            }
+            if let Some(ref handle) = self.pipeline {
+                for (idx, w) in resolved {
+                    let addr = self.current_addresses[idx];
+                    handle.queue_write(idx, w.raw_value);
+                    log::info!(
+                        "queued write for channel {} ({}): 0x{:08X} → 0x{:08X}",
+                        idx, w.channel_name, w.raw_value, addr
+                    );
                 }
             }
         } else {
@@ -1207,6 +1249,10 @@ impl DapSamplerApp {
                     let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
                     if let Err(e) = swd.init_with_clock(clock_hz) {
                         log::error!("SWD initialization failed before write: {}", e);
+                        self.set_error_with_hint(
+                            format!("Write failed: SWD initialization failed: {}", e),
+                            CONNECTION_HINT,
+                        );
                         return;
                     }
                     for w in &writes {
@@ -1220,6 +1266,10 @@ impl DapSamplerApp {
                                 "write request dropped: channel '{}' not in the Watch list",
                                 w.channel_name
                             );
+                            self.set_error(format!(
+                                "Write failed: channel '{}' is not in the Watch list",
+                                w.channel_name
+                            ));
                             continue;
                         };
                         match swd.write_variable(entry.address, entry.value_type.byte_size(), w.raw_value) {
@@ -1227,13 +1277,25 @@ impl DapSamplerApp {
                                 "wrote channel '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
                                 w.channel_name, w.raw_value, entry.address, entry.value_type.byte_size()
                             ),
-                            Err(e) => log::error!(
-                                "failed to write channel '{}': {}", w.channel_name, e
-                            ),
+                            Err(e) => {
+                                log::error!(
+                                    "failed to write channel '{}': {}", w.channel_name, e
+                                );
+                                self.set_error(format!(
+                                    "Write failed for channel '{}': {}",
+                                    w.channel_name, e
+                                ));
+                            }
                         }
                     }
                 }
-                Err(e) => log::error!("failed to connect to DAP-Link for write: {}", e),
+                Err(e) => {
+                    log::error!("failed to connect to DAP-Link for write: {}", e);
+                    self.set_error_with_hint(
+                        format!("Write failed: cannot connect to DAP-Link: {}", e),
+                        CONNECTION_HINT,
+                    );
+                }
             }
         }
     }
@@ -1263,7 +1325,9 @@ impl DapSamplerApp {
             .map(|(p, _)| p.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        // 弹窗：多行，信息完整
+        // 状态栏：单行，超宽由 Label::truncate 显示省略号。
+        // set_error 会先弹通用错误弹窗，下面再用专属弹窗覆盖
+        self.set_error("Stop acquisition before changing watched variables");
         self.warning_popup = Some(WarningPopup {
             title: "Acquisition Running",
             message: format!(
@@ -1271,8 +1335,6 @@ impl DapSamplerApp {
                 label, names
             ),
         });
-        // 状态栏：单行，超宽由 Label::truncate 显示省略号
-        self.set_error("Stop acquisition before changing watched variables");
     }
 
     /// 为新通道选色：取调色板中最靠前的、当前未被任何通道占用的颜色
@@ -1334,7 +1396,13 @@ impl DapSamplerApp {
                 "Unselected channel variables"
             };
             let names = rejected.join(", ");
-            // 弹窗：多行，信息完整
+            // 状态栏：单行，超宽由 Label::truncate 显示省略号。
+            // set_error 会先弹通用错误弹窗，下面再用专属弹窗覆盖
+            self.set_error(format!(
+                "Only 8 channels can be watched at a time. {}: {}",
+                label, names
+            ));
+            // 专属弹窗：多行，信息完整
             self.warning_popup = Some(WarningPopup {
                 title: "Channel Limit",
                 message: format!(
@@ -1342,11 +1410,6 @@ impl DapSamplerApp {
                     label, names
                 ),
             });
-            // 状态栏：单行，超宽由 Label::truncate 显示省略号
-            self.set_error(format!(
-                "Only 8 channels can be watched at a time. {}: {}",
-                label, names
-            ));
         }
 
         // 同步 Watch 面板
@@ -1623,6 +1686,20 @@ impl eframe::App for DapSamplerApp {
                 self.stop_acquisition();
                 // 中止原因基本是 USB 读/写失败（设备拔出等），附带连接排障建议
                 self.set_error_with_hint(format!("Acquisition aborted: {}", msg), CONNECTION_HINT);
+            }
+        }
+        // 引擎非致命故障通知（写入被跳过、协议失步丢数据）：只写日志用户
+        // 无感知，转为错误弹窗提示（set_error 弹通用 Error 弹窗）
+        if let Some(ref handle) = self.pipeline {
+            for notice in handle.drain_notices() {
+                match notice {
+                    PipelineNotice::WriteSkipped { var_idx, reason } => {
+                        self.set_error(self.write_skip_message(var_idx, &reason));
+                    }
+                    PipelineNotice::DataDropped { message } => {
+                        self.set_error(message);
+                    }
+                }
             }
         }
         self.drain_pipeline();
@@ -3024,5 +3101,56 @@ mod status_theme_tests {
         // 浅色主题基础仍然生效
         assert!(!style.visuals.dark_mode);
         assert_eq!(style.visuals.panel_fill, egui::Color32::WHITE);
+    }
+}
+
+#[cfg(test)]
+mod fault_popup_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn every_error_shows_a_popup() {
+        // 故障必须可感知：所有 set_error 都弹通用错误弹窗，不能只有底部
+        // 一行提示（用户报告：发生故障时视线在波形上根本注意不到）
+        let mut app = make_app();
+        app.set_error_with_hint("SWD initialization failed: timeout", CONNECTION_HINT);
+        let popup = app.warning_popup.as_ref().expect("错误必须弹窗");
+        assert_eq!(popup.title, "Error");
+        assert!(popup.message.starts_with("SWD initialization failed: timeout"));
+        assert!(
+            popup.message.contains("Note: Check that the DAP-Link"),
+            "连接类错误弹窗应附带排障建议，实际 {:?}",
+            popup.message
+        );
+
+        // 非连接类错误也弹窗，但不带排障建议
+        app.warning_popup = None;
+        app.set_error("Failed to export data: io error");
+        let popup = app.warning_popup.as_ref().expect("错误必须弹窗");
+        assert_eq!(popup.title, "Error");
+        assert!(
+            !popup.message.contains("Note:"),
+            "UI 类错误不得附带连接排障建议，实际 {:?}",
+            popup.message
+        );
+    }
+
+    #[test]
+    fn write_skip_message_maps_index_to_channel_name() {
+        // 引擎通知只带变量索引；UI 映射为通道名，索引越界时兜底不 panic
+        let mut app = make_app();
+        app.current_names = vec!["pid.kp".to_string(), "speed".to_string()];
+        assert_eq!(
+            app.write_skip_message(1, "no sampled old value yet"),
+            "Write to 'speed' was skipped: no sampled old value yet"
+        );
+        assert_eq!(
+            app.write_skip_message(7, "8-byte data is not 4-byte aligned (0x20000002)"),
+            "Write to 'channel #7' was skipped: 8-byte data is not 4-byte aligned (0x20000002)"
+        );
     }
 }

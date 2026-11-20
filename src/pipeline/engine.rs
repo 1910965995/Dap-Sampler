@@ -128,6 +128,29 @@ fn in_flight_dec(counter: &AtomicUsize) {
     }
 }
 
+/// 流水线发给 UI 的非致命故障通知
+///
+/// `thread_error` 用于致命错误（自动停止采集）；`PipelineNotice` 用于
+/// 「采集继续，但本次操作/数据受影响」的故障——提交线程跳过写入请求、
+/// 接收线程协议失步丢弃数据等。这些故障此前只写日志，用户视线在波形
+/// 上时完全无感知。
+#[derive(Debug, Clone)]
+pub enum PipelineNotice {
+    /// 提交线程跳过一个写入请求（变量索引 + 原因）
+    WriteSkipped { var_idx: usize, reason: String },
+    /// 接收线程丢弃了数据（协议失步/解析失败，已自动恢复同步）
+    DataDropped { message: String },
+}
+
+/// 追加一条通知（上限 16 条：防止故障风暴刷爆 UI 弹窗）
+fn push_notice(notices: &Mutex<Vec<PipelineNotice>>, notice: PipelineNotice) {
+    if let Ok(mut q) = notices.lock() {
+        if q.len() < 16 {
+            q.push(notice);
+        }
+    }
+}
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -257,14 +280,25 @@ impl PipelineEngine {
         // break 退出且无任何上报通道，UI 会永远显示 Running（原缺陷 ⑨）。
         // UI 每帧轮询 thread_error() / threads_alive() 触发自动停止。
         let thread_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // 非致命故障通知（写入被跳过、协议失步丢数据等）：只写日志用户
+        // 无感知，UI 每帧 drain 后转为错误弹窗
+        let notices: Arc<Mutex<Vec<PipelineNotice>>> = Arc::new(Mutex::new(Vec::new()));
 
         // 时间戳完全由接收线程的 seq 计算：
         //   timestamp = seq * interval_us / 1_000_000
         // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
         // 保证显示的采样间隔严格一致。无需跨线程队列传递。
 
-        let submit = self.spawn_submit_thread(start_time, Arc::clone(&thread_error))?;
-        let collect = self.spawn_collect_thread(Arc::clone(&ring), Arc::clone(&thread_error))?;
+        let submit = self.spawn_submit_thread(
+            start_time,
+            Arc::clone(&thread_error),
+            Arc::clone(&notices),
+        )?;
+        let collect = self.spawn_collect_thread(
+            Arc::clone(&ring),
+            Arc::clone(&thread_error),
+            Arc::clone(&notices),
+        )?;
 
         Ok(PipelineHandle {
             submit_handle: submit,
@@ -273,6 +307,7 @@ impl PipelineEngine {
             running: Arc::clone(&self.running),
             write_queue: Arc::clone(&self.write_queue),
             thread_error,
+            notices,
         })
     }
 
@@ -281,6 +316,7 @@ impl PipelineEngine {
         &self,
         start_time: Instant,
         thread_error: Arc<Mutex<Option<String>>>,
+        notices: Arc<Mutex<Vec<PipelineNotice>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
@@ -395,6 +431,13 @@ impl PipelineEngine {
                     for &(var_idx, value) in &pending_writes {
                         let Some(acc) = accesses.get(var_idx) else {
                             log::warn!("write request skipped: variable index {} has no aligned-access info", var_idx);
+                            push_notice(
+                                &notices,
+                                PipelineNotice::WriteSkipped {
+                                    var_idx,
+                                    reason: "no aligned-access info".to_string(),
+                                },
+                            );
                             continue;
                         };
 
@@ -407,6 +450,16 @@ impl PipelineEngine {
                                 log::warn!(
                                     "write request skipped: 8-byte data of variable {} is not 4-byte aligned (0x{:08X})",
                                     var_idx, acc.aligned_addr
+                                );
+                                push_notice(
+                                    &notices,
+                                    PipelineNotice::WriteSkipped {
+                                        var_idx,
+                                        reason: format!(
+                                            "8-byte data is not 4-byte aligned (0x{:08X})",
+                                            acc.aligned_addr
+                                        ),
+                                    },
                                 );
                                 continue;
                             }
@@ -449,6 +502,13 @@ impl PipelineEngine {
                             log::warn!(
                                 "write request skipped: variable {} has no sampled old value for read-modify-write",
                                 var_idx
+                            );
+                            push_notice(
+                                &notices,
+                                PipelineNotice::WriteSkipped {
+                                    var_idx,
+                                    reason: "no sampled old value yet (write again after the first sample arrives)".to_string(),
+                                },
                             );
                             continue;
                         };
@@ -570,6 +630,7 @@ impl PipelineEngine {
         &self,
         ring: Arc<RingBuffer>,
         thread_error: Arc<Mutex<Option<String>>>,
+        notices: Arc<Mutex<Vec<PipelineNotice>>>,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
@@ -651,6 +712,15 @@ impl PipelineEngine {
                                 "collect thread protocol desync: response header 0x{:02X} is not DAP_Transfer, dropping {} bytes to resync",
                                 data[offset], data.len() - offset
                             );
+                            push_notice(
+                                &notices,
+                                PipelineNotice::DataDropped {
+                                    message: format!(
+                                        "Protocol desync: dropped {} bytes of responses and resynchronized",
+                                        data.len() - offset
+                                    ),
+                                },
+                            );
                             offset = data.len();
                             if let Ok(mut q) = writes_per_cmd.lock() {
                                 q.clear();
@@ -665,6 +735,15 @@ impl PipelineEngine {
                         let write_reqs = write_counts_front(&writes_per_cmd);
                         let Some(write_reqs) = write_reqs else {
                             log::error!("collect thread write-count queue empty, dropping {} bytes to resync", data.len() - offset);
+                            push_notice(
+                                &notices,
+                                PipelineNotice::DataDropped {
+                                    message: format!(
+                                        "Protocol desync: dropped {} bytes of responses and resynchronized",
+                                        data.len() - offset
+                                    ),
+                                },
+                            );
                             offset = data.len();
                             if let Ok(mut q) = writes_per_cmd.lock() {
                                 q.clear();
@@ -678,6 +757,15 @@ impl PipelineEngine {
                             log::error!(
                                 "collect thread protocol desync: count={} exceeds command request count {}, dropping {} bytes to resync",
                                 count, total_requests, data.len() - offset
+                            );
+                            push_notice(
+                                &notices,
+                                PipelineNotice::DataDropped {
+                                    message: format!(
+                                        "Protocol desync: dropped {} bytes of responses and resynchronized",
+                                        data.len() - offset
+                                    ),
+                                },
                             );
                             offset = data.len();
                             if let Ok(mut q) = writes_per_cmd.lock() {
@@ -705,6 +793,15 @@ impl PipelineEngine {
                             Ok(r) => r,
                             Err(e) => {
                                 log::error!("collect thread parse failed (seq={}): {}", seq, e);
+                                push_notice(
+                                    &notices,
+                                    PipelineNotice::DataDropped {
+                                        message: format!(
+                                            "Failed to parse a response (seq={}): {}, data dropped",
+                                            seq, e
+                                        ),
+                                    },
+                                );
                                 seq += 1;
                                 continue;
                             }
@@ -802,6 +899,8 @@ pub struct PipelineHandle {
     write_queue: Arc<Mutex<VecDeque<(usize, u64)>>>,
     /// 子线程致命错误槽（第一个错误的描述）。Some = 采集无法继续
     thread_error: Arc<Mutex<Option<String>>>,
+    /// 非致命故障通知队列（写入被跳过、协议失步丢数据）
+    notices: Arc<Mutex<Vec<PipelineNotice>>>,
 }
 
 impl PipelineHandle {
@@ -822,6 +921,17 @@ impl PipelineHandle {
     /// Some = 采集无法继续，UI 应停止采集并向用户展示原因。
     pub fn thread_error(&self) -> Option<String> {
         self.thread_error.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// 取走全部非致命故障通知（写入被跳过、协议失步丢数据等）
+    ///
+    /// UI 每帧轮询，转为错误弹窗提示——这些故障此前只写日志，
+    /// 用户视线不在底部提示上时完全无感知。
+    pub fn drain_notices(&self) -> Vec<PipelineNotice> {
+        match self.notices.lock() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// 两个工作线程是否都仍在运行
@@ -1183,6 +1293,7 @@ mod tests {
             let _ = rx2.recv();
         });
         let te: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let notices: Arc<Mutex<Vec<PipelineNotice>>> = Arc::new(Mutex::new(Vec::new()));
         let handle = PipelineHandle {
             submit_handle: j1,
             collect_handle: j2,
@@ -1190,15 +1301,31 @@ mod tests {
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
             thread_error: Arc::clone(&te),
+            notices: Arc::clone(&notices),
         };
 
         // 两个线程都阻塞在 recv 上：必须判定为存活
         assert!(handle.threads_alive(), "运行中的线程不应被判定为退出");
         assert!(handle.thread_error().is_none(), "无错误时错误槽应为空");
+        assert!(handle.drain_notices().is_empty(), "无通知时队列应为空");
 
         // 子线程通过槽上报致命错误，UI 读取到完整描述
         *te.lock().unwrap() = Some("USB read failed: boom".to_string());
         assert_eq!(handle.thread_error().as_deref(), Some("USB read failed: boom"));
+
+        // 非致命通知队列：push 有上限（故障风暴不刷爆 UI），drain 取走并清空
+        for i in 0..20 {
+            push_notice(
+                &notices,
+                PipelineNotice::WriteSkipped {
+                    var_idx: i,
+                    reason: "test".to_string(),
+                },
+            );
+        }
+        assert_eq!(notices.lock().unwrap().len(), 16, "通知队列应有上限");
+        assert_eq!(handle.drain_notices().len(), 16, "drain 应取走全部通知");
+        assert!(handle.drain_notices().is_empty(), "drain 后应清空");
 
         // 线程退出后 is_finished 兜底检测生效（未走错误通道的死法也能发现）
         drop(tx1);

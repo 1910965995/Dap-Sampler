@@ -51,11 +51,8 @@ const CHANNEL_COLORS: [egui::Color32; 16] = [
 /// 连接类故障的排障建议（仅随 USB/SWD 连接失败类错误显示）
 const CONNECTION_HINT: &str = "Note: Check that the DAP-Link is connected, the WinUSB driver is installed, the device is not occupied by Keil/OpenOCD/pyOCD or other programs, the target board is powered, and the SWD wiring is correct; or try a lower SWD clock.";
 
-/// 侧栏分节间可拖拽分隔条的交互厚度（px，细线居中绘制）
-const SIDEBAR_HANDLE_H: f32 = 8.0;
-
-/// 侧栏分节的最小高度（px，仅保留标题行；分隔条拖拽的下限，无上限）
-const SIDEBAR_MIN_PANE: f32 = 24.0;
+/// 侧栏竖排标签列宽度（px，标签按钮铺满该列；列与竖分隔线间距 2px）
+const SIDEBAR_TAB_W: f32 = 16.0;
 
 /// 统一浅色主题与滚动条风格（每帧应用，覆盖 egui 默认值）
 ///
@@ -95,34 +92,128 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
-/// 侧栏分节之间的可拖拽分隔条
+/// 侧栏竖排文字标签：文字旋转 90° 自上而下书写，与标签条平行
 ///
-/// `SIDEBAR_HANDLE_H` 高的交互条，居中画一条细灰线；悬停/拖动时加粗加深
-/// 并显示垂直缩放光标。返回本帧的纵向拖拽增量（px，向下为正）。
-fn sidebar_splitter(ui: &mut egui::Ui) -> f32 {
-    let size = egui::vec2(ui.available_width(), SIDEBAR_HANDLE_H);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    let active = resp.hovered() || resp.dragged();
+/// 返回 true 表示被点击。选中态浅灰底 + 深色字，悬停浅灰底。
+fn vertical_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
+    let font = egui::FontId::proportional(12.0);
+    let galley =
+        ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER);
+    let pad_y = 8.0;
+    // 标签高度必须按**文本长度**（size.x）算：文字旋转 90° 后长边变为竖向，
+    // 若误用行高（size.y ≈ 14px）标签矩形会远小于旋转文字，相邻标签文字
+    // 全部重叠
+    let size = egui::vec2(SIDEBAR_TAB_W, galley.size().x + pad_y * 2.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let (color, width) = if active {
-            (egui::Color32::from_gray(150), 2.5)
+        let bg = if selected {
+            egui::Color32::from_gray(225)
+        } else if resp.hovered() {
+            egui::Color32::from_gray(240)
         } else {
-            (egui::Color32::from_gray(210), 1.5)
+            egui::Color32::TRANSPARENT
         };
-        let y = rect.center().y;
-        ui.painter().line_segment(
-            [egui::pos2(rect.left() + 2.0, y), egui::pos2(rect.right() - 2.0, y)],
-            egui::Stroke::new(width, color),
-        );
+        if bg != egui::Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(4), bg);
+        }
+        let color = if selected {
+            egui::Color32::from_rgb(45, 48, 55)
+        } else if resp.hovered() {
+            egui::Color32::from_rgb(70, 74, 82)
+        } else {
+            egui::Color32::from_rgb(110, 118, 128)
+        };
+        // 旋转 +90°（屏幕坐标系下顺时针）：文字自上而下书写。
+        // 旋转后包围盒宽 = galley 行高、高 = galley 文本长度，
+        // 中心对齐到标签矩形中心
+        let (gw, gh) = (galley.size().x, galley.size().y);
+        let pos = rect.center() + egui::vec2(gh * 0.5, -gw * 0.5);
+        let mut shape = egui::epaint::TextShape::new(pos, galley, color);
+        shape.angle = std::f32::consts::FRAC_PI_2;
+        // galley 以 PLACEHOLDER 排版，双保险：既设 fallback_color 也显式
+        // 覆写文字颜色（hover/选中态切换颜色时保证生效）
+        shape.override_text_color = Some(color);
+        ui.painter().add(shape);
     }
-    if active {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if resp.dragged() {
-        resp.drag_delta().y
-    } else {
-        0.0
+    resp.clicked()
+}
+
+#[cfg(test)]
+mod sidebar_tab_tests {
+    use super::*;
+
+    /// 旋转后（angle=π/2）文字包围盒：x ∈ [pos.x-行高, pos.x]，y ∈ [pos.y, pos.y+文本长]
+    fn rotated_bbox(t: &egui::epaint::TextShape) -> egui::Rect {
+        let (gw, gh) = (t.galley.size().x, t.galley.size().y);
+        egui::Rect::from_min_max(
+            egui::pos2(t.pos.x - gh, t.pos.y),
+            egui::pos2(t.pos.x, t.pos.y + gw),
+        )
     }
+
+    #[test]
+    fn vertical_tabs_do_not_overlap() {
+        // 回归：标签高度曾误用行高（size.y）而非文本长度（size.x），三个
+        // 标签矩形塌成 ~30px，旋转文字溢出互相重叠（用户截图反馈）
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(100.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(SIDEBAR_TAB_W, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        for label in ["Variables", "Channels", "Cursor"] {
+                            let _ = vertical_tab(ui, label, false);
+                        }
+                    },
+                );
+            });
+        });
+
+        let mut boxes: Vec<egui::Rect> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                let bbox = rotated_bbox(t);
+                // "Cursor" 最短也有 ~34px；旧的塌缩 bug 下相邻文字会互相
+                // 重叠，由下方两两断言捕获
+                assert!(
+                    bbox.height() > 24.0,
+                    "竖排文字包围盒应有文本长度那么高，实际 {bbox:?}"
+                );
+                boxes.push(bbox);
+            }
+        }
+        assert_eq!(boxes.len(), 3, "应绘制 3 个标签文字");
+
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        for w in boxes.windows(2) {
+            assert!(
+                w[1].top() >= w[0].bottom(),
+                "标签文字包围盒重叠: {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+}
+
+/// 侧栏竖排标签对应的分区
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Variables,
+    Channels,
+    Cursor,
 }
 
 /// DAP Sampler 主应用
@@ -148,10 +239,8 @@ pub struct DapSamplerApp {
     channel_panel: ChannelPanel,
     /// Watch 面板（示波器下方）
     watch_panel: WatchPanel,
-    /// 侧栏 Variables 分节高度（px，<=0 表示未初始化，首帧按比例分配）
-    sidebar_var_height: f32,
-    /// 侧栏 Channels 分节高度（px，<=0 表示未初始化，首帧按比例分配）
-    sidebar_channels_height: f32,
+    /// 侧栏当前选中的竖排标签分区
+    sidebar_active_tab: SidebarTab,
     #[allow(dead_code)]
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
@@ -410,8 +499,7 @@ impl DapSamplerApp {
             variable_browser: VariableBrowser::new(),
             channel_panel,
             watch_panel,
-            sidebar_var_height: 0.0,
-            sidebar_channels_height: 0.0,
+            sidebar_active_tab: SidebarTab::Variables,
             manual_channel_names,
             manual_value_types,
             rate_hz,
@@ -1501,11 +1589,11 @@ impl DapSamplerApp {
     }
 
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new("Click waveform to place cursor")
-                .size(10.0)
-                .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
-        );
+        // 未放置任何光标时：提示文字在标签页内容区内居中占满
+        if self.cursor.cursor1.is_none() && self.cursor.cursor2.is_none() {
+            super::text::centered_hint(ui, "Click waveform to place cursor");
+            return;
+        }
         let types = self.waveform.value_types().to_vec();
         let colors: Vec<egui::Color32> = self.channel_panel.channels.iter().map(|c| c.color).collect();
         let buffer = self.display_buf.all();
@@ -1852,46 +1940,68 @@ impl eframe::App for DapSamplerApp {
             .exact_height(24.0)
             .show(ctx, |ui| self.status_bar_ui(ui));
 
-        // ---- 左侧面板：变量浏览器 + 通道 + 光标 ----
-        // 三个分节的高度由两条可拖拽分隔条调整（见 sidebar_splitter）。
-        // 分隔条 k 只调整其上方分节的高度且无上限：下拉时下方内容顺次
-        // 下移，总高超出面板高度后由侧栏整体滚动（外层 ScrollArea 延伸）。
-        // 各分节内容超出自身高度时在分节内部滚动。
+        // ---- 左侧面板：竖排标签条 + 分区内容 ----
+        // 标签条竖排在最左（文字旋转 90° 自上而下，与标签条平行），点击
+        // 标签切换右侧内容区显示的分区，同一时间只显示一个分区
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(220.0)
             .width_range(220.0..=400.0)
+            // 默认面板内边距左右各 8px，标签列会整体被推离窗口边缘；
+            // 收窄为左 2 / 右 6 / 上下 2，标签列贴边显示
+            .frame(egui::Frame::NONE.fill(egui::Color32::WHITE).inner_margin(
+                egui::Margin { left: 2, right: 6, top: 2, bottom: 2 },
+            ))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let sp = ui.spacing().item_spacing.y;
-                        // 分节间共 4 个 item_spacing 间隙 + 2 条分隔条
-                        let chrome = 2.0 * SIDEBAR_HANDLE_H + 4.0 * sp;
-                        let total = ui.available_height();
-                        // 首帧按比例初始化：Variables 45% / Channels 35% / Cursor 余下
-                        if self.sidebar_var_height <= 0.0
-                            || self.sidebar_channels_height <= 0.0
-                        {
-                            self.sidebar_var_height = total * 0.45;
-                            self.sidebar_channels_height = total * 0.35;
-                        }
-                        if total < SIDEBAR_MIN_PANE * 2.0 + chrome {
-                            // 窗口过小时初始比例没有意义，退化为最小高度
-                            self.sidebar_var_height = self.sidebar_var_height.max(SIDEBAR_MIN_PANE);
-                            self.sidebar_channels_height = self.sidebar_channels_height.max(SIDEBAR_MIN_PANE);
-                        }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    // 标签列→竖线间距 2px。必须在分配标签列**之前**设置：
+                    // egui 推进布局游标用的是“前一个控件分配完那一刻”的间距，
+                    // 若分配之后再改，列与竖线之间已被旧的 8px 间距顶开
+                    //（右侧留白 bug）
+                    let saved_gap = ui.spacing().item_spacing.x;
+                    ui.spacing_mut().item_spacing.x = 2.0;
 
-                        // --- 变量浏览器 ---
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), self.sidebar_var_height),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                // allocate_ui_with_layout 内容不满时只分配
-                                // min_rect，这里强制撑满分节高度，分隔条才不漂移
-                                ui.set_min_height(self.sidebar_var_height);
-                                ui.strong("Variables");
+                    // --- 竖排标签条 ---
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIDEBAR_TAB_W, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            for tab in [
+                                SidebarTab::Variables,
+                                SidebarTab::Channels,
+                                SidebarTab::Cursor,
+                            ] {
+                                let label = match tab {
+                                    SidebarTab::Variables => "Variables",
+                                    SidebarTab::Channels => "Channels",
+                                    SidebarTab::Cursor => "Cursor",
+                                };
+                                if vertical_tab(ui, label, self.sidebar_active_tab == tab) {
+                                    self.sidebar_active_tab = tab;
+                                }
+                            }
+                        },
+                    );
+
+                    // 手绘 1px 竖线（egui Separator 自带 ~4px 内边距）
+                    let (line_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(1.0, ui.available_height()),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(line_rect.center().x, line_rect.top()),
+                            egui::pos2(line_rect.center().x, line_rect.bottom()),
+                        ],
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                    // 内容区恢复正常水平间距
+                    ui.spacing_mut().item_spacing.x = saved_gap;
+
+                    // --- 内容区：当前选中分区 ---
+                    ui.vertical(|ui| {
+                        match self.sidebar_active_tab {
+                            SidebarTab::Variables => {
                                 let changes = self
                                     .variable_browser
                                     .show(ui, self.elf_ctx.as_ref());
@@ -1904,38 +2014,25 @@ impl eframe::App for DapSamplerApp {
                                         self.apply_variable_changes(changes);
                                     }
                                 }
-                            },
-                        );
-
-                        // --- 分隔条 1：调整 Variables 高度 ---
-                        // 只改上方分节、无上限：下拉把下方内容顺次推下，
-                        // 总高超出面板时侧栏整体滚动延伸
-                        let dy = sidebar_splitter(ui);
-                        if dy != 0.0 {
-                            self.sidebar_var_height =
-                                (self.sidebar_var_height + dy).max(SIDEBAR_MIN_PANE);
-                        }
-
-                        // --- 通道 ---
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), self.sidebar_channels_height),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_min_height(self.sidebar_channels_height);
-                                ui.strong(format!(
-                                    "Channels ({}/{})",
-                                    self.channel_panel.channel_count(),
-                                    MAX_VALUES
-                                ));
+                            }
+                            SidebarTab::Channels => {
+                                // 空态时隐藏计数标题，让 "No channels" 真正
+                                // 居中占满整个内容区
+                                if self.channel_panel.channel_count() > 0 {
+                                    ui.strong(format!(
+                                        "Channels ({}/{})",
+                                        self.channel_panel.channel_count(),
+                                        MAX_VALUES
+                                    ));
+                                }
                                 let action =
                                     self.channel_panel.show(ui, self.selected_channel);
                                 if let Some(idx) = action.select {
-                                    self.selected_channel =
-                                        if self.selected_channel == Some(idx) {
-                                            None
-                                        } else {
-                                            Some(idx)
-                                        };
+                                    self.selected_channel = if self.selected_channel == Some(idx) {
+                                        None
+                                    } else {
+                                        Some(idx)
+                                    };
                                 }
                                 if let Some(remove_idx) = action.remove {
                                     // 采集中通道集合被引擎快照固定：删除会使
@@ -1945,8 +2042,7 @@ impl eframe::App for DapSamplerApp {
                                             "Stop acquisition before removing channels",
                                         );
                                     } else {
-                                        let name = self.channel_panel.channels
-                                            [remove_idx]
+                                        let name = self.channel_panel.channels[remove_idx]
                                             .name
                                             .clone();
                                         self.variable_browser.checked_paths.remove(&name);
@@ -1976,35 +2072,15 @@ impl eframe::App for DapSamplerApp {
                                         );
                                     }
                                 }
-                            },
-                        );
-
-                        // --- 分隔条 2：调整 Channels 高度（无上限，同上）---
-                        let dy = sidebar_splitter(ui);
-                        if dy != 0.0 {
-                            self.sidebar_channels_height =
-                                (self.sidebar_channels_height + dy).max(SIDEBAR_MIN_PANE);
-                        }
-
-                        // --- 光标：占余下高度，至少保留标题行 ---
-                        // H1+H2 超出面板时余量为负，Cursor 随内容被推到
-                        // 视区外，由侧栏滚动条延伸展示
-                        let cursor_h = (total
-                            - self.sidebar_var_height
-                            - self.sidebar_channels_height
-                            - chrome)
-                            .max(SIDEBAR_MIN_PANE);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), cursor_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_min_height(cursor_h);
-                                ui.strong("Cursor");
+                            }
+                            SidebarTab::Cursor => {
                                 self.show_cursor_info(ui);
-                            },
-                        );
+                            }
+                        }
                     });
+                });
             });
+
 
         // ---- 底部 Watch 面板 ----
         egui::TopBottomPanel::bottom("watch_panel")

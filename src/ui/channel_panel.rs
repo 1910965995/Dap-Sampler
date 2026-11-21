@@ -5,44 +5,84 @@ use crate::pipeline::sample::ValueType;
 const GREY_BG: egui::Color32 = egui::Color32::from_rgb(235, 237, 240);
 const GREY_HOVER: egui::Color32 = egui::Color32::from_rgb(208, 212, 218);
 const GREY_FG: egui::Color32 = egui::Color32::from_rgb(45, 48, 55);
+/// 闭眼（不观测）状态的淡灰
+const GREY_DIM: egui::Color32 = egui::Color32::from_rgb(0x9a, 0xa0, 0xa8);
 
 /// 图标按钮尺寸
 const ICON_BTN_SIZE: egui::Vec2 = egui::Vec2::new(16.0, 16.0);
 
-/// 绘制一个圆形图标按钮
+/// 按钮内容绘制回调：(painter, 按钮矩形)
+type PaintIcon<'a> = &'a dyn Fn(&egui::Painter, egui::Rect);
+
+/// 绘制一个圆形图标按钮（矢量图标）
 ///
-/// - size: 20×20 px
-/// - label: 居中显示的文本（如 "●" "×"）
-/// - fg: 文本颜色
 /// - bg: 正常背景色
 /// - hover_bg: hover 时的背景色
 ///
-/// 返回 true 表示用户点击了该按钮。
-fn icon_button(
+/// 返回按钮的 Response（点击判断与悬停提示由调用方处理）。
+fn icon_button_custom(
     ui: &mut egui::Ui,
-    label: &str,
-    fg: egui::Color32,
+    paint: PaintIcon<'_>,
     bg: egui::Color32,
     hover_bg: egui::Color32,
-) -> bool {
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(ICON_BTN_SIZE, egui::Sense::click());
 
     if ui.is_rect_visible(rect) {
         let bg_color = if response.hovered() { hover_bg } else { bg };
         let rounding = egui::CornerRadius::same(8);
         ui.painter().rect_filled(rect, rounding, bg_color);
-        // 用 galley 手动居中,避免 painter.text 因字体 metrics 导致视觉偏上
-        let font_id = egui::FontId::proportional(12.0);
-        let galley = ui.painter().layout_no_wrap(label.to_string(), font_id, fg);
-        let pos = rect.center() - galley.size() * 0.5;
-        ui.painter().galley(pos, galley, fg);
+        paint(ui.painter(), rect);
     }
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    response.clicked()
+    response
+}
+
+/// 绘制矢量 ×（移除按钮）
+///
+/// 与眼睛同用矢量画法、同 1.0px 线宽，墨迹约 6.9px 见方（8.6px 基础上整体
+/// 缩小 20%，与原 12px 字形约 7px 的墨迹相当）。
+fn paint_x(painter: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
+    let d = rect.width() * 0.216;
+    let stroke = egui::Stroke::new(1.0, GREY_FG);
+    painter.line_segment(
+        [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)],
+        stroke,
+    );
+}
+
+/// 绘制眼睛图标：观测中为睁眼，不观测为带斜杠的闭眼
+///
+/// 线宽刻意压到 1.0px 级别，对齐 12px Ubuntu-Light 字形（如 "×"）的视觉重量，
+/// 避免矢量描边在字体图标旁边显得过粗过深。
+fn paint_eye(painter: &egui::Painter, rect: egui::Rect, visible: bool) {
+    let c = rect.center();
+    let color = if visible { GREY_FG } else { GREY_DIM };
+    // 眼眶：扁椭圆描边
+    painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape::stroke(
+        c,
+        egui::vec2(rect.width() * 0.36, rect.height() * 0.24),
+        egui::Stroke::new(1.0, color),
+    )));
+    // 瞳孔：实心圆
+    painter.add(egui::Shape::circle_filled(c, rect.height() * 0.09, color));
+    if !visible {
+        // 斜杠：左上 → 右下，压过眼眶表示"隐藏"
+        let d = rect.width() * 0.42;
+        painter.line_segment(
+            [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+            egui::Stroke::new(1.1, color),
+        );
+    }
 }
 
 /// 通道面板中显示的通道信息
@@ -164,13 +204,27 @@ impl ChannelPanel {
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icon_button(ui, "×", GREY_FG, GREY_BG, GREY_HOVER) {
+                                let remove =
+                                    icon_button_custom(ui, &paint_x, GREY_BG, GREY_HOVER);
+                                if remove.clicked() {
                                     action.remove = Some(i);
                                 }
-                                let vis_label = if ch.visible { "●" } else { "○" };
-                                if icon_button(ui, vis_label, GREY_FG, GREY_BG, GREY_HOVER) {
+                                remove.on_hover_text("Remove channel");
+                                let visible = ch.visible;
+                                let eye = icon_button_custom(
+                                    ui,
+                                    &|p, rect| paint_eye(p, rect, visible),
+                                    GREY_BG,
+                                    GREY_HOVER,
+                                );
+                                if eye.clicked() {
                                     ch.visible = !ch.visible;
                                 }
+                                eye.on_hover_text(if visible {
+                                    "Hide channel"
+                                } else {
+                                    "Show channel"
+                                });
                             });
                         });
                     });
@@ -327,16 +381,68 @@ mod tests {
         assert!(p.channels[0].visible);
     }
 
-    #[test]
-    fn visible_label_shows_filled_when_visible() {
-        // 依赖 icon_button 的渲染行为：visible=true → label="●", false → label="○"
-        let p = panel_with_one_channel();
-        assert!(p.channels[0].visible);
-        let label_visible = "●";
-        assert_eq!(label_visible, "●");
+    /// 递归统计渲染输出中的矢量图形数量（线段按颜色区分：GREY_FG=×，GREY_DIM=闭眼斜杠）
+    fn count_icon_shapes(
+        shape: &egui::Shape,
+        ellipses: &mut usize,
+        circles: &mut usize,
+        fg_lines: &mut usize,
+        dim_lines: &mut usize,
+    ) {
+        match shape {
+            egui::Shape::Ellipse(_) => *ellipses += 1,
+            egui::Shape::Circle(_) => *circles += 1,
+            egui::Shape::LineSegment { stroke, .. } => {
+                if stroke.color == GREY_DIM {
+                    *dim_lines += 1;
+                } else if stroke.color == GREY_FG {
+                    *fg_lines += 1;
+                }
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| {
+                count_icon_shapes(s, ellipses, circles, fg_lines, dim_lines);
+            }),
+            _ => {}
+        }
+    }
 
-        let label_hidden = "○";
-        assert_eq!(label_hidden, "○");
+    #[test]
+    fn eye_icon_shows_slash_only_when_hidden() {
+        // 睁眼：椭圆眼眶 + 瞳孔，无斜杠；闭眼：额外多出一条淡灰斜杠。
+        // × 按钮恒画 2 条深灰线段，作为对照不变。
+        let mut p = panel_with_one_channel();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+
+        let shapes_of = |panel: &mut ChannelPanel| {
+            let output = render_frame(&ctx, panel);
+            let (mut ellipses, mut circles, mut fg_lines, mut dim_lines) =
+                (0usize, 0usize, 0usize, 0usize);
+            for clipped in &output.shapes {
+                count_icon_shapes(
+                    &clipped.shape,
+                    &mut ellipses,
+                    &mut circles,
+                    &mut fg_lines,
+                    &mut dim_lines,
+                );
+            }
+            (ellipses, circles, fg_lines, dim_lines)
+        };
+
+        p.channels[0].visible = true;
+        let (ellipse, circle, fg_line, dim_line) = shapes_of(&mut p);
+        assert_eq!(ellipse, 1, "open eye paints one ellipse outline");
+        assert_eq!(circle, 1, "open eye paints one iris");
+        assert_eq!(fg_line, 2, "remove button paints two GREY_FG strokes");
+        assert_eq!(dim_line, 0, "open eye has no slash");
+
+        p.channels[0].visible = false;
+        let (ellipse, circle, fg_line, dim_line) = shapes_of(&mut p);
+        assert_eq!(ellipse, 1, "hidden eye keeps the ellipse outline");
+        assert_eq!(circle, 1, "hidden eye keeps the iris");
+        assert_eq!(fg_line, 2, "remove button strokes unchanged");
+        assert_eq!(dim_line, 1, "hidden eye paints a slash");
     }
 
     #[test]
@@ -350,9 +456,116 @@ mod tests {
     }
 
     #[test]
-    fn icon_label_is_multiply_sign() {
-        // 验证移除按钮的文本是 U+00D7
-        let remove_label = "×";
-        assert_eq!(remove_label.chars().next().map(|c| c as u32), Some(0x00D7));
+    fn remove_button_is_vector_x() {
+        // × 已从字体字形改为矢量绘制：单通道一帧应恰好 2 条深灰线段
+        let mut p = panel_with_one_channel();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+
+        let output = render_frame(&ctx, &mut p);
+        let (mut ellipses, mut circles, mut fg_lines, mut dim_lines) =
+            (0usize, 0usize, 0usize, 0usize);
+        for clipped in &output.shapes {
+            count_icon_shapes(
+                &clipped.shape,
+                &mut ellipses,
+                &mut circles,
+                &mut fg_lines,
+                &mut dim_lines,
+            );
+        }
+        assert_eq!(fg_lines, 2, "vector × paints exactly two GREY_FG strokes");
+        assert_eq!(dim_lines, 0, "no slash when channel is visible");
+    }
+
+    /// 用 epaint 的 Tessellator（与 GPU 渲染同一条代码路径）实测单个 Shape 的
+    /// 网格顶点边界——能暴露描边外扩（StrokeKind::Outside）、路径近似等
+    /// 造成墨迹偏离几何中心的渲染层偏移
+    fn tessellated_bounds(shape: &egui::Shape) -> egui::Rect {
+        let mut tess = egui::epaint::Tessellator::new(
+            1.0,
+            egui::epaint::TessellationOptions::default(),
+            [512, 512],
+            Vec::new(),
+        );
+        let mut mesh = egui::epaint::Mesh::default();
+        tess.tessellate_shape(shape.clone(), &mut mesh);
+        let mut rect: Option<egui::Rect> = None;
+        for v in &mesh.vertices {
+            rect = Some(match rect {
+                Some(r) => r.union(egui::Rect::from_min_size(v.pos, egui::Vec2::ZERO)),
+                None => egui::Rect::from_min_size(v.pos, egui::Vec2::ZERO),
+            });
+        }
+        rect.expect("shape tessellated to at least one vertex")
+    }
+
+    #[test]
+    fn icons_are_centered_on_their_button_backgrounds() {
+        // 眼睛与 × 的墨迹网格边界中心应与按钮灰底矩形中心重合（容差 0.5px，
+        // 羽化边衬是对称的，理论偏移为 0）。睁眼与闭眼（含斜杠）两种状态都查。
+        let mut p = panel_with_one_channel();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+
+        let measure = |panel: &mut ChannelPanel| -> Vec<(egui::Rect, egui::Rect)> {
+            let output = render_frame(&ctx, panel);
+            // 按钮灰底（16×16 圆），按 x 排序：左=眼睛，右=×
+            let mut buttons: Vec<egui::Rect> = Vec::new();
+            for clipped in &output.shapes {
+                if let egui::Shape::Rect(r) = &clipped.shape {
+                    if r.fill == GREY_BG {
+                        buttons.push(r.rect);
+                    }
+                }
+            }
+            buttons.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            assert_eq!(buttons.len(), 2, "expected eye + remove buttons");
+
+            // 各墨迹图形的实测网格边界，归入包含其中心的按钮
+            let mut inks: Vec<egui::Rect> = Vec::new();
+            for clipped in &output.shapes {
+                let ink = match &clipped.shape {
+                    egui::Shape::Ellipse(_)
+                    | egui::Shape::Circle(_)
+                    | egui::Shape::LineSegment { .. } => tessellated_bounds(&clipped.shape),
+                    _ => continue,
+                };
+                inks.push(ink);
+            }
+
+            buttons
+                .iter()
+                .map(|btn| {
+                    let mut ink_union: Option<egui::Rect> = None;
+                    for ink in &inks {
+                        if btn.contains(ink.center()) {
+                            ink_union = Some(match ink_union {
+                                Some(u) => u.union(*ink),
+                                None => *ink,
+                            });
+                        }
+                    }
+                    let ink_union = ink_union.expect("button has no ink shapes");
+                    (*btn, ink_union)
+                })
+                .collect()
+        };
+
+        let assert_centered = |pairs: &[(egui::Rect, egui::Rect)], state: &str| {
+            for (btn, ink) in pairs {
+                let off = ink.center() - btn.center();
+                assert!(
+                    off.x.abs() < 0.5 && off.y.abs() < 0.5,
+                    "{state}: icon ink {ink:?} not centered on button {btn:?}, offset ({:.2}, {:.2})",
+                    off.x,
+                    off.y
+                );
+            }
+        };
+
+        assert_centered(&measure(&mut p), "visible");
+        p.channels[0].visible = false;
+        assert_centered(&measure(&mut p), "hidden");
     }
 }

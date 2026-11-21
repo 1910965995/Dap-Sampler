@@ -129,9 +129,12 @@ impl WaveformPanel {
         selected_channel: Option<usize>,
     ) -> WaveformOutput {
         if buffer.is_empty() {
-            // 空状态：居中显示提示与引导
+            // 空状态：居中显示提示与引导。
+            // 两行标签（14px + 11px + 行距）约 40px：偏移可用高度的一半
+            // 再减去内容一半才是真正的居中（0.35 之类的系数会随面板高度
+            // 变化偏离中心）
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.35);
+                ui.add_space(((ui.available_height() - 40.0) * 0.5).max(0.0));
                 ui.label(
                     egui::RichText::new("Waiting for data...")
                         .size(14.0)

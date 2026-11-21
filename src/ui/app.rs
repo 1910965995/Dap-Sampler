@@ -1655,6 +1655,13 @@ impl DapSamplerApp {
 }
 
 impl eframe::App for DapSamplerApp {
+    /// 窗口清屏色：eframe 默认近黑（rgb(12,12,12)），任何面板未覆盖的
+    /// 区域都会显示为黑色（拖大 Watch 后曾出现黑框）。本应用全白主题，
+    /// 清屏色也用白色兜底。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::WHITE.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 统一浅色主题 + 滚动条灰色风格（见 apply_theme 注释）
         apply_theme(ctx);
@@ -1882,6 +1889,10 @@ impl eframe::App for DapSamplerApp {
             .default_height(180.0)
             .min_height(180.0)
             .show(ctx, |ui| {
+                // egui 的上下面板只把内容填充到 height_range.min（180px）：
+                // 向上拖高 Watch 后，内容高度不变，面板余下区域不会被绘制，
+                // 显示为窗口清屏色（黑色）。这里强制内容撑满面板高度。
+                ui.set_min_height(ui.max_rect().height());
                 let colors: Vec<egui::Color32> =
                     self.channel_panel.channels.iter().map(|c| c.color).collect();
                 self.watch_panel.show(ui, &colors);

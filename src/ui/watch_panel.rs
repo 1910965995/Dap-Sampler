@@ -266,9 +266,10 @@ impl WatchPanel {
         ui.add_space(2.0);
 
         if self.entries.is_empty() {
-            // 居中空状态提示（与波形区 Waiting for data... 样式一致）
+            // 居中空状态提示（与波形区 Waiting for data... 样式一致）。
+            // 精确垂直居中：两行标签约 40px，偏移可用高度的一半减内容一半
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.35);
+                ui.add_space(((ui.available_height() - 40.0) * 0.5).max(0.0));
                 ui.label(egui::RichText::new("No watch variables").size(14.0).color(TEXT_MUTED));
                 ui.label(
                     egui::RichText::new("Import ELF or add channels to start watching")

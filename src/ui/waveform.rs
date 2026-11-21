@@ -1,4 +1,7 @@
 use egui_plot::{Line, Legend, Plot, PlotBounds, PlotPoint, Points};
+
+/// 波形 Plot 的 egui 内存键：用于跨帧读取图例点击产生的 hidden 集
+const WAVEFORM_PLOT_MEM_ID: &str = "waveform_plot_state";
 use crate::pipeline::sample::{Sample, ValueType};
 
 /// 波形显示模式
@@ -66,6 +69,8 @@ pub struct WaveformPanel {
     auto_scroll: bool,
     /// 波形显示模式（连线 / 散点）
     display_mode: WaveformDisplayMode,
+    /// 加粗通道名集合：图例点击切换（可多通道同时加粗），与可见性无关
+    bold_names: std::collections::HashSet<String>,
 }
 
 /// 波形渲染输出
@@ -110,6 +115,7 @@ impl WaveformPanel {
             auto_y_max_abs: 1.0,
             auto_scroll: true,
             display_mode,
+            bold_names: Default::default(),
         }
     }
 
@@ -220,8 +226,29 @@ impl WaveformPanel {
         let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
 
+        // ---- 图例点击 → 加粗切换 ----
+        // Legend 配置空 hidden_items 覆盖（每帧把内存中的隐藏集重置为空，
+        // 曲线永不被隐藏）；点击图例项的瞬间该项会短暂进入内存中的
+        // hidden 集（仅持续一帧，下一帧即被覆盖重置），据此检测点击并
+        // 切换该通道的加粗状态。读完后立即清空，避免线被隐藏一帧闪烁。
+        if let Some(mut mem) =
+            egui_plot::PlotMemory::load(ui.ctx(), egui::Id::new(WAVEFORM_PLOT_MEM_ID))
+        {
+            for name in mem.hidden_items.iter() {
+                self.toggle_bold_by_name(name);
+            }
+            mem.hidden_items.clear();
+            mem.store(ui.ctx(), egui::Id::new(WAVEFORM_PLOT_MEM_ID));
+        }
+
         let plot = Plot::new("waveform_plot")
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .id(egui::Id::new(WAVEFORM_PLOT_MEM_ID))
+            .legend(
+                Legend::default()
+                    .position(egui_plot::Corner::RightTop)
+                    // 空集覆盖：图例勾选恒为选中，点击不再隐藏曲线
+                    .hidden_items(Vec::<String>::new()),
+            )
             .show_grid(true)
             .show_axes(true)
             .x_axis_label(x_label)
@@ -306,8 +333,9 @@ impl WaveformPanel {
                 } else {
                     ch.color
                 };
-                let line_w = if is_sel { 2.8 } else { 1.4 };
-                let point_r = if is_sel { 2.4 } else { 1.5 };
+                let bold = self.bold_names.contains(&ch.name);
+                let line_w = if bold { 3.2 } else if is_sel { 2.8 } else { 1.4 };
+                let point_r = if bold { 3.0 } else if is_sel { 2.4 } else { 1.5 };
                 match self.display_mode {
                     WaveformDisplayMode::Line => {
                         plot_ui.line(
@@ -530,6 +558,26 @@ impl WaveformPanel {
             ch.visible = !ch.visible;
             self.mark_channel_dirty(index);
         }
+    }
+
+    /// 图例点击：切换通道加粗状态（可多通道同时加粗）
+    ///
+    /// 加粗仅影响线宽/点半径，与可见性（Channels 界面的眼睛）无关；
+    /// 名字不在通道列表中时静默忽略。
+    pub fn toggle_bold_by_name(&mut self, name: &str) {
+        if !self.bold_names.remove(name) {
+            self.bold_names.insert(name.to_owned());
+        }
+    }
+
+    /// 当前加粗通道名集合（重建通道集时用于保留状态）
+    pub fn bold_names(&self) -> &std::collections::HashSet<String> {
+        &self.bold_names
+    }
+
+    /// 恢复加粗通道集合
+    pub fn set_bold_names(&mut self, names: std::collections::HashSet<String>) {
+        self.bold_names = names;
     }
 
     /// 查询通道可见性
@@ -819,6 +867,55 @@ mod tests {
         let clean = make_buffer(3, &[u64::from(1.0f32.to_bits())]);
         panel.rebuild_cache(&clean);
         assert!(!panel.nan_in_stream);
+    }
+
+    #[test]
+    fn toggle_bold_by_name_flips_and_ignores_unknown() {
+        let mut panel = WaveformPanel::new(
+            vec!["CH1".to_string(), "CH2".to_string()],
+            vec![egui::Color32::RED, egui::Color32::GREEN],
+            1000.0,
+            vec![ValueType::Float, ValueType::Float],
+            WaveformDisplayMode::Line,
+        );
+
+        // 首次点击：加粗
+        panel.toggle_bold_by_name("CH1");
+        assert!(panel.bold_names().contains("CH1"), "点击后应加粗");
+        assert!(!panel.bold_names().contains("CH2"), "其余通道不受影响");
+
+        // 再次点击：取消加粗
+        panel.toggle_bold_by_name("CH1");
+        assert!(!panel.bold_names().contains("CH1"), "再次点击应取消加粗");
+
+        // 未知通道名：静默忽略（进入集合无妨，渲染按通道名匹配）
+        panel.toggle_bold_by_name("CH9");
+        panel.toggle_bold_by_name("CH9");
+        assert!(!panel.bold_names().contains("CH9"), "未知名切换两次应回到空");
+    }
+
+    #[test]
+    fn bold_names_survive_channel_set_rebuild() {
+        // 重建通道集（WaveformPanel::new 替换实例）时按名保留加粗状态
+        let mut panel = WaveformPanel::new(
+            vec!["CH1".to_string()],
+            vec![egui::Color32::RED],
+            1000.0,
+            vec![ValueType::Float],
+            WaveformDisplayMode::Line,
+        );
+        panel.toggle_bold_by_name("CH1");
+
+        let kept = panel.bold_names().clone();
+        let mut rebuilt = WaveformPanel::new(
+            vec!["CH1".to_string(), "CH2".to_string()],
+            vec![egui::Color32::RED, egui::Color32::GREEN],
+            1000.0,
+            vec![ValueType::Float, ValueType::Float],
+            WaveformDisplayMode::Line,
+        );
+        rebuilt.set_bold_names(kept);
+        assert!(rebuilt.bold_names().contains("CH1"), "重建后应保留加粗");
     }
 
     #[test]

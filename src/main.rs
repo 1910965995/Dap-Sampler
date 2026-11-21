@@ -532,8 +532,12 @@ fn cmd_sample(
     if addresses.is_empty() {
         anyhow::bail!("at least one memory address is required");
     }
-    if addresses.len() > 8 {
-        anyhow::bail!("at most 8 variables supported, got: {}", addresses.len());
+    if addresses.len() > dap_sampler::pipeline::sample::MAX_VALUES {
+        anyhow::bail!(
+            "at most {} variables supported, got: {}",
+            dap_sampler::pipeline::sample::MAX_VALUES,
+            addresses.len()
+        );
     }
 
     println!("\u{1f50c} Connecting to DAP-Link...");
@@ -662,8 +666,12 @@ fn cmd_gui(
             .map(|s| parse_address(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        if addresses.len() > 8 {
-            anyhow::bail!("at most 8 variables supported, got: {}", addresses.len());
+        if addresses.len() > dap_sampler::pipeline::sample::MAX_VALUES {
+            anyhow::bail!(
+                "at most {} variables supported, got: {}",
+                dap_sampler::pipeline::sample::MAX_VALUES,
+                addresses.len()
+            );
         }
         addresses
     } else {

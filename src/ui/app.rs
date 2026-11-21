@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use crate::pipeline::sample::Sample;
 use crate::pipeline::sample::ValueType;
+use crate::pipeline::sample::MAX_VALUES;
 use crate::pipeline::engine::{PipelineEngine, PipelineHandle, PipelineNotice};
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
@@ -26,8 +27,9 @@ struct WarningPopup {
     message: String,
 }
 
-/// 示波器风格通道色板（v1.1.0 配色：红/绿/蓝/橙/品红/青/灰/粉）
-const CHANNEL_COLORS: [egui::Color32; 8] = [
+/// 示波器风格通道色板（v1.1.0 配色：红/绿/蓝/橙/品红/青/灰/粉；
+/// v1.4.x 扩至 16 色以覆盖 16 通道上限：紫/黄绿/青绿/棕/玫红/深蓝/橄榄/炭黑）
+const CHANNEL_COLORS: [egui::Color32; 16] = [
     egui::Color32::from_rgb(255, 68, 68),   // 红
     egui::Color32::from_rgb(68, 255, 68),   // 绿
     egui::Color32::from_rgb(68, 68, 255),   // 蓝
@@ -36,10 +38,24 @@ const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(68, 255, 255),  // 青
     egui::Color32::from_rgb(180, 180, 180), // 灰
     egui::Color32::from_rgb(255, 150, 150), // 粉
+    egui::Color32::from_rgb(130, 80, 255),  // 紫
+    egui::Color32::from_rgb(140, 220, 30),  // 黄绿
+    egui::Color32::from_rgb(0, 150, 136),   // 青绿
+    egui::Color32::from_rgb(140, 90, 40),   // 棕
+    egui::Color32::from_rgb(220, 40, 120),  // 玫红
+    egui::Color32::from_rgb(40, 90, 200),   // 深蓝
+    egui::Color32::from_rgb(140, 140, 40),  // 橄榄
+    egui::Color32::from_rgb(60, 60, 60),    // 炭黑
 ];
 
 /// 连接类故障的排障建议（仅随 USB/SWD 连接失败类错误显示）
 const CONNECTION_HINT: &str = "Note: Check that the DAP-Link is connected, the WinUSB driver is installed, the device is not occupied by Keil/OpenOCD/pyOCD or other programs, the target board is powered, and the SWD wiring is correct; or try a lower SWD clock.";
+
+/// 侧栏分节间可拖拽分隔条的交互厚度（px，细线居中绘制）
+const SIDEBAR_HANDLE_H: f32 = 8.0;
+
+/// 侧栏分节的最小高度（px，仅保留标题行；分隔条拖拽的下限，无上限）
+const SIDEBAR_MIN_PANE: f32 = 24.0;
 
 /// 统一浅色主题与滚动条风格（每帧应用，覆盖 egui 默认值）
 ///
@@ -57,6 +73,10 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(246);
     visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(236);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(236);
+    // CollapsingHeader 展开体（Variables/Channels/Cursor）左侧的缩进参考
+    // 竖线：egui 0.31 默认开启（indent_has_left_vline），界面扁平风格下
+    // 显得杂乱，去掉
+    visuals.indent_has_left_vline = false;
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
         style.spacing.scroll = egui::style::ScrollStyle {
@@ -73,6 +93,36 @@ fn apply_theme(ctx: &egui::Context) {
             ..egui::style::ScrollStyle::floating()
         };
     });
+}
+
+/// 侧栏分节之间的可拖拽分隔条
+///
+/// `SIDEBAR_HANDLE_H` 高的交互条，居中画一条细灰线；悬停/拖动时加粗加深
+/// 并显示垂直缩放光标。返回本帧的纵向拖拽增量（px，向下为正）。
+fn sidebar_splitter(ui: &mut egui::Ui) -> f32 {
+    let size = egui::vec2(ui.available_width(), SIDEBAR_HANDLE_H);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let active = resp.hovered() || resp.dragged();
+    if ui.is_rect_visible(rect) {
+        let (color, width) = if active {
+            (egui::Color32::from_gray(150), 2.5)
+        } else {
+            (egui::Color32::from_gray(210), 1.5)
+        };
+        let y = rect.center().y;
+        ui.painter().line_segment(
+            [egui::pos2(rect.left() + 2.0, y), egui::pos2(rect.right() - 2.0, y)],
+            egui::Stroke::new(width, color),
+        );
+    }
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if resp.dragged() {
+        resp.drag_delta().y
+    } else {
+        0.0
+    }
 }
 
 /// DAP Sampler 主应用
@@ -98,10 +148,10 @@ pub struct DapSamplerApp {
     channel_panel: ChannelPanel,
     /// Watch 面板（示波器下方）
     watch_panel: WatchPanel,
-    /// 左侧面板各模块的展开/收起状态
-    var_browser_open: bool,
-    channels_open: bool,
-    cursor_open: bool,
+    /// 侧栏 Variables 分节高度（px，<=0 表示未初始化，首帧按比例分配）
+    sidebar_var_height: f32,
+    /// 侧栏 Channels 分节高度（px，<=0 表示未初始化，首帧按比例分配）
+    sidebar_channels_height: f32,
     #[allow(dead_code)]
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
@@ -360,9 +410,8 @@ impl DapSamplerApp {
             variable_browser: VariableBrowser::new(),
             channel_panel,
             watch_panel,
-            var_browser_open: true,
-            channels_open: true,
-            cursor_open: true,
+            sidebar_var_height: 0.0,
+            sidebar_channels_height: 0.0,
             manual_channel_names,
             manual_value_types,
             rate_hz,
@@ -408,6 +457,11 @@ impl DapSamplerApp {
         } else {
             ui.visuals().text_color()
         };
+        // egui 的 TopDown 布局对普通控件不应用 main_align（初始游标把主轴
+        // 延伸到无穷），固定 24px 栏高下文字贴顶。手动把标签行垂直居中：
+        // 偏移 = (可用高度 - 行高) / 2，水平仍保持面板默认的左对齐
+        let label_h = ui.text_style_height(&egui::TextStyle::Body);
+        ui.add_space(((ui.available_height() - label_h) * 0.5).max(0.0));
         let label =
             ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).truncate());
         // 被截断时悬停显示完整消息；仅连接类错误附带排障建议
@@ -428,7 +482,7 @@ impl DapSamplerApp {
         }
     }
 
-    /// 通道数上限弹窗（勾选超过 8 个变量时）
+    /// 通道数上限弹窗（勾选超过 16 个变量时）
     ///
     /// 底部红字容易被忽略，用居中弹窗明确告知被拒绝的变量。
     /// 右上角 X 关闭；vscroll(false) 防止内容区撑高窗口。
@@ -1343,7 +1397,7 @@ impl DapSamplerApp {
     /// 分配尾部颜色——4 通道（红绿蓝黄）删掉第一个后再添加，count=3
     /// 仍取第 4 色，与现存通道撞色。按未占用色选取还天然复用被释放
     /// 的颜色：删除红色后，新通道优先拿回红色。
-    /// 兜底分支仅在通道数超过调色板长度时才会走到（当前上限 8 =
+    /// 兜底分支仅在通道数超过调色板长度时才会走到（当前上限 16 =
     /// 调色板长度，正常不可达），此时退回按数量取模。
     fn pick_channel_color(&self) -> egui::Color32 {
         let used: Vec<egui::Color32> = self
@@ -1368,7 +1422,7 @@ impl DapSamplerApp {
             if is_checked {
                 if !self.channel_panel.has_channel(&path) {
                     let ch_count = self.channel_panel.channel_count();
-                    if ch_count >= 8 {
+                    if ch_count >= MAX_VALUES {
                         // 回滚勾选状态，保持 UI 与真实通道数一致
                         self.variable_browser.checked_paths.remove(&path);
                         rejected.push(path);
@@ -1399,15 +1453,15 @@ impl DapSamplerApp {
             // 状态栏：单行，超宽由 Label::truncate 显示省略号。
             // set_error 会先弹通用错误弹窗，下面再用专属弹窗覆盖
             self.set_error(format!(
-                "Only 8 channels can be watched at a time. {}: {}",
-                label, names
+                "Only {} channels can be watched at a time. {}: {}",
+                MAX_VALUES, label, names
             ));
             // 专属弹窗：多行，信息完整
             self.warning_popup = Some(WarningPopup {
                 title: "Channel Limit",
                 message: format!(
-                    "Only 8 channels can be watched at a time.\n{}: {}",
-                    label, names
+                    "Only {} channels can be watched at a time.\n{}: {}",
+                    MAX_VALUES, label, names
                 ),
             });
         }
@@ -1798,7 +1852,11 @@ impl eframe::App for DapSamplerApp {
             .exact_height(24.0)
             .show(ctx, |ui| self.status_bar_ui(ui));
 
-        // ---- 左侧面板：变量浏览器 + 通道 + 光标（可展开/收起）----
+        // ---- 左侧面板：变量浏览器 + 通道 + 光标 ----
+        // 三个分节的高度由两条可拖拽分隔条调整（见 sidebar_splitter）。
+        // 分隔条 k 只调整其上方分节的高度且无上限：下拉时下方内容顺次
+        // 下移，总高超出面板高度后由侧栏整体滚动（外层 ScrollArea 延伸）。
+        // 各分节内容超出自身高度时在分节内部滚动。
         egui::SidePanel::left("sidebar")
             .resizable(true)
             .default_width(220.0)
@@ -1808,15 +1866,35 @@ impl eframe::App for DapSamplerApp {
                     .id_salt("sidebar_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // --- 变量浏览器模块 ---
-                        egui::CollapsingHeader::new("Variables")
-                            .default_open(self.var_browser_open)
-                            .id_salt("var_browser_header")
-                            .show(ui, |ui| {
-                                let changes = self.variable_browser.show(
-                                    ui,
-                                    self.elf_ctx.as_ref(),
-                                );
+                        let sp = ui.spacing().item_spacing.y;
+                        // 分节间共 4 个 item_spacing 间隙 + 2 条分隔条
+                        let chrome = 2.0 * SIDEBAR_HANDLE_H + 4.0 * sp;
+                        let total = ui.available_height();
+                        // 首帧按比例初始化：Variables 45% / Channels 35% / Cursor 余下
+                        if self.sidebar_var_height <= 0.0
+                            || self.sidebar_channels_height <= 0.0
+                        {
+                            self.sidebar_var_height = total * 0.45;
+                            self.sidebar_channels_height = total * 0.35;
+                        }
+                        if total < SIDEBAR_MIN_PANE * 2.0 + chrome {
+                            // 窗口过小时初始比例没有意义，退化为最小高度
+                            self.sidebar_var_height = self.sidebar_var_height.max(SIDEBAR_MIN_PANE);
+                            self.sidebar_channels_height = self.sidebar_channels_height.max(SIDEBAR_MIN_PANE);
+                        }
+
+                        // --- 变量浏览器 ---
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), self.sidebar_var_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // allocate_ui_with_layout 内容不满时只分配
+                                // min_rect，这里强制撑满分节高度，分隔条才不漂移
+                                ui.set_min_height(self.sidebar_var_height);
+                                ui.strong("Variables");
+                                let changes = self
+                                    .variable_browser
+                                    .show(ui, self.elf_ctx.as_ref());
                                 if !changes.is_empty() {
                                     // 采集中通道集合被引擎快照固定：增删会破坏
                                     // Watch 行与采样数据的对应关系，必须先停止
@@ -1826,24 +1904,38 @@ impl eframe::App for DapSamplerApp {
                                         self.apply_variable_changes(changes);
                                     }
                                 }
-                            });
+                            },
+                        );
 
-                        ui.separator();
+                        // --- 分隔条 1：调整 Variables 高度 ---
+                        // 只改上方分节、无上限：下拉把下方内容顺次推下，
+                        // 总高超出面板时侧栏整体滚动延伸
+                        let dy = sidebar_splitter(ui);
+                        if dy != 0.0 {
+                            self.sidebar_var_height =
+                                (self.sidebar_var_height + dy).max(SIDEBAR_MIN_PANE);
+                        }
 
-                        // --- 通道模块 ---
-                        egui::CollapsingHeader::new(
-                            format!("Channels ({}/8)", self.channel_panel.channel_count())
-                        )
-                            .default_open(self.channels_open)
-                            .id_salt("channels_header")
-                            .show(ui, |ui| {
-                                let action = self.channel_panel.show(ui, self.selected_channel);
+                        // --- 通道 ---
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), self.sidebar_channels_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_height(self.sidebar_channels_height);
+                                ui.strong(format!(
+                                    "Channels ({}/{})",
+                                    self.channel_panel.channel_count(),
+                                    MAX_VALUES
+                                ));
+                                let action =
+                                    self.channel_panel.show(ui, self.selected_channel);
                                 if let Some(idx) = action.select {
-                                    self.selected_channel = if self.selected_channel == Some(idx) {
-                                        None
-                                    } else {
-                                        Some(idx)
-                                    };
+                                    self.selected_channel =
+                                        if self.selected_channel == Some(idx) {
+                                            None
+                                        } else {
+                                            Some(idx)
+                                        };
                                 }
                                 if let Some(remove_idx) = action.remove {
                                     // 采集中通道集合被引擎快照固定：删除会使
@@ -1853,7 +1945,10 @@ impl eframe::App for DapSamplerApp {
                                             "Stop acquisition before removing channels",
                                         );
                                     } else {
-                                        let name = self.channel_panel.channels[remove_idx].name.clone();
+                                        let name = self.channel_panel.channels
+                                            [remove_idx]
+                                            .name
+                                            .clone();
                                         self.variable_browser.checked_paths.remove(&name);
                                         self.channel_panel.remove_channel(remove_idx);
                                         if let Some(sel) = self.selected_channel {
@@ -1863,23 +1958,51 @@ impl eframe::App for DapSamplerApp {
                                                 self.selected_channel = Some(sel - 1);
                                             }
                                         }
-                                        let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
-                                        let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+                                        let names: Vec<String> = self
+                                            .channel_panel
+                                            .channels
+                                            .iter()
+                                            .map(|c| c.name.clone())
+                                            .collect();
+                                        let types: Vec<ValueType> = self
+                                            .channel_panel
+                                            .channels
+                                            .iter()
+                                            .map(|c| c.value_type)
+                                            .collect();
                                         let addresses = self.collect_channel_addresses();
-                                        self.watch_panel.sync_from_channels(&names, &types, &addresses);
+                                        self.watch_panel.sync_from_channels(
+                                            &names, &types, &addresses,
+                                        );
                                     }
                                 }
-                            });
+                            },
+                        );
 
-                        ui.separator();
+                        // --- 分隔条 2：调整 Channels 高度（无上限，同上）---
+                        let dy = sidebar_splitter(ui);
+                        if dy != 0.0 {
+                            self.sidebar_channels_height =
+                                (self.sidebar_channels_height + dy).max(SIDEBAR_MIN_PANE);
+                        }
 
-                        // --- 光标模块 ---
-                        egui::CollapsingHeader::new("Cursor")
-                            .default_open(self.cursor_open)
-                            .id_salt("cursor_header")
-                            .show(ui, |ui| {
+                        // --- 光标：占余下高度，至少保留标题行 ---
+                        // H1+H2 超出面板时余量为负，Cursor 随内容被推到
+                        // 视区外，由侧栏滚动条延伸展示
+                        let cursor_h = (total
+                            - self.sidebar_var_height
+                            - self.sidebar_channels_height
+                            - chrome)
+                            .max(SIDEBAR_MIN_PANE);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), cursor_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_height(cursor_h);
+                                ui.strong("Cursor");
                                 self.show_cursor_info(ui);
-                            });
+                            },
+                        );
                     });
             });
 
@@ -2376,33 +2499,35 @@ mod channel_limit_tests {
     }
 
     #[test]
-    fn ninth_check_is_rejected_and_rolled_back() {
-        // 前 8 个正常加入通道
+    fn over_limit_check_is_rejected_and_rolled_back() {
+        // 前 MAX_VALUES 个正常加入通道
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
-        assert_eq!(app.channel_panel.channel_count(), 8);
-        assert!(!app.status_is_error, "8 个以内不应报错");
+        app.apply_variable_changes(first_n);
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES);
+        assert!(!app.status_is_error, "上限以内不应报错");
 
-        // 第 9 个必须被拒绝：通道数不变
-        app.apply_variable_changes(vec![("var8".to_string(), true)]);
+        // 第 MAX_VALUES+1 个必须被拒绝：通道数不变
+        let overflow_name = format!("var{}", MAX_VALUES);
+        app.apply_variable_changes(vec![(overflow_name.clone(), true)]);
         assert_eq!(
             app.channel_panel.channel_count(),
-            8,
-            "第 9 个通道不得加入"
+            MAX_VALUES,
+            "超出上限的通道不得加入"
         );
         // 勾选状态必须回滚，否则 UI 显示已勾选但实际没通道
         assert!(
-            !app.variable_browser.checked_paths.contains("var8"),
+            !app.variable_browser.checked_paths.contains(&overflow_name),
             "被拒绝的变量必须回滚勾选状态"
         );
         // 必须有明确提示
         assert!(app.status_is_error, "超限勾选必须给出错误提示");
+        let limit_msg = format!("Only {} channels", MAX_VALUES);
         let status = app.status_text.as_deref().unwrap_or("");
         assert!(
-            status.contains("Only 8 channels") && status.contains("Unselected channel variable"),
+            status.contains(&limit_msg) && status.contains("Unselected channel variable"),
             "状态栏应说明通道上限与被取消的变量，实际 {:?}",
             app.status_text
         );
@@ -2415,7 +2540,7 @@ mod channel_limit_tests {
         // 弹窗多行，且列出被拒变量
         let popup = app.warning_popup.as_ref().map(|w| w.message.as_str()).unwrap_or("");
         assert!(
-            popup.contains("Only 8 channels") && popup.contains("var8"),
+            popup.contains(&limit_msg) && popup.contains(&overflow_name),
             "弹窗应列出被拒绝的变量，实际 {:?}",
             app.warning_popup
         );
@@ -2440,10 +2565,10 @@ mod channel_limit_tests {
     #[test]
     fn status_bar_truncates_while_popup_wraps() {
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
+        app.apply_variable_changes(first_n);
         // 用超长变量名确保单行必定放不下
         let long_name = "SystemCoreClockWithAnExtremelyLongVariableNameForTesting";
         app.apply_variable_changes(vec![(long_name.to_string(), true)]);
@@ -2502,10 +2627,10 @@ mod channel_limit_tests {
     fn rejection_message_pluralizes_multiple_variables() {
         // 一次勾选多个超限变量时，文案用复数形式
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
+        app.apply_variable_changes(first_n);
         let extra: Vec<(String, bool)> = (0..2)
             .map(|i| (format!("extra{i}"), true))
             .collect();
@@ -2523,19 +2648,20 @@ mod channel_limit_tests {
     #[test]
     fn unchecking_frees_a_slot() {
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
+        app.apply_variable_changes(first_n);
 
         // 取消一个 → 腾出位置
         app.apply_variable_changes(vec![("var0".to_string(), false)]);
-        assert_eq!(app.channel_panel.channel_count(), 7);
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES - 1);
 
-        // 现在第 9 个可以正常加入
-        app.apply_variable_changes(vec![("var8".to_string(), true)]);
-        assert_eq!(app.channel_panel.channel_count(), 8);
-        assert!(app.variable_browser.checked_paths.contains("var8"));
+        // 现在超出上限的新变量可以正常加入
+        let new_var = format!("var{}", MAX_VALUES);
+        app.apply_variable_changes(vec![(new_var.clone(), true)]);
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES);
+        assert!(app.variable_browser.checked_paths.contains(&new_var));
         assert!(!app.status_is_error, "腾出位置后不应报错");
         assert!(
             app.warning_popup.is_none(),
@@ -2612,25 +2738,25 @@ mod channel_limit_tests {
 
     #[test]
     fn batch_add_colors_are_distinct() {
-        // 一次勾选多个变量时逐个取未占用色，不得重复
+        // 一次勾选满额通道时逐个取未占用色，不得重复（覆盖全部 16 色）
         let mut app = make_app();
-        let batch: Vec<(String, bool)> = (0..8)
+        let batch: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
         app.apply_variable_changes(batch);
-        assert_eq!(app.channel_panel.channel_count(), 8);
-        assert_colors_all_distinct(&app, "一次加入 8 个");
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES);
+        assert_colors_all_distinct(&app, &format!("一次加入 {} 个", MAX_VALUES));
     }
 
     #[test]
     fn applying_popup_dismissal_clears_warning() {
         // 弹窗内容为 None 时不渲染；用户点 OK / X 后应清空
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
-        app.apply_variable_changes(vec![("var9".to_string(), true)]);
+        app.apply_variable_changes(first_n);
+        app.apply_variable_changes(vec![(format!("var{}", MAX_VALUES), true)]);
         assert!(app.warning_popup.is_some());
 
         // 模拟关闭
@@ -2643,24 +2769,25 @@ mod channel_limit_tests {
         // 回归：运行态勾选变更只发底部红字——复选框不回滚（勾上了但实际
         // 没采）、也没有弹窗提醒，与通道超限的提醒强度不一致
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
-        assert_eq!(app.channel_panel.channel_count(), 8);
+        app.apply_variable_changes(first_n);
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES);
 
         // 模拟运行态：渲染层点击已先行翻转 checked_paths，随后上报变更
         app.controls.state = AcquisitionState::Running;
-        app.variable_browser.checked_paths.insert("var8".to_string());
-        app.reject_variable_changes_while_running(&[("var8".to_string(), true)]);
+        let new_var = format!("var{}", MAX_VALUES);
+        app.variable_browser.checked_paths.insert(new_var.clone());
+        app.reject_variable_changes_while_running(&[(new_var.clone(), true)]);
 
         // 勾选状态必须回滚
         assert!(
-            !app.variable_browser.checked_paths.contains("var8"),
+            !app.variable_browser.checked_paths.contains(&new_var),
             "运行态勾选必须回滚复选框状态"
         );
         // 通道集合不变
-        assert_eq!(app.channel_panel.channel_count(), 8);
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES);
         // 状态栏：单行错误提示
         assert!(app.status_is_error, "运行态变更必须给出错误提示");
         let status = app.status_text.as_deref().unwrap_or("");
@@ -2674,7 +2801,7 @@ mod channel_limit_tests {
         let popup = app.warning_popup.as_ref().expect("运行态拒绝必须弹窗");
         assert_eq!(popup.title, "Acquisition Running");
         assert!(
-            popup.message.contains("Stop acquisition") && popup.message.contains("var8"),
+            popup.message.contains("Stop acquisition") && popup.message.contains(&new_var),
             "弹窗应说明原因并列出变量，实际 {:?}",
             popup.message
         );
@@ -2685,10 +2812,10 @@ mod channel_limit_tests {
     fn running_uncheck_is_rolled_back_too() {
         // 运行态取消勾选同样是结构性变更：通道保留，复选框恢复勾选
         let mut app = make_app();
-        let first8: Vec<(String, bool)> = (0..8)
+        let first_n: Vec<(String, bool)> = (0..MAX_VALUES)
             .map(|i| (format!("var{i}"), true))
             .collect();
-        app.apply_variable_changes(first8);
+        app.apply_variable_changes(first_n);
         assert!(app.variable_browser.checked_paths.contains("var0"));
 
         app.controls.state = AcquisitionState::Running;
@@ -2700,7 +2827,7 @@ mod channel_limit_tests {
             app.variable_browser.checked_paths.contains("var0"),
             "运行态取消勾选必须回滚复选框状态"
         );
-        assert_eq!(app.channel_panel.channel_count(), 8, "通道不得被移除");
+        assert_eq!(app.channel_panel.channel_count(), MAX_VALUES, "通道不得被移除");
         assert!(app.warning_popup.is_some(), "运行态拒绝必须弹窗");
     }
 }
@@ -3059,7 +3186,10 @@ mod status_theme_tests {
         // 通道超限这类 UI 错误不带连接排障建议——「检查 DAP-Link 连接」
         // 对它们毫无意义，无差别拼接会误导排查方向（用户报告）
         let mut app = make_app();
-        app.set_error("Only 8 channels can be watched at a time. Unselected channel variable: s_uartIrqId[1]");
+        app.set_error(format!(
+            "Only {} channels can be watched at a time. Unselected channel variable: s_uartIrqId[1]",
+            MAX_VALUES
+        ));
         let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
         assert!(
             !tip.contains("Note:") && !tip.contains("DAP-Link"),
@@ -3086,7 +3216,10 @@ mod status_theme_tests {
         let tip = app.status_tooltip(app.status_text.as_deref().unwrap());
         assert!(!tip.contains("Note:"));
 
-        app.set_error("Only 8 channels can be watched at a time");
+        app.set_error(format!(
+            "Only {} channels can be watched at a time",
+            MAX_VALUES
+        ));
         assert!(app.status_hint.is_none(), "set_error 应清掉旧建议");
     }
 

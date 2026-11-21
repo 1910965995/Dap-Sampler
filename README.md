@@ -15,7 +15,7 @@
 | `read <addr>` | 读取 32 位内存值，支持 `--float` 解析为浮点 |
 | `write <addr> --value <v>` | 写入内存值，支持 u32（hex/dec）和 float 类型 |
 | `monitor <addr>` | 连续监视单个变量，可指定采样率和次数 |
-| `sample --addresses ...` | 高速流水线采样，支持最多 8 个变量，输出 CSV |
+| `sample --addresses ...` | 高速流水线采样，支持最多 16 个变量，输出 CSV |
 | `gui` | 启动 GUI 可视化界面（默认行为，双击 exe 即启动） |
 
 ### GUI 可视化
@@ -114,7 +114,7 @@ cargo test
 ## 已知限制
 
 - 仅支持 CMSIS-DAP v2（Bulk 传输），不支持 v1（HID）
-- 单次最多 8 个变量
+- 单次最多 16 个变量
 - 采样率上限 100 kHz
 - 目标 MCU 开启读保护（RDP）时无法访问
 

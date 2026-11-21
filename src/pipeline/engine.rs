@@ -21,6 +21,13 @@ use super::ring_buffer::RingBuffer;
 /// 典型 packet_size (512/1024)。同时避免 total_requests as u8 截断。
 const MAX_TRANSFER_REQUESTS: usize = 64;
 
+/// 每周期为交互式写入预留的请求数
+///
+/// 读取块若占满 MAX_TRANSFER_REQUESTS，写入预算 max_writes = 0，用户的
+/// 交互写入（Watch 面板）将永远排队得不到执行——静默故障。预留 4 条
+/// 恰好容纳一条最宽的 64 位写入（写 TAR + 写 DRW × 2 字）。
+const WRITE_BUDGET_REQUESTS: usize = 4;
+
 /// 在途命令数上限（背压控制）
 ///
 /// 提交线程最多领先接收线程 MAX_IN_FLIGHT 条命令。当 DAP-Link 吞吐不足
@@ -40,6 +47,36 @@ const MAX_IN_FLIGHT: usize = 4;
 /// 访问会重复命中同一地址（64 位变量的高字恒等于低字）。
 fn read_block_requests(accesses: &[MemAccess]) -> usize {
     accesses.iter().map(|a| 2 * a.words as usize).sum()
+}
+
+/// 校验采样配置能否安全编码进流水线（启动前调用，返回明确错误）
+///
+/// 两条硬约束，违反任一都会产生静默故障而非显式报错：
+/// - 变量数 > [`MAX_VALUES`]：`Sample.values` 是定长数组，`Sample::new`
+///   会静默截断超出的值——波形上通道永远是一条平线却看不出原因
+/// - 读块请求数超过预算：DAP_Transfer 的计数字段是 u8，且命令总长受
+///   USB 端点包大小限制（MAX_TRANSFER_REQUESTS 已是保守值）；同时为
+///   交互式写入预留 WRITE_BUDGET_REQUESTS 条，否则写入永久饿死
+///
+/// 旧实现只有线程内的 debug_assert!（release 下编译剔除），超限时
+/// 命令直接损坏且无任何提示。
+fn validate_config(accesses: &[MemAccess]) -> Result<()> {
+    if accesses.len() > MAX_VALUES {
+        return Err(Error::Other(format!(
+            "Too many sampling variables: {} requested, max {} (sample slots would be silently truncated)",
+            accesses.len(),
+            MAX_VALUES
+        )));
+    }
+    let requests = read_block_requests(accesses);
+    let max_read_requests = MAX_TRANSFER_REQUESTS - WRITE_BUDGET_REQUESTS;
+    if requests > max_read_requests {
+        return Err(Error::Other(format!(
+            "Sampling variables need {} transfer requests per cycle, exceeding the {}-request budget ({} reserved for interactive writes). Remove some channels or use narrower variable types",
+            requests, max_read_requests, WRITE_BUDGET_REQUESTS
+        )));
+    }
+    Ok(())
 }
 
 /// 读取块的请求类型序列（true = AP 读，false = 写）
@@ -194,7 +231,8 @@ impl PipelineEngine {
     /// 从已初始化的 SWD 链路创建流水线引擎
     ///
     /// `usb` 和 `dap` 来自 `SwdLink::into_parts()`。
-    /// `addresses` 是一组目标内存地址（1-8 个），`types` 与之一一对应
+    /// `addresses` 是一组目标内存地址（1-[`MAX_VALUES`] 个，启动时经
+    /// [`validate_config`] 校验），`types` 与之一一对应
     /// （子字变量 u8/u16 按对齐整字读取后提取 lane）。
     /// `rate_hz` 是目标采样率。
     pub fn new(
@@ -253,6 +291,10 @@ impl PipelineEngine {
     ///
     /// `capacity`：环形缓冲容量（采样点数）
     pub fn start(&self, capacity: usize) -> Result<PipelineHandle> {
+        // 配置校验（变量数 / 读块请求预算）：超限必须显式报错，
+        // 而不是静默截断采样值或损坏 USB 命令
+        validate_config(&self.accesses)?;
+
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
         // 复位在途计数器
@@ -1190,6 +1232,52 @@ mod tests {
         let mixed: Vec<MemAccess> =
             [Float64, Float, Float, Float].iter().map(|t| MemAccess::from_addr_size(0, t.byte_size())).collect();
         assert_eq!(read_block_requests(&mixed), 2 * 2 + 3 * 2);
+    }
+
+    #[test]
+    fn validate_config_accepts_budget_fitting_configs() {
+        // 16 个 32 位变量 = 32 条请求；15 个 64 位变量 = 60 条请求，
+        // 恰好用满读块预算（64 - 4 条写预留）且留出每周期一条宽写入
+        let narrow: Vec<MemAccess> = (0..MAX_VALUES as u32)
+            .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 4, 4))
+            .collect();
+        assert_eq!(read_block_requests(&narrow), 32);
+        assert!(validate_config(&narrow).is_ok());
+
+        let wide: Vec<MemAccess> = (0..15u32)
+            .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 8, 8))
+            .collect();
+        assert_eq!(read_block_requests(&wide), 60);
+        assert!(validate_config(&wide).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_too_many_variables() {
+        // 17 个变量超过 MAX_VALUES：Sample 定长槽会静默截断，必须显式报错
+        let accesses: Vec<MemAccess> = (0..=(MAX_VALUES as u32))
+            .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 4, 4))
+            .collect();
+        let err = validate_config(&accesses).unwrap_err().to_string();
+        assert!(
+            err.contains("Too many sampling variables")
+                && err.contains(&MAX_VALUES.to_string()),
+            "错误信息应说明变量数上限，实际 {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_read_block_eating_write_budget() {
+        // 16 个 64 位变量 = 64 条请求：读块吃满 64 条会把每周期写预算
+        // 压到 0，交互式写入永远饿死——必须显式报错（读块上限实为 60 条）
+        let accesses: Vec<MemAccess> = (0..16u32)
+            .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 8, 8))
+            .collect();
+        assert_eq!(read_block_requests(&accesses), 64);
+        let err = validate_config(&accesses).unwrap_err().to_string();
+        assert!(
+            err.contains("exceeding the") && err.contains("interactive writes"),
+            "错误信息应说明请求预算与写预留，实际 {err:?}"
+        );
     }
 
     #[test]

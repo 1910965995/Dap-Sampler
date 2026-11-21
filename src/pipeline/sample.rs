@@ -93,8 +93,12 @@ impl ValueType {
     }
 }
 
-/// 单次采样支持的最大变量数（与上层 8 通道上限一致，见 main.rs/app.rs 校验）
-pub const MAX_VALUES: usize = 8;
+/// 单次采样支持的最大变量数（通道数上限的唯一权威定义，UI/CLI 校验引用它）
+///
+/// 16 个 32 位变量仅占 32 条 DAP_Transfer 请求，绰绰有余；全 64 位变量
+/// 每个占 4 条请求，须给交互写入留预算，实际上限 15 个（≤ 60 条）——
+/// 由 engine.rs 的 validate_config 在启动时校验并报错。
+pub const MAX_VALUES: usize = 16;
 
 /// 单次采样点（包含多个变量的读取值）
 ///

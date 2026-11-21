@@ -295,13 +295,6 @@ impl VariableBrowser {
         );
         ui.add_space(4.0);
 
-        // 统计信息
-        let total = ctx.variables.len();
-        let checked_count = self.checked_paths.len();
-        ui.label(format!("Variables: {}  Selected: {}", total, checked_count));
-
-        ui.separator();
-
         // ELF 变化 → 重建分组树缓存（一次性成本，后续帧直接复用）。
         // 判断用内容指纹：同路径重新编译（内容变）也能感知
         let key = Self::elf_content_key(ctx);
@@ -328,7 +321,7 @@ impl VariableBrowser {
         egui::ScrollArea::vertical()
             .id_salt("variable_scroll")
             .auto_shrink([false, true])
-            .max_height(400.0)
+            // 视口上限就是分节分配的高度（拖分隔条可调），不再写死 400px
             .show(ui, |ui| {
                 for (g, roots) in visible_groups {
                     ui.add_space(4.0);

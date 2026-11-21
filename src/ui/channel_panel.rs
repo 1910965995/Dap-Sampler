@@ -1,5 +1,5 @@
 use super::text::layout_elided;
-use crate::pipeline::sample::ValueType;
+use crate::pipeline::sample::{ValueType, MAX_VALUES};
 
 // ── 圆形图标按钮配色 ──
 const GREY_BG: egui::Color32 = egui::Color32::from_rgb(235, 237, 240);
@@ -138,6 +138,15 @@ impl ChannelPanel {
             .show(ui, |ui| {
                 for (i, ch) in self.channels.iter_mut().enumerate() {
                     let is_sel = selected == Some(i);
+                    // × 按钮贴右边界太近：右内边距加半个按钮间距，把眼睛/×
+                    // 按钮组整体左移 gap/2（gap = item_spacing.x）
+                    let half_gap = (ui.spacing().item_spacing.x * 0.5).round() as i8;
+                    let row_margin = egui::Margin {
+                        left: 2,
+                        right: 2 + half_gap,
+                        top: 1,
+                        bottom: 1,
+                    };
                     let frame = if is_sel {
                         egui::Frame::NONE
                             .fill(egui::Color32::from_rgba_unmultiplied(
@@ -147,9 +156,9 @@ impl ChannelPanel {
                                 40,
                             ))
                             .corner_radius(3.0)
-                            .inner_margin(egui::Margin::symmetric(2, 1))
+                            .inner_margin(row_margin)
                     } else {
-                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(2, 1))
+                        egui::Frame::NONE.inner_margin(row_margin)
                     };
 
                     frame.show(ui, |ui| {
@@ -240,8 +249,11 @@ impl ChannelPanel {
     }
 
     /// 添加通道
+    ///
+    /// 上限为 [`MAX_VALUES`]（Sample 的定长值槽数），超出时静默忽略；
+    /// UI 层在超限前已经给出明确报错，这里是兜底防线。
     pub fn add_channel(&mut self, name: String, color: egui::Color32, value_type: ValueType) {
-        if self.channels.len() < 8 {
+        if self.channels.len() < MAX_VALUES {
             self.channels.push(ChannelEntry {
                 name,
                 color,
@@ -453,6 +465,22 @@ mod tests {
         assert_eq!(p.channel_count(), 1);
         p.remove_channel(0);
         assert_eq!(p.channel_count(), 0);
+    }
+
+    #[test]
+    fn add_channel_respects_max_values_limit() {
+        // 上限与 Sample 定长值槽一致：超出 MAX_VALUES 的通道静默忽略
+        let mut p = ChannelPanel::new();
+        for i in 0..MAX_VALUES {
+            p.add_channel(format!("v{i}"), egui::Color32::RED, ValueType::Float);
+        }
+        assert_eq!(p.channel_count(), MAX_VALUES);
+        p.add_channel("overflow".to_string(), egui::Color32::RED, ValueType::Float);
+        assert_eq!(
+            p.channel_count(),
+            MAX_VALUES,
+            "超出 MAX_VALUES 的通道不得加入"
+        );
     }
 
     #[test]

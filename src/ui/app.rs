@@ -2687,7 +2687,8 @@ impl eframe::App for DapSamplerApp {
                 }
             });
 
-            // 波形
+            // 波形（与上方工具栏留出一点间距：分隔线移除后波形贴得太近）
+            ui.add_space(8.0);
             let buffer_offset = self.display_buf.oldest_seq();
             let wave_out = self.waveform.show(
                 ui,

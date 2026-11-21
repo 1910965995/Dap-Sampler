@@ -465,7 +465,19 @@ impl PipelineEngine {
                     let count_pos = cmd.len();
                     cmd.push(0u8); // 头部第 3 字节：实际请求数，末尾回填
 
-                    let words_guard = last_words.lock().ok();
+                    // 子字写入的旧值快照：只在有待写入时才取，且取完立刻放锁。
+                    // 此前这里是长命的 MutexGuard——一直活到循环体末尾（横跨
+                    // write_nonblock + spin_sleep 整个采样间隔）。采集线程每
+                    // 解析一条响应都要抢同一把锁保存原始对齐字，锁几乎全程
+                    // 被提交线程持有，采集线程只能靠调度器偶尔抢占拿到，解析
+                    // 吞吐掉到目标采样率的 70-80%，USB IN 端点随后堵塞、设备
+                    // 无法及时发布响应，实际采样率随之下降（v1.3.0 无此锁，
+                    // 无此问题）。快照只有 ≤16×12 字节，仅写入时克隆一次。
+                    let words_snapshot = if pending_writes.is_empty() {
+                        None
+                    } else {
+                        last_words.lock().ok().map(|g| g.clone())
+                    };
                     let mut n_requests = 0usize;
                     // 实际编码进命令的写请求数（TAR/DRW 各算一条）。
                     // 切帧必须用这个值：被跳过的写入不占请求。
@@ -535,7 +547,7 @@ impl PipelineEngine {
 
                         // 子字变量（u8/u16）：用最近一次采样的**原始整字**
                         // 合并，只覆盖本变量 lane，不踩相邻变量
-                        let last = words_guard
+                        let last = words_snapshot
                             .as_ref()
                             .and_then(|w| w.get(var_idx))
                             .copied()

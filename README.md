@@ -206,3 +206,7 @@ Dap-Sampler/
 - **P3**：egui GUI 实时波形显示，通道/游标/Follow 模式
 - **P4**：ELF/DWARF 变量浏览器、Watch 监视面板、UI 重构与性能优化
 - **v1.0.0**：增加 write 子命令、SWD 时钟可调、采样率上限扩至 100kHz、Windows 优化（无控制台弹出 + 圆角图标嵌入）
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。

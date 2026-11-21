@@ -1,4 +1,4 @@
-use egui_plot::{Line, Legend, Plot, PlotBounds, PlotPoint, Points};
+use egui_plot::{Line, Plot, PlotBounds, PlotPoint, Points};
 
 /// 波形 Plot 的 egui 内存键：用于跨帧读取图例点击产生的 hidden 集
 const WAVEFORM_PLOT_MEM_ID: &str = "waveform_plot_state";
@@ -71,6 +71,8 @@ pub struct WaveformPanel {
     display_mode: WaveformDisplayMode,
     /// 加粗通道名集合：图例点击切换（可多通道同时加粗），与可见性无关
     bold_names: std::collections::HashSet<String>,
+    /// 本帧悬停在图例上的通道名（None = 无悬停；悬停通道波形加粗预览）
+    hover_bold: Option<String>,
 }
 
 /// 波形渲染输出
@@ -116,6 +118,7 @@ impl WaveformPanel {
             auto_scroll: true,
             display_mode,
             bold_names: Default::default(),
+            hover_bold: None,
         }
     }
 
@@ -226,29 +229,11 @@ impl WaveformPanel {
         let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
 
-        // ---- 图例点击 → 加粗切换 ----
-        // Legend 配置空 hidden_items 覆盖（每帧把内存中的隐藏集重置为空，
-        // 曲线永不被隐藏）；点击图例项的瞬间该项会短暂进入内存中的
-        // hidden 集（仅持续一帧，下一帧即被覆盖重置），据此检测点击并
-        // 切换该通道的加粗状态。读完后立即清空，避免线被隐藏一帧闪烁。
-        if let Some(mut mem) =
-            egui_plot::PlotMemory::load(ui.ctx(), egui::Id::new(WAVEFORM_PLOT_MEM_ID))
-        {
-            for name in mem.hidden_items.iter() {
-                self.toggle_bold_by_name(name);
-            }
-            mem.hidden_items.clear();
-            mem.store(ui.ctx(), egui::Id::new(WAVEFORM_PLOT_MEM_ID));
-        }
+        // 图例为自绘 overlay（见 draw_legend）：内置 Legend 无法为「锁定
+        // 加粗」状态提供持久视觉标记，且悬停加粗/点击切换两套行为纠缠。
 
         let plot = Plot::new("waveform_plot")
             .id(egui::Id::new(WAVEFORM_PLOT_MEM_ID))
-            .legend(
-                Legend::default()
-                    .position(egui_plot::Corner::RightTop)
-                    // 空集覆盖：图例勾选恒为选中，点击不再隐藏曲线
-                    .hidden_items(Vec::<String>::new()),
-            )
             .show_grid(true)
             .show_axes(true)
             .x_axis_label(x_label)
@@ -333,7 +318,10 @@ impl WaveformPanel {
                 } else {
                     ch.color
                 };
-                let bold = self.bold_names.contains(&ch.name);
+                // 加粗 = 图例点击锁定；悬停图例时对 hovered 通道做同样的
+                // 加粗预览（hover_bold 由 draw_legend 每帧覆盖赋值）
+                let hover = self.hover_bold.as_deref() == Some(ch.name.as_str());
+                let bold = hover || self.bold_names.contains(&ch.name);
                 let line_w = if bold { 3.2 } else if is_sel { 2.8 } else { 1.4 };
                 let point_r = if bold { 3.0 } else if is_sel { 2.4 } else { 1.5 };
                 match self.display_mode {
@@ -385,10 +373,134 @@ impl WaveformPanel {
             }
         });
 
+        // 自绘图例（右上角悬浮）：点击锁定加粗、悬停预览加粗
+        self.draw_legend(ui, plot_response.response.rect);
+
         WaveformOutput {
             cursor_seq: clicked_seq,
             plot_rect: Some(plot_response.response.rect),
         }
+    }
+
+    /// 右上角悬浮图例（自绘，替代 egui_plot 内置 Legend）
+    ///
+    /// 每个通道一行：色点 + 通道名。
+    /// - 悬停：色点外圈高亮（与内置悬停观感一致），对应通道波形加粗预览
+    /// - 点击：**锁定**该状态——色点外圈持久保留（与悬停同款圆圈），波形
+    ///   持续加粗；再次点击解锁。锁定状态在图例中始终可见
+    ///
+    /// 悬停态通过 `hover_bold` 字段在下一帧生效（图例绘制在波形之后，
+    /// 一帧延迟对悬停预览无感知）。
+    fn draw_legend(&mut self, ui: &mut egui::Ui, plot_rect: egui::Rect) {
+        if self.channels.is_empty() {
+            self.hover_bold = None;
+            return;
+        }
+        let mut hovered: Option<String> = None;
+
+        egui::Area::new(ui.id().with("waveform_legend"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 6.0))
+            .constrain_to(plot_rect)
+            .show(ui.ctx(), |ui| {
+                // 与内置 Legend 相同的底框（半透明白底 + 窗口描边）
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                    .corner_radius(ui.style().visuals.window_corner_radius)
+                    .fill(ui.style().visuals.extreme_bg_color)
+                    .stroke(ui.style().visuals.window_stroke)
+                    .multiply_with_opacity(0.75)
+                    .show(ui, |ui| {
+                        // 先快照通道列表（循环内要可变借用 self 切换加粗）
+                        let entries: Vec<(String, egui::Color32)> = self
+                            .channels
+                            .iter()
+                            .map(|c| (c.name.clone(), c.color))
+                            .collect();
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let text_h = ui.text_style_height(&egui::TextStyle::Body);
+                        let icon = text_h.max(13.0);
+                        let gap = 6.0;
+                        let row_h = icon.max(text_h) + 4.0;
+
+                        // 预排版所有通道名 → 统一行宽：对齐由**等宽行**保证，
+                        // 不用 Align::Max 右对齐（top_down 布局的初始游标会把
+                        // min_rect 撑满整个可用宽度，底框被拉成全宽、内容前
+                        // 出现大片空白）
+                        let galleys: Vec<(std::sync::Arc<egui::Galley>, egui::Color32)> = entries
+                            .iter()
+                            .map(|(name, color)| {
+                                (
+                                    ui.painter().layout_no_wrap(
+                                        name.clone(),
+                                        egui::FontId::proportional(12.5),
+                                        egui::Color32::PLACEHOLDER,
+                                    ),
+                                    *color,
+                                )
+                            })
+                            .collect();
+                        let max_text_w = galleys
+                            .iter()
+                            .map(|(g, _)| g.size().x)
+                            .fold(0.0f32, f32::max);
+                        let row_w = icon + gap + max_text_w;
+
+                        for (galley, color) in &galleys {
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::click());
+                            let name = galley.text().to_string();
+                            let locked = self.bold_names.contains(&name);
+                            if resp.hovered() {
+                                hovered = Some(name.clone());
+                            }
+                            if resp.clicked() {
+                                self.toggle_bold_by_name(&name);
+                            }
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if !ui.is_rect_visible(rect) {
+                                continue;
+                            }
+
+                            // 色点：空闲时只有通道色实心圆（无圈无底）；悬停
+                            // 或锁定时才画外圈（底圆 + 悬停态描边），锁定 =
+                            // 持久的悬停外观。排布与内置 RightTop 图例一致
+                            // （label_on_the_left）：文字在左（右对齐到共同
+                            // 边界），色点列在右侧对齐
+                            let dot_center =
+                                egui::pos2(rect.right() - icon * 0.5, rect.center().y);
+                            if resp.hovered() || locked {
+                                ui.painter().add(egui::epaint::CircleShape {
+                                    center: dot_center,
+                                    radius: icon * 0.5,
+                                    fill: ui.visuals().widgets.hovered.bg_fill,
+                                    stroke: ui.visuals().widgets.hovered.bg_stroke,
+                                });
+                            }
+                            ui.painter().circle_filled(dot_center, icon * 0.4, *color);
+                            // 通道名（右对齐到色点左侧的共同边界）
+                            let text_color = if resp.hovered() {
+                                ui.style().interact(&resp).text_color()
+                            } else {
+                                ui.style().visuals.text_color()
+                            };
+                            let mut shape = egui::epaint::TextShape::new(
+                                egui::pos2(
+                                    rect.right() - icon - gap - galley.size().x,
+                                    rect.center().y - galley.size().y * 0.5,
+                                ),
+                                galley.clone(),
+                                text_color,
+                            );
+                            shape.override_text_color = Some(text_color);
+                            ui.painter().add(shape);
+                        }
+                    });
+            });
+        // 每帧整体覆盖：本帧悬停的通道名（None = 无悬停）
+        self.hover_bold = hovered;
     }
 
     /// 重建波形缓存
@@ -916,6 +1028,70 @@ mod tests {
         );
         rebuilt.set_bold_names(kept);
         assert!(rebuilt.bold_names().contains("CH1"), "重建后应保留加粗");
+    }
+
+    #[test]
+    fn legend_rows_render_without_overlap() {
+        // 自绘图例回归：每个通道一行（色点 + 名称），行间不重叠。
+        // 注意：egui Area 的第一帧是 sizing pass（绘制被丢弃），需先跑
+        // 一帧预热，第二帧才能收集到图例形状。
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0), ("Motor Current", 0.0, 1.0), ("温度", 0.0, 1.0)]);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let output = {
+            // 第一帧：Area sizing pass（输出被 egui 丢弃）
+            let _ = ctx.run(raw.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    panel.draw_legend(ui, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0)));
+                });
+            });
+            // 第二帧：正常绘制
+            ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    panel.draw_legend(ui, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0)));
+                });
+            })
+        };
+        let mut boxes: Vec<egui::Rect> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                boxes.push(egui::Rect::from_min_size(t.pos, t.galley.size()));
+            }
+        }
+        assert_eq!(boxes.len(), 3, "应绘制 3 个通道名");
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        for w in boxes.windows(2) {
+            assert!(
+                w[1].top() >= w[0].bottom(),
+                "图例行文字包围盒重叠: {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            boxes[0].width() < boxes[1].width(),
+            "行宽应随文本长度变化"
+        );
+        // 底框必须紧贴内容（曾被 Align::Max 初始游标撑成全宽，左侧出现
+        // 大片空白）。带描边的 Rect = 图例底框；CentralPanel 背景无描边
+        for clipped in &output.shapes {
+            if let egui::Shape::Rect(r) = &clipped.shape {
+                if r.stroke.width > 0.0 {
+                    assert!(
+                        r.rect.width() < 220.0,
+                        "图例底框应紧贴内容，不应被撑成全宽: {:?}",
+                        r.rect
+                    );
+                }
+            }
+        }
     }
 
     #[test]

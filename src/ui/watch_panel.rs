@@ -12,6 +12,7 @@ pub struct WriteRequest {
 }
 
 /// Watch 面板中显示的单个变量条目
+#[derive(Clone)]
 pub struct WatchEntry {
     /// 变量名（ELF 模式为 path，手工模式为 "CH1 0x..."）
     pub name: String,

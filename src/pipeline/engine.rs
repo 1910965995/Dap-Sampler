@@ -310,7 +310,7 @@ impl PipelineEngine {
             lw.clear();
         }
         // 排空 USB IN 端点残留响应（上一次运行的命令响应可能仍留在
-        // 端点缓冲中——Pause/Resume 复用同一 USB 句柄时尤其如此）。
+        // 端点缓冲中，同一设备被快速 Stop→Start 重连时尤其如此）。
         // 否则新会话会把旧响应当新数据消费，且写入数队列与响应失去
         // 对应关系，切帧从此错位。
         self.usb.flush_input();

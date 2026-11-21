@@ -5,15 +5,12 @@ pub enum AcquisitionState {
     Idle,
     /// 采集中
     Running,
-    /// 已暂停
-    Paused,
 }
 
 /// 用户操作命令
 #[derive(Debug, Clone, Copy)]
 pub enum AcquisitionCommand {
     Start,
-    Pause,
     Stop,
 }
 
@@ -62,30 +59,26 @@ impl ControlPanel {
         }
     }
 
-    /// 渲染采集控制按钮（Start/Pause/Stop），返回用户操作
+    /// 渲染采集控制按钮（Idle 显 Start，Running 显 Stop），返回用户操作
     ///
     /// 与参数输入分离，便于外部在按钮与参数之间插入其他控件（如 Follow）。
+    /// 不设 Pause：Stop 后波形冻结在屏上（下次 Start 才清空），重连 USB
+    /// 只需几百毫秒，暂停带来的状态区分与限制反成负担。
     pub fn show_buttons(&mut self, ui: &mut egui::Ui) -> Option<AcquisitionCommand> {
         let mut cmd = None;
 
         // --- 采集控制按钮 ---
         match self.state {
-            AcquisitionState::Idle | AcquisitionState::Paused => {
+            AcquisitionState::Idle => {
                 if ui.button("\u{25b6} Start").clicked() {
                     cmd = Some(AcquisitionCommand::Start);
                 }
             }
             AcquisitionState::Running => {
-                if ui.button("\u{23f8} Pause").clicked() {
-                    cmd = Some(AcquisitionCommand::Pause);
+                if ui.button("\u{23f9} Stop").clicked() {
+                    cmd = Some(AcquisitionCommand::Stop);
                 }
             }
-        }
-
-        if self.state != AcquisitionState::Idle
-            && ui.button("\u{23f9} Stop").clicked()
-        {
-            cmd = Some(AcquisitionCommand::Stop);
         }
 
         cmd
@@ -126,10 +119,6 @@ impl ControlPanel {
     /// 更新状态（由外部调用）
     pub fn set_running(&mut self) {
         self.state = AcquisitionState::Running;
-    }
-
-    pub fn set_paused(&mut self) {
-        self.state = AcquisitionState::Paused;
     }
 
     pub fn set_stopped(&mut self) {

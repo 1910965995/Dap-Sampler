@@ -86,6 +86,7 @@ fn paint_eye(painter: &egui::Painter, rect: egui::Rect, visible: bool) {
 }
 
 /// 通道面板中显示的通道信息
+#[derive(Clone)]
 pub struct ChannelEntry {
     pub name: String,
     pub color: egui::Color32,

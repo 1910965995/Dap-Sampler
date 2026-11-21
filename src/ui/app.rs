@@ -13,9 +13,9 @@ use super::waveform::{WaveformPanel, WaveformDisplayMode};
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
 use super::cursor::{CursorResult, CursorState};
 use super::variable_browser::VariableBrowser;
-use super::channel_panel::ChannelPanel;
-use super::watch_panel::WatchPanel;
-use crate::project::{ProjectFile, ProjectVariable, PROJECT_VERSION};
+use super::channel_panel::{ChannelPanel, ChannelEntry};
+use super::watch_panel::{WatchPanel, WatchEntry};
+use crate::project::{ProjectFile, ProjectScope, ProjectVariable, PROJECT_VERSION};
 
 /// Idle 状态下 ELF 文件变化检测的轮询间隔
 const ELF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -141,6 +141,84 @@ fn vertical_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     resp.clicked()
 }
 
+/// scope 标签条标签高度（px）
+const SCOPE_TAB_H: f32 = 22.0;
+
+/// 横向 scope 标签：文字水平书写，右侧带删除 ×（配色与左栏竖排标签同款）
+///
+/// 整签可点（切换 scope），双击进入改名，× 是**独立的子控件**（后注册，
+/// 命中优先于整签），点击删除 scope。
+///
+/// `id` 必须传 scope 的稳定 uid（而非布局序号自动 id）：egui 的点击判定
+/// 是「按下帧记录的控件 id，在松开帧按 id 匹配」，自动 id 随内容增删移位
+/// ——删除一个标签后下一个标签继承其 id，松开帧的 clicked 会落到错误
+/// 的标签上，甚至落到 "+" 按钮上（删最后一个 → 松开时 "+" 被点击 →
+/// 删掉又立即重建同名标签，表现为"关不掉"）。
+/// 返回 (单击, 双击, ×命中)。
+fn scope_tab(ui: &mut egui::Ui, id: egui::Id, label: &str, selected: bool) -> (bool, bool, bool) {
+    const PAD_X: f32 = 8.0;
+    const X_HIT: f32 = 16.0;
+    let font = egui::FontId::proportional(12.0);
+    let galley =
+        ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER);
+    let galley_w = galley.size().x;
+    let size = egui::vec2(galley_w + PAD_X * 2.0 + X_HIT, SCOPE_TAB_H);
+    // 只推进布局游标（hover 感知不参与点击），真正的交互响应用显式 id
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    // 整签交互（先注册，× 后注册覆盖其上，× 区域内的点击归 ×）
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    // × 子区域：独立控件，精确的按钮式点击语义
+    let x_center = egui::pos2(rect.right() - X_HIT * 0.5, rect.center().y);
+    let x_rect = egui::Rect::from_center_size(x_center, egui::vec2(X_HIT, SCOPE_TAB_H));
+    let x_resp = ui.interact(x_rect, id.with("close"), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let bg = if selected {
+            egui::Color32::from_gray(225)
+        } else if resp.hovered() {
+            egui::Color32::from_gray(240)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        if bg != egui::Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(4), bg);
+        }
+        let color = if selected {
+            egui::Color32::from_rgb(45, 48, 55)
+        } else if resp.hovered() {
+            egui::Color32::from_rgb(70, 74, 82)
+        } else {
+            egui::Color32::from_rgb(110, 118, 128)
+        };
+        // 文字垂直居中于标签矩形，左侧留出内边距
+        let text_pos = egui::pos2(rect.left() + PAD_X, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(text_pos, galley, color);
+
+        // 右侧小 ×：1px 矢量线段，悬停在 × 上时加深（与
+        // Channels 面板眼睛/× 按钮的矢量画法同一风格）
+        let x_color = if x_resp.hovered() {
+            egui::Color32::from_rgb(45, 48, 55)
+        } else {
+            color
+        };
+        let d = 3.0;
+        let stroke = egui::Stroke::new(1.0, x_color);
+        ui.painter().line_segment(
+            [egui::pos2(x_center.x - d, x_center.y - d), egui::pos2(x_center.x + d, x_center.y + d)],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [egui::pos2(x_center.x - d, x_center.y + d), egui::pos2(x_center.x + d, x_center.y - d)],
+            stroke,
+        );
+    }
+    if resp.hovered() || x_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // 只认真正的 click 事件：按下未松开（is_pointer_button_down_on）期间
+    // interact_pointer_pos 每帧都是 Some，若不做 clicked 门控会连删多个
+    (resp.clicked(), resp.double_clicked(), x_resp.clicked())
+}
+
 #[cfg(test)]
 mod sidebar_tab_tests {
     use super::*;
@@ -216,6 +294,65 @@ enum SidebarTab {
     Cursor,
 }
 
+/// 单个示波器 scope 的持久配置
+///
+/// 多 scope 共享 ELF 文件、Buffer capacity 与唯一的 DAP 连接；每个 scope
+/// 独立持有变量集（≤ MAX_VALUES）与 Rate/Window/SWD Clock/Display 参数。
+/// 同一时刻只有一个 scope 实际采样，因此引擎层完全复用单 scope 模型。
+///
+/// 数据存放约定：活动 scope 的变量勾选 / 通道 / Watch 行「活数据」就在
+/// `variable_browser.checked_paths` / `channel_panel.channels` /
+/// `watch_panel.entries` 三个面板字段里（所有现有逻辑零改动即作用于活动
+/// scope）；非活动 scope 的数据存档在各自 Scope 里，切换时双向拷贝搬运。
+struct Scope {
+    /// 创建时分配的自增 uid（标签控件 id 用它）
+    ///
+    /// egui 按布局序号生成自动 id：删除一个标签后，下一个标签会继承被删
+    /// 标签的 id，「松开鼠标那一帧的 clicked」就会落到错误的标签上（点
+    /// scope3 的 × 删掉 scope4、点最后一个 × 删掉又立即重建同名标签等）。
+    /// uid 与内容/位置无关、永不复用，彻底杜绝串扰。
+    id: u64,
+    /// 标签条显示名称（"Scope 1"，可重命名）
+    name: String,
+    /// 该 scope 勾选的 ELF 变量（与 variable_browser.checked_paths 同步）
+    checked_paths: std::collections::HashSet<String>,
+    /// 通道列表（≤ MAX_VALUES）
+    channels: Vec<ChannelEntry>,
+    /// Watch 表行（按 scope 隔离，切换时与 watch_panel.entries 互换）
+    watch_entries: Vec<WatchEntry>,
+    /// 采样率 (Hz)
+    rate_hz: u32,
+    /// 显示窗口大小（采样点数）
+    window_size: usize,
+    /// SWD 时钟 (MHz)
+    swd_clock_mhz: u32,
+    /// 波形显示模式
+    display_mode: WaveformDisplayMode,
+    /// 按名字覆盖的采样地址（打开工程选「使用工程地址」时生成；
+    /// None = 按 ELF 解析地址）
+    saved_addresses: Option<std::collections::HashMap<String, u32>>,
+}
+
+impl Scope {
+    /// 新建空 scope，参数取默认值（与新建工程一致：5000 Hz / 2000 点 / 1 MHz / Line）
+    ///
+    /// uid 为 0 占位，由 `DapSamplerApp::make_scope` 分配真实值。
+    fn new(name: String) -> Self {
+        Self {
+            id: 0,
+            name,
+            checked_paths: Default::default(),
+            channels: Vec::new(),
+            watch_entries: Vec::new(),
+            rate_hz: 5000,
+            window_size: 2000,
+            swd_clock_mhz: 1,
+            display_mode: WaveformDisplayMode::Line,
+            saved_addresses: None,
+        }
+    }
+}
+
 /// DAP Sampler 主应用
 pub struct DapSamplerApp {
     pipeline: Option<PipelineHandle>,
@@ -241,6 +378,16 @@ pub struct DapSamplerApp {
     watch_panel: WatchPanel,
     /// 侧栏当前选中的竖排标签分区
     sidebar_active_tab: SidebarTab,
+    /// 所有示波器 scope（多 scope 共享 ELF / Buffer capacity / DAP 连接）
+    scopes: Vec<Scope>,
+    /// 当前激活的 scope 索引（恒有 scopes.len() ≥ 1 且 active_scope < len）
+    active_scope: usize,
+    /// 正在改名的 scope（索引 + 编辑缓冲；None = 无改名进行中）
+    scope_rename: Option<(usize, String)>,
+    /// 改名编辑框是否需要在下一帧请求焦点（开始改名后的首帧置位）
+    scope_rename_needs_focus: bool,
+    /// 下一个 scope 的自增 uid（1 起；0 为占位值）
+    next_scope_uid: u64,
     #[allow(dead_code)]
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
@@ -266,6 +413,11 @@ pub struct DapSamplerApp {
     status_text: Option<String>,
     /// 状态消息是否为错误（错误显示红色）
     status_is_error: bool,
+    /// 状态消息是否为警告（黄色显示，不弹窗）
+    ///
+    /// 用于协议失步丢数据这类**自恢复**的非致命事件；错误（红）优先级
+    /// 更高，set_status / set_error 会清除警告态
+    status_is_warning: bool,
     /// 状态栏错误附带的排障建议（悬停时显示）
     ///
     /// 仅连接类错误（USB 打开失败、SWD 初始化失败、采集异常中止）设置，
@@ -483,6 +635,15 @@ impl DapSamplerApp {
             .and_then(|c| std::fs::metadata(&c.file_path).ok())
             .and_then(|m| m.modified().ok());
 
+        // 默认 scope（"Scope 1"）：参数取 CLI 注入值，与全局镜像保持一致
+        let mut default_scope = Scope::new("Scope 1".to_string());
+        default_scope.id = 1;
+        default_scope.rate_hz =
+            rate_hz.clamp(crate::ui::controls::RATE_MIN, crate::ui::controls::RATE_MAX);
+        default_scope.window_size = 2000;
+        default_scope.swd_clock_mhz = swd_clock_mhz;
+        default_scope.display_mode = display_mode;
+
         Self {
             pipeline: None,
             active_usb: None,  // USB 连接推迟到 Start 时建立
@@ -500,6 +661,11 @@ impl DapSamplerApp {
             channel_panel,
             watch_panel,
             sidebar_active_tab: SidebarTab::Variables,
+            scopes: vec![default_scope],
+            active_scope: 0,
+            scope_rename: None,
+            scope_rename_needs_focus: false,
+            next_scope_uid: 1,
             manual_channel_names,
             manual_value_types,
             rate_hz,
@@ -513,6 +679,7 @@ impl DapSamplerApp {
             // 启动时状态栏默认显示 Ready
             status_text: Some("Ready".to_string()),
             status_is_error: false,
+            status_is_warning: false,
             status_hint: None,
             selected_channel: None,
             project_path: None,
@@ -542,6 +709,9 @@ impl DapSamplerApp {
         };
         let color = if self.status_is_error {
             egui::Color32::from_rgb(0xff, 0x55, 0x55)
+        } else if self.status_is_warning {
+            // 警告用琥珀黄（与波形区"光标滑出缓冲"的警告色一致）
+            egui::Color32::from_rgb(0xc0, 0x82, 0x00)
         } else {
             ui.visuals().text_color()
         };
@@ -619,6 +789,7 @@ impl DapSamplerApp {
         log::error!("{}", message);
         self.status_text = Some(message.clone());
         self.status_is_error = true;
+        self.status_is_warning = false;
         // 每条新消息都不继承上一条的排障建议
         self.status_hint = hint.clone();
         let message = match hint {
@@ -637,6 +808,21 @@ impl DapSamplerApp {
         log::info!("{}", message);
         self.status_text = Some(message);
         self.status_is_error = false;
+        self.status_is_warning = false;
+        self.status_hint = None;
+    }
+
+    /// 记录一条警告消息（状态栏黄字，不弹窗）
+    ///
+    /// 用于协议失步丢数据这类**自恢复**的非致命事件：丢掉的是几个采样
+    /// 点，引擎随即重新对齐继续采样，弹窗打断操作不成比例；且失步可能
+    /// 连续发生，逐次弹窗会刷屏。
+    fn set_warning(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::warn!("{}", message);
+        self.status_text = Some(message);
+        self.status_is_error = false;
+        self.status_is_warning = true;
         self.status_hint = None;
     }
 
@@ -653,36 +839,21 @@ impl DapSamplerApp {
         self.last_project_variables = Vec::new();
         self.elf_mtime = None;
         self.stop_acquisition();
-        // 清空 ELF / 通道 / Watch / 手工模式
+        // 清空 ELF / 手工模式
         self.elf_ctx = None;
         self.variable_browser.clear();
-        self.channel_panel.channels.clear();
-        self.watch_panel.entries.clear();
-        self.watch_panel.reset_col_widths();
         self.manual_addresses.clear();
         self.manual_channel_names.clear();
         self.manual_value_types.clear();
-        self.current_addresses.clear();
-        self.current_names.clear();
-        self.current_types.clear();
-        // 参数回默认（与 DapSamplerApp::new 一致：5000 Hz / 2000 点 / 1 MHz / Line）
-        self.rate_hz = 5000;
-        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
-        self.window_size = 2000;
+        // 重置为单个默认空 scope：通道 / Watch / 参数全部回默认
+        // （与启动一致：5000 Hz / 2000 点 / 1 MHz / Line）
         self.buffer_capacity = crate::ui::controls::DEFAULT_BUFFER_CAPACITY;
-        self.controls.sample_rate = self.rate_hz;
-        self.controls.window_size = self.window_size;
-        self.controls.swd_clock_mhz = 1;
-        self.swd_clock_mhz = 1;
-        let mode = WaveformDisplayMode::Line;
-        self.display_mode = mode;
-        self.waveform = WaveformPanel::new(vec![], vec![], self.interval_us, vec![], mode);
-        // 清空运行时状态
-        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
-        self.cursor.clear();
-        self.controls.update_count(0);
-        self.controls.set_stopped();
-        self.selected_channel = None;
+        self.scopes = vec![self.make_scope("Scope 1".to_string())];
+        self.active_scope = 0;
+        self.scope_rename = None;
+        self.scope_rename_needs_focus = false;
+        self.load_scope_views(0);
+        self.watch_panel.reset_col_widths();
         self.controls.target_count = None;
         self.project_path = None;
         self.set_status("New project created (config cleared)");
@@ -749,27 +920,35 @@ impl DapSamplerApp {
 
     /// 保存当前配置为工程文件（已有路径直接覆盖，否则弹保存对话框）
     fn save_project(&mut self) {
+        // 活动 scope 的活数据在面板里，先存档再统一序列化
+        self.archive_active_scope();
         let file = ProjectFile {
             version: PROJECT_VERSION,
             elf_path: self.elf_ctx.as_ref().map(|c| c.file_path.clone()),
-            sample_rate_hz: self.controls.sample_rate,
-            swd_clock_mhz: self.controls.swd_clock_mhz,
-            window_size: self.controls.window_size,
             buffer_capacity: self.buffer_capacity,
-            display_mode: self.waveform.display_mode().label().to_string(),
             watch_col_widths: self.watch_panel.col_widths().to_vec(),
-            variables: self
-                .watch_panel
-                .entries
+            scopes: self
+                .scopes
                 .iter()
-                .map(|e| ProjectVariable {
-                    name: e.name.clone(),
-                    address: e.address,
-                    value_type: e.value_type.label().to_string(),
-                    refresh_period_s: e.refresh_period_s,
-                    y_offset: e.y_offset,
-                    y_scale: e.y_scale,
-                    remark: e.remark.clone(),
+                .map(|scope| ProjectScope {
+                    name: scope.name.clone(),
+                    sample_rate_hz: scope.rate_hz,
+                    swd_clock_mhz: scope.swd_clock_mhz,
+                    window_size: scope.window_size,
+                    display_mode: scope.display_mode.label().to_string(),
+                    variables: scope
+                        .watch_entries
+                        .iter()
+                        .map(|e| ProjectVariable {
+                            name: e.name.clone(),
+                            address: e.address,
+                            value_type: e.value_type.label().to_string(),
+                            refresh_period_s: e.refresh_period_s,
+                            y_offset: e.y_offset,
+                            y_scale: e.y_scale,
+                            remark: e.remark.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -802,7 +981,7 @@ impl DapSamplerApp {
         }
     }
 
-    /// 打开工程文件：恢复 ELF、通道、Watch 配置与全局参数
+    /// 打开工程文件：恢复 ELF、多 scope 配置与 Watch 全局设置
     fn open_project(&mut self, path: &std::path::Path) {
         self.status_text = None;
         self.status_is_error = false;
@@ -829,10 +1008,21 @@ impl DapSamplerApp {
                 return;
             }
         };
-        // 暂存工程变量（同步弹窗选 No 时用工程地址恢复）
-        self.last_project_variables = file.variables.clone();
+        // 所有 scope 的变量并集：ELF 同步 diff 与「使用工程地址」都按名字
+        // 作用于全部 scope（同名变量共享同一地址）
+        let all_variables: Vec<ProjectVariable> = file
+            .scopes
+            .iter()
+            .flat_map(|s| s.variables.iter().cloned())
+            .collect();
+        self.last_project_variables = all_variables.clone();
+        // 打开工程后地址一律走 ELF 解析或每 scope 的覆盖表，
+        // CLI 手工快照不再参与
+        self.manual_addresses.clear();
+        self.manual_channel_names.clear();
+        self.manual_value_types.clear();
 
-        // 2. 加载 ELF（失败仅警告，用保存的地址继续）
+        // 2. 加载 ELF（失败仅警告，用工程记录的地址继续）
         let elf_loaded = if let Some(elf_path) = &file.elf_path {
             match ElfParser::load(elf_path) {
                 Ok(ctx) => {
@@ -842,7 +1032,7 @@ impl DapSamplerApp {
                         .and_then(|m| m.modified().ok());
                     // 检测工程变量与 ELF 的差异（地址不同/缺失）→ 挂起同步询问
                     // 注意：必须在 ctx 移入 elf_ctx 之前借用 ctx.variables
-                    self.elf_sync_prompt = compute_elf_diffs(&file.variables, &ctx.variables);
+                    self.elf_sync_prompt = compute_elf_diffs(&all_variables, &ctx.variables);
                     self.elf_sync_open = self.elf_sync_prompt.is_some();
                     self.elf_ctx = Some(ctx);
                     log::info!("ELF loaded: {}", elf_path);
@@ -855,6 +1045,7 @@ impl DapSamplerApp {
                     log::error!("ELF load failed, continuing with saved variable addresses: {}", e);
                     self.status_text = Some(format!("ELF load failed, continuing with saved variable addresses: {}", e));
                     self.status_is_error = true;
+                    self.status_is_warning = false;
                     self.status_hint = None;
                     // 弹窗警告：状态栏红字容易被忽略，ELF 缺失是打开工程的关键异常
                     self.elf_warning = Some(format!(
@@ -870,113 +1061,140 @@ impl DapSamplerApp {
             false
         };
 
-        // 3. 恢复通道与 Watch 列表
-        if elf_loaded {
-            // ELF 模式：勾选工程变量 → 复用 apply_variable_changes 重建通道
-            self.manual_addresses.clear();
-            self.manual_channel_names.clear();
-            self.manual_value_types.clear();
-            self.variable_browser.clear();
-            // 只恢复 ELF 中真实存在的变量（固件符号可能已变化），缺失者警告跳过
-            let mut missing: Vec<String> = Vec::new();
-            for v in &file.variables {
-                let exists = self.elf_ctx.as_ref().is_some_and(|ctx| {
-                    ctx.variables.iter().any(|ev| elf_var_matches(ev, &v.name))
-                });
-                if exists {
-                    self.variable_browser.checked_paths.insert(v.name.clone());
-                } else {
-                    missing.push(v.name.clone());
-                }
+        // 3. 逐 scope 重建（面板作暂存区，复用现有恢复逻辑），再汇总装入
+        let mut restored: Vec<Scope> = Vec::new();
+        let mut missing_all: Vec<String> = Vec::new();
+        for p_scope in &file.scopes {
+            let (scope, missing) = self.restore_scope_from_project(p_scope, elf_loaded);
+            // ELF 加载失败时所有变量都按「缺失」跳过（改用工程地址采样），
+            // 不再叠加 "not found in ELF" 错误覆盖上面的 ELF 加载失败状态
+            if elf_loaded {
+                missing_all.extend(missing);
             }
-            if !missing.is_empty() {
-                self.set_error(format!(
-                    "{} variables in project not found in ELF, skipped: {}",
-                    missing.len(),
-                    missing.join(", ")
-                ));
-            }
-            // 先移除不在工程内的旧通道，再添加工程变量通道
-            let project_names: std::collections::HashSet<&str> =
-                file.variables.iter().map(|v| v.name.as_str()).collect();
-            let mut changes: Vec<(String, bool)> = self
-                .channel_panel
-                .channels
-                .iter()
-                .filter(|c| !project_names.contains(c.name.as_str()))
-                .map(|c| (c.name.clone(), false))
-                .collect();
-            changes.extend(
-                file
-                    .variables
-                    .iter()
-                    .filter(|v| !missing.contains(&v.name))
-                    .map(|v| (v.name.clone(), true)),
-            );
-            self.apply_variable_changes(changes);
-        } else {
-            // 手工模式（或 ELF 加载失败降级）：用工程里的地址/类型直接恢复
-            self.manual_addresses = file.variables.iter().map(|v| v.address).collect();
-            self.manual_value_types =
-                file.variables.iter().map(|v| v.value_type()).collect();
-            self.manual_channel_names = file.variables.iter().map(|v| v.name.clone()).collect();
-            self.variable_browser.clear();
-            self.channel_panel.channels.clear();
-            for (i, v) in file.variables.iter().enumerate() {
-                let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-                self.channel_panel
-                    .add_channel(v.name.clone(), color, v.value_type());
-            }
-            let names: Vec<String> = self
-                .channel_panel
-                .channels
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
-            let types: Vec<ValueType> = self
-                .channel_panel
-                .channels
-                .iter()
-                .map(|c| c.value_type)
-                .collect();
-            self.watch_panel
-                .sync_from_channels(&names, &types, &self.manual_addresses);
+            restored.push(scope);
         }
+        if !missing_all.is_empty() {
+            self.set_error(format!(
+                "{} variables in project not found in ELF, skipped: {}",
+                missing_all.len(),
+                missing_all.join(", ")
+            ));
+        }
+        if restored.is_empty() {
+            restored.push(self.make_scope("Scope 1".to_string()));
+        }
+        self.scopes = restored;
+        self.active_scope = 0;
+        self.scope_rename = None;
+        self.scope_rename_needs_focus = false;
 
-        // 4. 覆盖 Watch 配置字段（y_offset/y_scale/refresh/remark 以工程为准）
-        self.restore_watch_config(&file.variables);
-        // 4.5 恢复 Watch 列宽（旧版工程无此字段时为默认宽度；非法值在面板内夹紧）
+        // 4. 恢复全局设置：Buffer capacity 与 Watch 列宽
+        //（旧版工程无这些字段时为默认值；非法值在面板内夹紧）
+        self.buffer_capacity = file
+            .buffer_capacity
+            .clamp(crate::ui::controls::BUFFER_CAPACITY_MIN, crate::ui::controls::BUFFER_CAPACITY_MAX);
         self.watch_panel.set_col_widths(&file.watch_col_widths);
 
-        // 5. 恢复全局参数（controls 与 app 字段、waveform 三方同步）
-        self.controls.sample_rate = file.sample_rate_hz
-            .clamp(crate::ui::controls::RATE_MIN, crate::ui::controls::RATE_MAX);
-        self.rate_hz = self.controls.sample_rate;
-        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
-        self.waveform.set_interval(self.interval_us);
-        self.controls.swd_clock_mhz = file.swd_clock_mhz.clamp(1, 50);
-        self.swd_clock_mhz = self.controls.swd_clock_mhz;
-        self.controls.window_size = file.window_size
-            .clamp(crate::ui::controls::WINDOW_MIN, crate::ui::controls::WINDOW_MAX);
-        self.window_size = self.controls.window_size;
-        self.buffer_capacity = file.buffer_capacity
-            .clamp(crate::ui::controls::BUFFER_CAPACITY_MIN, crate::ui::controls::BUFFER_CAPACITY_MAX);
-        let mode = file.display_mode();
-        self.waveform.set_display_mode(mode);
-        self.display_mode = mode;
-
-        // 6. 清空运行时状态，回到 Idle
-        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
-        self.cursor.clear();
-        self.controls.update_count(0);
-        self.selected_channel = None;
+        // 5. 清空运行时状态，回到 Idle（激活第一个 scope）
+        self.load_scope_views(0);
         self.controls.target_count = None;
 
-        // 7. 记录工程路径
+        // 6. 记录工程路径
         self.project_path = Some(path.display().to_string());
         if !self.status_is_error {
             self.set_status(format!("Project opened: {}", path.display()));
         }
+    }
+
+    /// 用工程文件里单个 scope 的配置，经面板暂存区重建出完整 Scope
+    ///
+    /// 面板（勾选 / 通道 / Watch 行）此时只作暂存区：复用现有恢复逻辑构建
+    /// 通道与 Watch 行，再拷贝进返回的 Scope。调用方随后用 load_scope_views
+    /// 重新灌入要激活的 scope。
+    /// 返回 (Scope, ELF 中缺失被跳过的变量名列表)。
+    fn restore_scope_from_project(
+        &mut self,
+        p_scope: &ProjectScope,
+        elf_loaded: bool,
+    ) -> (Scope, Vec<String>) {
+        let mut scope = self.make_scope(p_scope.name.clone());
+        scope.rate_hz = p_scope
+            .sample_rate_hz
+            .clamp(crate::ui::controls::RATE_MIN, crate::ui::controls::RATE_MAX);
+        scope.window_size = p_scope
+            .window_size
+            .clamp(crate::ui::controls::WINDOW_MIN, crate::ui::controls::WINDOW_MAX);
+        scope.swd_clock_mhz = p_scope.swd_clock_mhz.clamp(1, 50);
+        scope.display_mode = p_scope.display_mode();
+
+        // 面板暂存区清空后按工程变量重建
+        self.variable_browser.checked_paths.clear();
+        self.channel_panel.channels.clear();
+        self.watch_panel.entries.clear();
+
+        // ELF 已加载：只恢复其中真实存在的变量（固件符号可能已变化），
+        // 缺失者告警跳过；ELF 未加载：全部按工程变量恢复通道（地址走覆盖表）
+        let mut missing: Vec<String> = Vec::new();
+        for v in &p_scope.variables {
+            let in_elf = self.elf_ctx.as_ref().is_some_and(|ctx| {
+                ctx.variables.iter().any(|ev| elf_var_matches(ev, &v.name))
+            });
+            let make_channel = if elf_loaded { in_elf } else { true };
+            if make_channel {
+                if elf_loaded {
+                    self.variable_browser.checked_paths.insert(v.name.clone());
+                }
+                let color = self.pick_channel_color();
+                self.channel_panel.add_channel(v.name.clone(), color, v.value_type());
+            } else {
+                missing.push(v.name.clone());
+            }
+        }
+
+        // Watch 行：地址按恢复来源取值（ELF 已加载 → ELF 解析；否则用工程地址）
+        let names: Vec<String> = self
+            .channel_panel
+            .channels
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let types: Vec<ValueType> = self
+            .channel_panel
+            .channels
+            .iter()
+            .map(|c| c.value_type)
+            .collect();
+        let addresses: Vec<u32> = if elf_loaded {
+            self.collect_channel_addresses()
+        } else {
+            p_scope
+                .variables
+                .iter()
+                .filter(|v| !missing.contains(&v.name))
+                .map(|v| v.address)
+                .collect()
+        };
+        self.watch_panel.sync_from_channels(&names, &types, &addresses);
+        // 覆盖 Watch 配置字段（y_offset/y_scale/refresh/remark 以工程为准）
+        self.restore_watch_config(&p_scope.variables);
+
+        // ELF 未加载（路径缺失/解析失败）：采样地址只能用工程记录值，
+        // 生成按名字的覆盖表，Start 时绕过 ELF 解析
+        if !elf_loaded {
+            scope.saved_addresses = Some(
+                p_scope
+                    .variables
+                    .iter()
+                    .filter(|v| !missing.contains(&v.name))
+                    .map(|v| (v.name.clone(), v.address))
+                    .collect(),
+            );
+        }
+
+        scope.checked_paths = self.variable_browser.checked_paths.clone();
+        scope.channels = self.channel_panel.channels.clone();
+        scope.watch_entries = self.watch_panel.entries.clone();
+        (scope, missing)
     }
 
     /// 用工程变量按**名字**回查，恢复 Watch 行的地址/类型/显示配置
@@ -1009,15 +1227,29 @@ impl DapSamplerApp {
         }
     }
 
-    /// 同步弹窗选 Yes：地址统一用 ELF 文件的值，缺失变量删除
+    /// 同步弹窗选 Yes：地址统一用 ELF 文件的值，缺失变量从所有 scope 删除
     fn apply_elf_sync(&mut self, prompt: &ElfSyncPrompt) {
-        // 1. 删除 ELF 中不存在的变量（通道 + 勾选 + Watch）
+        // 1. 删除 ELF 中不存在的变量：活动 scope 走面板，其余 scope 改存档
         for name in &prompt.missing {
             self.channel_panel.remove_by_name(name);
             self.variable_browser.checked_paths.remove(name);
         }
         if !prompt.missing.is_empty() {
             self.selected_channel = None;
+        }
+        let missing: std::collections::HashSet<&str> =
+            prompt.missing.iter().map(|s| s.as_str()).collect();
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            if i == self.active_scope {
+                // 活动 scope 的数据在面板里，上面已处理；地址覆盖表直接清
+                scope.saved_addresses = None;
+                continue;
+            }
+            scope.channels.retain(|c| !missing.contains(c.name.as_str()));
+            scope.checked_paths.retain(|p| !missing.contains(p.as_str()));
+            scope.watch_entries.retain(|e| !missing.contains(e.name.as_str()));
+            // 地址以 ELF 为准：清掉工程地址覆盖表
+            scope.saved_addresses = None;
         }
         // 2. 确保地址收集走 ELF 分支（手工快照清空必须在 collect 之前，防误用旧手工地址）
         self.manual_addresses.clear();
@@ -1037,20 +1269,29 @@ impl DapSamplerApp {
         self.refresh_elf_mtime();
     }
 
-    /// 同步弹窗选 No（或 X 关闭）：统一用工程记录的地址（切手工快照，采样与 Watch 一致）
+    /// 同步弹窗选 No（或 X 关闭）：所有 scope 的采样地址统一改用工程记录值
+    ///
+    /// 多 scope 下按名字生成每 scope 的地址覆盖表（Start 时优先使用），
+    /// 通道 / 勾选保持不动；活动 scope 的 Watch 行地址同步为工程值，
+    /// 其余 scope 的 Watch 行地址在下次切换/采样时自然对齐。
     fn use_project_addresses(&mut self, variables: &[ProjectVariable]) {
-        self.manual_addresses = variables.iter().map(|v| v.address).collect();
-        self.manual_channel_names = variables.iter().map(|v| v.name.clone()).collect();
-        self.manual_value_types = variables.iter().map(|v| v.value_type()).collect();
-        self.variable_browser.clear();
-        self.channel_panel.channels.clear();
-        for (i, v) in variables.iter().enumerate() {
-            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-            self.channel_panel.add_channel(v.name.clone(), color, v.value_type());
+        let map: std::collections::HashMap<String, u32> = variables
+            .iter()
+            .map(|v| (v.name.clone(), v.address))
+            .collect();
+        for scope in &mut self.scopes {
+            scope.saved_addresses = Some(map.clone());
         }
+        // 活动 scope 的 Watch 行地址同步为工程值（按名字回查，未命中留 0）
         let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
         let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
-        self.watch_panel.sync_from_channels(&names, &types, &self.manual_addresses);
+        let addresses: Vec<u32> = self
+            .channel_panel
+            .channels
+            .iter()
+            .map(|c| map.get(&c.name).copied().unwrap_or(0))
+            .collect();
+        self.watch_panel.sync_from_channels(&names, &types, &addresses);
         self.set_status("Using saved variable addresses (ELF not synchronized)");
         self.refresh_elf_mtime();
     }
@@ -1092,6 +1333,7 @@ impl DapSamplerApp {
     /// 变量从 ELF 删除后，Variables 勾选统计、Channels 面板应与新内容一致，
     /// 否则残留变量会在 Start 时因找不到地址被静默跳过。
     fn remove_stale_variables(&mut self, elf_vars: &[ElfVariable]) {
+        // 活动 scope 的数据在面板里；非活动 scope 直接清理存档
         let stale: Vec<String> = self
             .variable_browser
             .checked_paths
@@ -1099,14 +1341,29 @@ impl DapSamplerApp {
             .filter(|p| !elf_vars.iter().any(|ev| elf_var_matches(ev, p)))
             .cloned()
             .collect();
-        if stale.is_empty() {
-            return;
+        if !stale.is_empty() {
+            for name in &stale {
+                self.variable_browser.checked_paths.remove(name);
+                self.channel_panel.remove_by_name(name);
+            }
+            self.selected_channel = None;
         }
-        for name in &stale {
-            self.variable_browser.checked_paths.remove(name);
-            self.channel_panel.remove_by_name(name);
+        for (i, scope) in self.scopes.iter_mut().enumerate() {
+            if i == self.active_scope {
+                continue;
+            }
+            let dead: Vec<String> = scope
+                .checked_paths
+                .iter()
+                .filter(|p| !elf_vars.iter().any(|ev| elf_var_matches(ev, p)))
+                .cloned()
+                .collect();
+            for name in &dead {
+                scope.checked_paths.remove(name);
+            }
+            scope.channels.retain(|c| !dead.contains(&c.name));
+            scope.watch_entries.retain(|e| !dead.contains(&e.name));
         }
-        self.selected_channel = None;
     }
 
     /// ELF Changed 弹窗选 Yes：重新解析 ELF 文件
@@ -1151,15 +1408,21 @@ impl DapSamplerApp {
             } else {
                 // ELF 模式：从 channel_panel 动态获取。
                 // 以"匹配成功"为单位收集 (通道, 地址)，保证 names/colors/
-                // types/addresses 四个列表始终一一对齐（匹配失败的通道整组跳过）
+                // types/addresses 四个列表始终一一对齐（匹配失败的通道整组跳过）。
+                // 地址先查「使用工程地址」覆盖表（打开工程选 No 时生成，
+                // ELF 缺失/差异也能按工程值采样），再按 ELF 解析
                 let channels = &self.channel_panel.channels;
                 if channels.is_empty() {
                     self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
                     return;
                 }
+                let overrides = self.scopes[self.active_scope].saved_addresses.clone();
                 let matched: Vec<(&_, u32)> = channels
                     .iter()
                     .filter_map(|ch| {
+                        if let Some(&addr) = overrides.as_ref().and_then(|m| m.get(&ch.name)) {
+                            return Some((ch, addr));
+                        }
                         self.elf_ctx.as_ref().and_then(|ctx| {
                             ctx.variables
                                 .iter()
@@ -1187,7 +1450,7 @@ impl DapSamplerApp {
         }
 
         // 保存当前通道地址/名字/类型列表（用于 Watch 写入的子字对齐处理与名字解析）
-        let prev_addresses = std::mem::replace(&mut self.current_addresses, addresses.clone());
+        self.current_addresses = addresses.clone();
         self.current_names = channel_names.clone();
         self.current_types = types.clone();
 
@@ -1216,32 +1479,17 @@ impl DapSamplerApp {
         }
 
         // 3. 更新波形面板（通道名和类型）
-        // Paused→Start 且通道配置未变时保留历史波形数据；
-        // 其余情况（Idle→Start 或通道增删/改名/改类型）清空缓冲重新开始
-        let old_names = self.waveform.channel_names();
-        let config_unchanged = prev_addresses == addresses
-            && self.waveform.value_types() == types.as_slice()
-            && old_names.len() == channel_names.len()
-            && old_names
-                .iter()
-                .zip(&channel_names)
-                .all(|(a, b)| *a == b.as_str());
-        // Pause 期间改了缓冲区容量 → 视为配置变化，恢复时重建缓冲
-        let keep_history = self.controls.state == AcquisitionState::Paused
-            && config_unchanged
-            && self.display_buf.max_samples() == self.buffer_capacity;
-
+        // 重建通道集时按名保留图例加粗状态（被删除的通道自然消失）
+        let bold_names = self.waveform.bold_names().clone();
         self.waveform =
             WaveformPanel::new(channel_names.clone(), channel_colors, self.interval_us, types.clone(), self.display_mode);
+        self.waveform.set_bold_names(bold_names);
 
-        // 4. 数据缓冲区：Pause 恢复且配置未变时保留历史（含光标与计数），否则清空重建
-        if keep_history {
-            self.display_buf.set_max_samples(self.buffer_capacity);
-        } else {
-            self.display_buf = DisplayBuffer::new(self.buffer_capacity);
-            self.cursor.clear();
-            self.controls.update_count(0);
-        }
+        // 4. 每次开始都清空数据缓冲区重新采样（含光标与计数）；
+        // Stop 后冻结的波形在屏上保留，直到下一次 Start
+        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
+        self.cursor.clear();
+        self.controls.update_count(0);
 
         // 5. 创建 PipelineEngine
         let engine = PipelineEngine::new(
@@ -1298,11 +1546,252 @@ impl DapSamplerApp {
         self.set_status("Acquisition stopped");
     }
 
-    fn pause_acquisition(&mut self) {
-        self.stop_pipeline();
-        self.controls.set_paused();
-        // Pause 时保持 USB 连接，恢复采集更快
-        self.set_status("Acquisition paused");
+    // ---- 多 scope 管理 ----
+
+    /// 把面板视图中的活动 scope 活数据与参数镜像存档回 scopes[active_scope]
+    ///
+    /// 面板三个 pub 字段（checked_paths / channels / watch entries）在任意
+    /// 时刻就是活动 scope 的当前数据；这里拷贝存档（面板保持不动），供
+    /// 切换 / 保存工程时取用。
+    fn archive_active_scope(&mut self) {
+        let idx = self.active_scope;
+        let Some(scope) = self.scopes.get_mut(idx) else {
+            return;
+        };
+        scope.checked_paths = self.variable_browser.checked_paths.clone();
+        scope.channels = self.channel_panel.channels.clone();
+        scope.watch_entries = self.watch_panel.entries.clone();
+        scope.rate_hz = self.rate_hz;
+        scope.window_size = self.window_size;
+        scope.swd_clock_mhz = self.swd_clock_mhz;
+        scope.display_mode = self.display_mode;
+    }
+
+    /// 把 scopes[idx] 的存档灌回面板视图与参数镜像，并清空运行时状态
+    ///
+    /// 波形 / 缓冲 / 光标不跨 scope 保留（切换即清空）：DisplayBuffer 与
+    /// cursor 全局单份，重置为空；波形面板重建为空通道集（Start 时再按
+    /// 通道集重建，与打开工程后的行为一致）。
+    fn load_scope_views(&mut self, idx: usize) {
+        let Some(scope) = self.scopes.get(idx) else {
+            return;
+        };
+        self.variable_browser.checked_paths = scope.checked_paths.clone();
+        self.channel_panel.channels = scope.channels.clone();
+        self.watch_panel.entries = scope.watch_entries.clone();
+        self.rate_hz = scope.rate_hz;
+        self.interval_us = 1_000_000.0 / self.rate_hz as f64;
+        self.window_size = scope.window_size;
+        self.swd_clock_mhz = scope.swd_clock_mhz;
+        self.display_mode = scope.display_mode;
+        self.controls.sample_rate = self.rate_hz;
+        self.controls.window_size = self.window_size;
+        self.controls.swd_clock_mhz = self.swd_clock_mhz;
+        self.waveform = WaveformPanel::new(
+            vec![],
+            vec![],
+            self.interval_us,
+            vec![],
+            self.display_mode,
+        );
+        self.display_buf = DisplayBuffer::new(self.buffer_capacity);
+        self.cursor.clear();
+        self.selected_channel = None;
+        self.controls.update_count(0);
+        self.has_new_data = false;
+        // 引擎快照（地址/名字/类型）属于上一个 scope 的采集会话，清空；
+        // Watch 写入在重新 Start 之前应当失败而不是写错变量
+        self.current_addresses.clear();
+        self.current_names.clear();
+        self.current_types.clear();
+    }
+
+    /// 切换完成后的收尾：按「采样状态跟随切换」规则决定是否自动开始
+    ///
+    /// 切换前在采集/暂停 → 用新 scope 自己的参数自动重新开始；本来就空闲
+    /// → 保持空闲。新 scope 没有通道时无法采样，提示先添加变量。
+    fn finish_scope_switch(&mut self, was_running: bool) {
+        let name = self.scopes[self.active_scope].name.clone();
+        if was_running && !self.scopes[self.active_scope].channels.is_empty() {
+            self.set_status(format!("Switched to {}", name));
+            self.start_acquisition();
+        } else if was_running {
+            self.set_status(format!(
+                "Switched to {} (no channels: press Start after adding variables)",
+                name
+            ));
+        } else {
+            self.set_status(format!("Switched to {}", name));
+        }
+    }
+
+    /// 切换到 scopes[idx]（点击 scope 标签）
+    ///
+    /// 每个 scope 的 SWD Clock 独立，连接必须以新时钟重新初始化，因此
+    /// 切换总是先停止采集并释放 USB（自动开始的 Start 会重新连接）。
+    fn switch_to_scope(&mut self, idx: usize) {
+        if idx >= self.scopes.len() || idx == self.active_scope {
+            return;
+        }
+        let was_running = self.controls.state != AcquisitionState::Idle;
+        self.stop_acquisition();
+        self.archive_active_scope();
+        self.active_scope = idx;
+        self.load_scope_views(idx);
+        self.finish_scope_switch(was_running);
+    }
+
+    /// 创建新 scope（首个未占用编号命名）并切换过去
+    fn create_scope(&mut self) {
+        let was_running = self.controls.state != AcquisitionState::Idle;
+        self.commit_scope_rename();
+        self.stop_acquisition();
+        self.archive_active_scope();
+        let name = self.next_scope_name();
+        let scope = self.make_scope(name);
+        self.scopes.push(scope);
+        self.active_scope = self.scopes.len() - 1;
+        self.load_scope_views(self.active_scope);
+        self.finish_scope_switch(was_running);
+    }
+
+    /// 删除 scopes[idx]；删除活动 scope 时切换到相邻 scope（采样先停止）。
+    /// 始终保持至少一个 scope：删光后自动重建默认空 scope。
+    fn delete_scope(&mut self, idx: usize) {
+        if idx >= self.scopes.len() {
+            return;
+        }
+        self.commit_scope_rename();
+        let was_running = self.controls.state != AcquisitionState::Idle;
+        self.scopes.remove(idx);
+        if self.scopes.is_empty() {
+            let scope = self.make_scope(self.next_scope_name());
+            self.scopes.push(scope);
+            self.active_scope = 0;
+            self.load_scope_views(0);
+            self.set_status("Last oscilloscope removed, created a new empty one");
+            return;
+        }
+        if idx == self.active_scope {
+            // 删除的是活动 scope：数据在面板里随删除丢弃，进入相邻 scope
+            let new_idx = idx.min(self.scopes.len() - 1);
+            self.active_scope = new_idx;
+            self.load_scope_views(new_idx);
+            self.finish_scope_switch(was_running);
+        } else {
+            // 删除非活动 scope：只需修正活动索引（被删项在前时索引前移）
+            if idx < self.active_scope {
+                self.active_scope -= 1;
+            }
+            let name = self.scopes[self.active_scope].name.clone();
+            self.set_status(format!("Oscilloscope removed, now on {}", name));
+        }
+    }
+
+    /// 创建带自增 uid 的空 scope（uid 用于标签控件的稳定 id）
+    fn make_scope(&mut self, name: String) -> Scope {
+        self.next_scope_uid += 1;
+        let mut scope = Scope::new(name);
+        scope.id = self.next_scope_uid;
+        scope
+    }
+
+    /// 下一个未占用的 scope 名称（"Scope N"，N 取首个空位）
+    fn next_scope_name(&self) -> String {
+        let mut n = 1;
+        loop {
+            let candidate = format!("Scope {}", n);
+            if self.scopes.iter().all(|s| s.name != candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// 提交正在进行的标签改名（空名/纯空白回退原名）
+    fn commit_scope_rename(&mut self) {
+        if let Some((idx, name)) = self.scope_rename.take() {
+            let trimmed = name.trim().to_string();
+            if !trimmed.is_empty() {
+                if let Some(scope) = self.scopes.get_mut(idx) {
+                    scope.name = trimmed;
+                }
+            }
+        }
+        self.scope_rename_needs_focus = false;
+    }
+
+    /// scope 标签条（菜单栏下方横向一排）：点击切换、双击改名、× 删除、+ 新建
+    fn show_scope_tabs(&mut self, ui: &mut egui::Ui) {
+        // 本帧动作先收集、循环结束后统一执行：删除会改变索引，边渲染边
+        // 执行会让同一帧内后续标签的点击落到错误的 scope 上
+        let mut switch_to = None;
+        let mut start_rename = None;
+        let mut delete_idx = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for i in 0..self.scopes.len() {
+                if self.scope_rename.as_ref().map(|r| r.0) == Some(i) {
+                    // 改名编辑态：原地 TextEdit，回车/失焦提交，Esc 取消
+                    let Some((_, text)) = self.scope_rename.as_mut() else {
+                        unreachable!("rename entry must exist for the renaming tab");
+                    };
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .desired_width(120.0)
+                            .font(egui::TextStyle::Body),
+                    );
+                    // 仅在改名开始的首帧请求焦点：之后每帧都请求会把用户
+                    // 点到别处的焦点再抢回来，lost_focus 提交就永远不触发
+                    if self.scope_rename_needs_focus {
+                        resp.request_focus();
+                        self.scope_rename_needs_focus = false;
+                    }
+                    let (enter, esc) = ui.ctx().input(|inp| {
+                        (
+                            inp.key_pressed(egui::Key::Enter),
+                            inp.key_pressed(egui::Key::Escape),
+                        )
+                    });
+                    if esc {
+                        self.scope_rename = None;
+                        self.scope_rename_needs_focus = false;
+                    } else if resp.lost_focus() || enter {
+                        self.commit_scope_rename();
+                    }
+                    continue;
+                }
+                let (name, selected) = (self.scopes[i].name.clone(), i == self.active_scope);
+                // 标签控件 id 用 scope 的稳定 uid：删除/重排后不复用，
+                // 「松开帧按 id 匹配 clicked」不会落到别的标签上
+                let tab_id = egui::Id::new(("scope_tab", self.scopes[i].id));
+                let (clicked, double_clicked, x_clicked) = scope_tab(ui, tab_id, &name, selected);
+                if x_clicked {
+                    delete_idx = Some(i);
+                } else if double_clicked {
+                    start_rename = Some((i, name));
+                } else if clicked && !selected {
+                    switch_to = Some(i);
+                }
+            }
+            // "+" 快捷新建
+            if ui.small_button("+").clicked() {
+                self.create_scope();
+            }
+        });
+        // 结构性操作（删除/切换/开始改名）先提交未完成的改名，避免把
+        // 改名缓冲带进新的 scope 状态
+        if delete_idx.is_some() || switch_to.is_some() || start_rename.is_some() {
+            self.commit_scope_rename();
+        }
+        if let Some(i) = delete_idx {
+            self.delete_scope(i);
+        } else if let Some((i, name)) = start_rename {
+            self.scope_rename = Some((i, name));
+            self.scope_rename_needs_focus = true;
+        } else if let Some(i) = switch_to {
+            self.switch_to_scope(i);
+        }
     }
 
     fn drain_pipeline(&mut self) {
@@ -1610,72 +2099,75 @@ impl DapSamplerApp {
             })
         });
         let delta = self.cursor.delta(buffer, offset, &types);
+        let c1 = self.cursor.cursor1;
+        let c2 = self.cursor.cursor2;
+        // 光标滑出缓冲提示用的缓冲区范围（提前取值，滚动闭包内只持有所有权值）
+        let range_text = if self.display_buf.is_empty() {
+            "(buffer cleared)".to_string()
+        } else {
+            format!(
+                "[{} ~ {}]",
+                self.display_buf.oldest_seq(),
+                self.display_buf.next_seq() - 1
+            )
+        };
 
-        // ---- Delta ----
-        if let Some((dt, dv)) = delta {
-            ui.separator();
-            ui.label(egui::RichText::new("Delta").strong());
-            ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
-            for (i, v) in dv.iter().enumerate() {
-                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, "●");
-                    ui.label(egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace());
-                });
+        // 读数比侧栏可见区域高（多通道 × 三段内容）时整体滚动，
+        // 否则底部内容会被裁掉看不到
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            // ---- Delta ----
+            if let Some((dt, dv)) = delta {
+                ui.label(egui::RichText::new("Delta").strong());
+                ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
+                for (i, v) in dv.iter().enumerate() {
+                    let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, "●");
+                        ui.label(egui::RichText::new(format!("dCH{}: {:.4}", i + 1, v)).monospace());
+                    });
+                }
             }
-        }
 
-        // ---- Cursor 1 ----
-        if let Some(r) = r1 {
-            ui.separator();
-            ui.label(egui::RichText::new("Cursor 1").strong());
-            for (i, v) in r.values.iter().enumerate() {
-                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, "●");
-                    ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
-                });
+            // ---- Cursor 1 ----
+            if let Some(r) = r1 {
+                ui.label(egui::RichText::new("Cursor 1").strong());
+                // 时刻紧跟标题：通道读数多时也不会被挤到看不见的位置
+                ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
+                for (i, v) in r.values.iter().enumerate() {
+                    let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, "●");
+                        ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
+                    });
+                }
+            } else if let Some(seq) = c1 {
+                // 光标存在但已滑出缓冲范围（窗口滚动/清空后）：给出可见提示，
+                // 而不是静默不显示读数
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc0, 0x82, 0x00),
+                    format!("⚠ Cursor 1 @ seq {} slid out of buffer range {}", seq, range_text),
+                );
             }
-            ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
-        } else if let Some(seq) = self.cursor.cursor1 {
-            // 光标存在但已滑出缓冲范围（窗口滚动/清空后）：给出可见提示，
-            // 而不是静默不显示读数
-            ui.separator();
-            let range_text = if self.display_buf.is_empty() {
-                "(buffer cleared)".to_string()
-            } else {
-                format!(
-                    "[{} ~ {}]",
-                    self.display_buf.oldest_seq(),
-                    self.display_buf.next_seq() - 1
-                )
-            };
-            ui.colored_label(
-                egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                format!("⚠ Cursor 1 @ seq {} slid out of buffer range {}", seq, range_text),
-            );
-        }
 
-        // ---- Cursor 2 ----
-        if let Some(r) = r2 {
-            ui.separator();
-            ui.label(egui::RichText::new("Cursor 2").strong());
-            for (i, v) in r.values.iter().enumerate() {
-                let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, "●");
-                    ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
-                });
+            // ---- Cursor 2 ----
+            if let Some(r) = r2 {
+                ui.label(egui::RichText::new("Cursor 2").strong());
+                ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
+                for (i, v) in r.values.iter().enumerate() {
+                    let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, "●");
+                        ui.label(egui::RichText::new(format!("CH{}: {:.4}", i + 1, v)).monospace());
+                    });
+                }
+            } else if c2.is_some() {
+                // Cursor2 已滑出缓冲（窗口滚动后）
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc0, 0x82, 0x00),
+                    "⚠ Cursor 2 slid out of buffer range",
+                );
             }
-            ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
-        } else if self.cursor.cursor2.is_some() {
-            // Cursor2 已滑出缓冲（窗口滚动后）
-            ui.separator();
-            ui.colored_label(
-                egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                "⚠ Cursor 2 slid out of buffer range",
-            );
-        }
+        });
     }
 
     /// 悬停自动展开/收起的菜单按钮
@@ -1837,8 +2329,9 @@ impl eframe::App for DapSamplerApp {
                 self.set_error_with_hint(format!("Acquisition aborted: {}", msg), CONNECTION_HINT);
             }
         }
-        // 引擎非致命故障通知（写入被跳过、协议失步丢数据）：只写日志用户
-        // 无感知，转为错误弹窗提示（set_error 弹通用 Error 弹窗）
+        // 引擎非致命故障通知：写入被跳过（用户主动发起的写失败，弹窗
+        // 提醒）与协议失步丢数据（自恢复的非致命事件，降级为状态栏黄字，
+        // 不弹窗打断——失步可能连续发生，逐次弹窗会刷屏）
         if let Some(ref handle) = self.pipeline {
             for notice in handle.drain_notices() {
                 match notice {
@@ -1846,7 +2339,7 @@ impl eframe::App for DapSamplerApp {
                         self.set_error(self.write_skip_message(var_idx, &reason));
                     }
                     PipelineNotice::DataDropped { message } => {
-                        self.set_error(message);
+                        self.set_warning(message);
                     }
                 }
             }
@@ -1907,6 +2400,15 @@ impl eframe::App for DapSamplerApp {
                     false
                 });
 
+                // ---- 示波器菜单：多 scope 管理 ----
+                self.hover_menu(ui, "oscilloscope", "Oscilloscope(O)", |ui, app| {
+                    if menu_item(ui, "New Oscilloscope").clicked() {
+                        app.create_scope();
+                        return true;
+                    }
+                    false
+                });
+
                 // ---- 设置菜单 ----
                 self.hover_menu(ui, "settings", "Settings(S)", |ui, app| {
                     if menu_item(ui, "General Settings…").clicked() {
@@ -1925,6 +2427,12 @@ impl eframe::App for DapSamplerApp {
                     false
                 });
             });
+        });
+
+        // ---- scope 标签条（菜单栏下方横向一排，多示波器切换）----
+        // top 面板按声明顺序自上而下堆叠：在 header 之后声明即紧贴菜单栏
+        egui::TopBottomPanel::top("scope_tabs").show(ctx, |ui| {
+            self.show_scope_tabs(ui);
         });
 
         // ---- 底部状态栏（横跨整个窗口宽度，界面最底部）----
@@ -2112,13 +2620,10 @@ impl eframe::App for DapSamplerApp {
                 if let Some(cmd) = self.controls.show_buttons(ui) {
                     match cmd {
                         AcquisitionCommand::Start => {
-                            if self.controls.state == AcquisitionState::Idle
-                                || self.controls.state == AcquisitionState::Paused
-                            {
+                            if self.controls.state == AcquisitionState::Idle {
                                 self.start_acquisition();
                             }
                         }
-                        AcquisitionCommand::Pause => self.pause_acquisition(),
                         AcquisitionCommand::Stop => self.stop_acquisition(),
                     }
                 }
@@ -2135,23 +2640,26 @@ impl eframe::App for DapSamplerApp {
 
                 self.controls.show_params(ui);
 
-                // 检测采样率变化
+                // 检测采样率变化（参数归属当前 scope：写镜像字段的同时写回存档）
                 if self.controls.sample_rate != self.rate_hz {
                     self.rate_hz = self.controls.sample_rate;
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
+                    self.scopes[self.active_scope].rate_hz = self.rate_hz;
                     self.set_status(format!("Sample rate changed to {} Hz", self.rate_hz));
                 }
 
                 // 检测 SWD 时钟变化（仅记录日志，下次连接时生效）
                 if self.controls.swd_clock_mhz != self.swd_clock_mhz {
                     self.swd_clock_mhz = self.controls.swd_clock_mhz;
+                    self.scopes[self.active_scope].swd_clock_mhz = self.swd_clock_mhz;
                     self.set_status(format!("SWD clock changed to {} MHz (applies on next DAP-Link connection)", self.swd_clock_mhz));
                 }
 
                 // 检测窗口大小变化
                 if self.controls.window_size != self.window_size {
                     self.window_size = self.controls.window_size;
+                    self.scopes[self.active_scope].window_size = self.window_size;
                     self.set_status(format!("Display window size changed to {} points", self.window_size));
                 }
 
@@ -2169,6 +2677,7 @@ impl eframe::App for DapSamplerApp {
                     });
                 if mode != self.display_mode {
                     self.display_mode = mode;
+                    self.scopes[self.active_scope].display_mode = mode;
                     self.waveform.set_display_mode(mode);
                     let mode_label = match mode {
                         WaveformDisplayMode::Line => "Line",
@@ -2177,8 +2686,6 @@ impl eframe::App for DapSamplerApp {
                     self.set_status(format!("Display mode switched to {}", mode_label));
                 }
             });
-
-            ui.separator();
 
             // 波形
             let buffer_offset = self.display_buf.oldest_seq();
@@ -2503,6 +3010,380 @@ mod status_tests {
         app.set_status("new message");
         assert_eq!(app.status_text.as_deref(), Some("new message"));
         assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn set_warning_records_warning_without_popup() {
+        // 协议失步丢数据是自恢复的非致命事件：状态栏黄字即可，不弹窗
+        let mut app = make_app();
+        app.set_warning("Protocol desync: dropped 11 bytes of responses and resynchronized");
+        assert_eq!(
+            app.status_text.as_deref(),
+            Some("Protocol desync: dropped 11 bytes of responses and resynchronized")
+        );
+        assert!(app.status_is_warning);
+        assert!(!app.status_is_error);
+        assert!(app.warning_popup.is_none(), "警告不应弹出错误弹窗");
+    }
+
+    #[test]
+    fn newer_message_clears_warning_state() {
+        let mut app = make_app();
+        app.set_warning("Protocol desync: dropped 11 bytes of responses and resynchronized");
+        // 后续普通消息清除警告态
+        app.set_status("Acquisition started");
+        assert!(!app.status_is_warning);
+        // 后续错误覆盖警告态
+        app.set_warning("stale warning");
+        app.set_error("real error");
+        assert!(app.status_is_error);
+        assert!(!app.status_is_warning);
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn make_app() -> DapSamplerApp {
+        DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1)
+    }
+
+    #[test]
+    fn switch_scope_preserves_per_scope_state() {
+        let mut app = make_app();
+        // scope 1：一个通道 + 独立参数 + 显示模式
+        app.channel_panel.add_channel("v1".to_string(), egui::Color32::RED, ValueType::Float);
+        app.watch_panel.sync_from_channels(&["v1".to_string()], &[ValueType::Float], &[0x10]);
+        app.rate_hz = 10_000;
+        app.controls.sample_rate = 10_000;
+        app.window_size = 500;
+        app.display_mode = WaveformDisplayMode::Point;
+        app.create_scope(); // -> "Scope 2"，切到新 scope
+        assert_eq!(app.scopes.len(), 2);
+        assert_eq!(app.active_scope, 1);
+        // 切走后面板清空、参数回新 scope 默认值、运行时状态清空
+        assert!(app.channel_panel.channels.is_empty());
+        assert!(app.watch_panel.entries.is_empty());
+        assert_eq!(app.controls.sample_rate, 5000);
+        assert_eq!(app.controls.window_size, 2000);
+        assert!(app.display_buf.is_empty());
+        assert!(app.cursor.cursor1.is_none());
+        // 切回 scope 1：通道 / Watch 行 / 参数 / 显示模式全部恢复
+        app.switch_to_scope(0);
+        assert_eq!(app.active_scope, 0);
+        assert_eq!(app.channel_panel.channel_count(), 1);
+        assert_eq!(app.channel_panel.channels[0].name, "v1");
+        assert_eq!(app.watch_panel.entries.len(), 1);
+        assert_eq!(app.rate_hz, 10_000);
+        assert_eq!(app.window_size, 500);
+        assert_eq!(app.controls.sample_rate, 10_000);
+        assert_eq!(app.display_mode, WaveformDisplayMode::Point);
+    }
+
+    #[test]
+    fn checked_paths_are_per_scope() {
+        // 变量树勾选状态跟随 scope：各自独立，互不串扰
+        let mut app = make_app();
+        app.variable_browser.checked_paths.insert("a".to_string());
+        app.create_scope();
+        app.variable_browser.checked_paths.insert("b".to_string());
+        app.switch_to_scope(0);
+        assert!(app.variable_browser.checked_paths.contains("a"));
+        assert!(!app.variable_browser.checked_paths.contains("b"));
+        app.switch_to_scope(1);
+        assert!(app.variable_browser.checked_paths.contains("b"));
+        assert!(!app.variable_browser.checked_paths.contains("a"));
+    }
+
+    #[test]
+    fn switch_scope_clears_cursor_and_selection() {
+        // 波形/光标/选中通道不跨 scope 保留（切换即清空）
+        let mut app = make_app();
+        app.selected_channel = Some(0);
+        app.cursor.click(42);
+        app.create_scope();
+        assert!(app.cursor.cursor1.is_none());
+        assert_eq!(app.selected_channel, None);
+    }
+
+    #[test]
+    fn delete_active_scope_moves_to_neighbor() {
+        let mut app = make_app();
+        app.create_scope(); // 2 个，active=1
+        app.create_scope(); // 3 个，active=2
+        app.delete_scope(2); // 删除活动 scope
+        assert_eq!(app.scopes.len(), 2);
+        assert_eq!(app.active_scope, 1);
+        assert_eq!(app.scopes[1].name, "Scope 2");
+    }
+
+    #[test]
+    fn delete_earlier_scope_adjusts_active_index() {
+        let mut app = make_app();
+        app.create_scope(); // 2 个，active=1
+        app.delete_scope(0); // 删除非活动且在前的 scope
+        assert_eq!(app.scopes.len(), 1);
+        assert_eq!(app.active_scope, 0);
+        assert_eq!(app.scopes[0].name, "Scope 2");
+    }
+
+    #[test]
+    fn delete_last_scope_recreates_empty_default() {
+        let mut app = make_app();
+        app.channel_panel.add_channel("v1".to_string(), egui::Color32::RED, ValueType::Float);
+        app.delete_scope(0);
+        assert_eq!(app.scopes.len(), 1);
+        assert_eq!(app.active_scope, 0);
+        assert_eq!(app.scopes[0].name, "Scope 1");
+        assert!(app.channel_panel.channels.is_empty());
+        assert!(app.variable_browser.checked_paths.is_empty());
+    }
+
+    #[test]
+    fn next_scope_name_skips_taken_numbers() {
+        let mut app = make_app();
+        assert_eq!(app.next_scope_name(), "Scope 2");
+        // 用户把 Scope 1 改名后，新 scope 可以补回空位
+        app.scopes[0].name = "Motor".to_string();
+        assert_eq!(app.next_scope_name(), "Scope 1");
+    }
+
+    #[test]
+    fn rename_commit_trims_and_empty_reverts() {
+        let mut app = make_app();
+        app.scope_rename = Some((0, "  Motor loop  ".to_string()));
+        app.commit_scope_rename();
+        assert_eq!(app.scopes[0].name, "Motor loop");
+        // 空白名回退原名
+        app.scope_rename = Some((0, "   ".to_string()));
+        app.commit_scope_rename();
+        assert_eq!(app.scopes[0].name, "Motor loop");
+    }
+
+    #[test]
+    fn project_round_trip_preserves_scopes() {
+        let mut app = make_app();
+        // scope 1：一个通道 + 独立参数（无 ELF → 保存后走工程地址覆盖表）
+        app.channel_panel.add_channel("pid.kp".to_string(), egui::Color32::RED, ValueType::Float);
+        app.watch_panel.sync_from_channels(&["pid.kp".to_string()], &[ValueType::Float], &[0x2000_0100]);
+        app.rate_hz = 8000;
+        app.controls.sample_rate = 8000;
+        app.window_size = 1500;
+        app.create_scope();
+        app.scopes[1].name = "Motor".to_string();
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("scopes_rt_{}.dapsproj", std::process::id()));
+        app.project_path = Some(path.display().to_string());
+        app.save_project();
+
+        // 全新应用打开同一工程
+        let mut app2 = make_app();
+        app2.open_project(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(app2.scopes.len(), 2, "两个 scope 都应恢复");
+        assert_eq!(app2.scopes[0].rate_hz, 8000);
+        assert_eq!(app2.scopes[0].window_size, 1500);
+        assert_eq!(app2.scopes[1].name, "Motor");
+        // 活动 scope 0：通道与 Watch 行恢复，无 ELF → 生成工程地址覆盖表
+        assert_eq!(app2.channel_panel.channel_count(), 1);
+        assert_eq!(app2.channel_panel.channels[0].name, "pid.kp");
+        assert_eq!(app2.watch_panel.entries[0].address, 0x2000_0100);
+        assert_eq!(
+            app2.scopes[0].saved_addresses.as_ref().and_then(|m| m.get("pid.kp")),
+            Some(&0x2000_0100)
+        );
+        // 切到 scope 1：空通道、空 Watch
+        app2.switch_to_scope(1);
+        assert_eq!(app2.active_scope, 1);
+        assert!(app2.channel_panel.channels.is_empty());
+        assert!(app2.watch_panel.entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scope_tab_tests {
+    use super::*;
+
+    #[test]
+    fn horizontal_tabs_do_not_overlap() {
+        // 回归：标签宽度必须按文本 galley 宽（size.x）计算；若误用行高
+        // 标签会窄到文字溢出互相重叠。三个长短悬殊的名称两两不重叠
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {}); // 初始化字体
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, label) in ["A", "Motor loop", "电流环 Current"].into_iter().enumerate() {
+                        let id = egui::Id::new(("scope_tab", i));
+                        let _ = scope_tab(ui, id, label, false);
+                    }
+                });
+            });
+        });
+
+        let mut boxes: Vec<egui::Rect> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                // 水平文字包围盒 = pos + galley 尺寸
+                boxes.push(egui::Rect::from_min_size(t.pos, t.galley.size()));
+            }
+        }
+        assert_eq!(boxes.len(), 3, "应绘制 3 个标签文字");
+        for b in &boxes {
+            assert!(b.width() > 5.0, "文字应实际渲染，包围盒 {:?}", b);
+        }
+        boxes.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        for w in boxes.windows(2) {
+            assert!(
+                w[1].left() >= w[0].right(),
+                "标签文字包围盒重叠: {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn tab_width_scales_with_text_length() {
+        // 长文本标签应显著宽于短文本标签（宽度来自文本而非固定值）
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, label) in ["A", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"].into_iter().enumerate() {
+                        let id = egui::Id::new(("scope_tab", i));
+                        let _ = scope_tab(ui, id, label, false);
+                    }
+                });
+            });
+        });
+        let mut widths: Vec<(String, f32)> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                let bbox = egui::Rect::from_min_size(t.pos, t.galley.size());
+                widths.push((t.galley.text().to_string(), bbox.width()));
+            }
+        }
+        assert_eq!(widths.len(), 2, "应绘制 2 个标签文字");
+        let short = widths.iter().find(|(t, _)| t == "A").expect("短文本").1;
+        let long = widths
+            .iter()
+            .find(|(t, _)| t.starts_with("AAA"))
+            .expect("长文本")
+            .1;
+        assert!(
+            long > short + 100.0,
+            "长文本标签应更宽: {} vs {}",
+            long,
+            short
+        );
+    }
+
+    // ---- × 删除交互回归（egui 交互模拟）----
+
+    /// 渲染一帧 scope 标签条
+    fn frame(app: &mut DapSamplerApp, ctx: &egui::Context, raw: egui::RawInput) -> egui::FullOutput {
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.show_scope_tabs(ui);
+            });
+        })
+    }
+
+    /// 从绘制形状中提取各标签 × 的中心点（每个 × 画 2 条线段，中点相同）
+    fn x_centers(output: &egui::FullOutput) -> Vec<egui::Pos2> {
+        let mut mids: Vec<egui::Pos2> = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::LineSegment { points, .. } = &clipped.shape {
+                mids.push(egui::pos2(
+                    (points[0].x + points[1].x) * 0.5,
+                    (points[0].y + points[1].y) * 0.5,
+                ));
+            }
+        }
+        mids.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        mids.dedup_by(|a, b| (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5);
+        mids
+    }
+
+    /// 模拟在 scopes[click_idx] 标签的 × 上完整点击（悬停→按下→按住数帧→松开），
+    /// 返回结束后的 scope 名称列表
+    fn click_x_and_collect(click_idx: usize) -> Vec<String> {
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1);
+        app.create_scope();
+        app.create_scope();
+        app.create_scope();
+        assert_eq!(app.scopes.len(), 4);
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0));
+        // 首帧：布局标签并取各 × 中心
+        let output = frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), ..Default::default() });
+        let centers = x_centers(&output);
+        assert_eq!(centers.len(), 4, "4 个标签应绘制 4 个 ×");
+        let target = centers[click_idx];
+
+        let button = egui::PointerButton::Primary;
+        let ev_move = egui::Event::PointerMoved(target);
+        let ev_press = egui::Event::PointerButton { pos: target, button, pressed: true, modifiers: egui::Modifiers::default() };
+        let ev_release = egui::Event::PointerButton { pos: target, button, pressed: false, modifiers: egui::Modifiers::default() };
+
+        // 悬停帧
+        frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), events: vec![ev_move], ..Default::default() });
+        // 按下帧
+        frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), events: vec![ev_press], ..Default::default() });
+        // 按住不放若干帧（回归：按住期间每帧删一个的级联删除）
+        for _ in 0..3 {
+            frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), ..Default::default() });
+        }
+        // 松开帧
+        frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), events: vec![ev_release], ..Default::default() });
+        // 松开后两帧（回归：id 串扰导致松开帧/下一帧误删或误建）
+        for _ in 0..2 {
+            frame(&mut app, &ctx, egui::RawInput { screen_rect: Some(screen), ..Default::default() });
+        }
+        app.scopes.iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn clicking_x_deletes_exactly_that_scope() {
+        // 回归：× 删除曾出现两类 bug——
+        // ① 按住期间 interact_pointer_pos 每帧有效 → 级联删除；
+        // ② 标签用布局序号自动 id，删除后下一个标签继承被删 id，
+        //    松开帧 clicked 落到错误标签（点 scope3 删 scope4、点最后
+        //    一个关不掉还可能触发 "+" 重建）。逐个位置验证恰好删一个。
+        let cases = [
+            (0usize, vec!["Scope 2", "Scope 3", "Scope 4"]),
+            (1usize, vec!["Scope 1", "Scope 3", "Scope 4"]),
+            (2usize, vec!["Scope 1", "Scope 2", "Scope 4"]),
+            (3usize, vec!["Scope 1", "Scope 2", "Scope 3"]),
+        ];
+        for (idx, expected) in cases {
+            let names = click_x_and_collect(idx);
+            assert_eq!(
+                names, expected,
+                "点击第 {} 个标签的 × 应只删除 Scope {}",
+                idx + 1,
+                idx + 1
+            );
+        }
     }
 }
 
@@ -3059,13 +3940,33 @@ mod elf_sync_tests {
     }
 
     #[test]
-    fn use_project_addresses_switches_to_manual_snapshot() {
-        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, None, vec![], 1);
+    fn use_project_addresses_sets_saved_address_overrides() {
+        // 多 scope 语义：按名字生成每 scope 的地址覆盖表，通道/勾选不动；
+        // 活动 scope 的 Watch 行地址同步为工程值
+        let elf = ElfContext {
+            file_path: "C:/fw/fw.elf".to_string(),
+            variables: vec![elf_var("pid.kp", 0x2000_0200)],
+        };
+        let mut app = DapSamplerApp::new(vec![], vec![], 5000, None, Some(elf), vec![], 1);
+        app.create_scope(); // 现在有两个 scope，覆盖表应作用于全部
+        app.channel_panel.add_channel("pid.kp".to_string(), egui::Color32::RED, ValueType::Float);
+        app.watch_panel.sync_from_channels(
+            &["pid.kp".to_string()],
+            &[ValueType::Float],
+            &[0x2000_0200],
+        );
         let vars = vec![project_var("pid.kp", 0x2000_0100)];
         app.use_project_addresses(&vars);
-        assert_eq!(app.manual_addresses, vec![0x2000_0100]);
-        assert_eq!(app.manual_channel_names, vec!["pid.kp".to_string()]);
+        // 手工快照不参与（地址走 ELF 解析或覆盖表）
+        assert!(app.manual_addresses.is_empty());
+        // 通道保持不动
         assert!(app.channel_panel.has_channel("pid.kp"));
+        // 所有 scope 都拿到覆盖表
+        for scope in &app.scopes {
+            let overrides = scope.saved_addresses.as_ref().expect("应生成地址覆盖表");
+            assert_eq!(overrides.get("pid.kp"), Some(&0x2000_0100));
+        }
+        // 活动 scope 的 Watch 行地址更新为工程值
         let entry = app.watch_panel.entries.iter().find(|e| e.name == "pid.kp").unwrap();
         assert_eq!(entry.address, 0x2000_0100);
     }

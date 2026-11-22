@@ -1531,21 +1531,20 @@ impl DapSamplerApp {
         self.stop_pipeline();
         self.controls.set_stopped();
         // 释放 USB 设备：发送 DAP_Disconnect + release_interface
-        // 不发送 DAP_Disconnect 会导致 DAP-Link 固件认为调试器仍连接着
+        // 不发送 DAP_Disconnect 会导致 DAP-Link 固件认为调试器仍连接着。
+        // release 只借 &self，经 Arc 直接调用：即使残留其他 Arc 引用也
+        // 立即执行（旧实现的 Arc::try_unwrap 失败分支从不释放，把释放
+        // 推迟到最后一个引用 Drop，固件断开被无限期推迟）
+        let mut release_unconfirmed = false;
         if let Some(usb) = self.active_usb.take() {
-            match Arc::try_unwrap(usb) {
-                Ok(mut bulk) => {
-                    bulk.release();
-                }
-                Err(arc) => {
-                    if let Some(bulk) = Arc::get_mut(&mut arc.clone()) {
-                        bulk.release();
-                    }
-                    drop(arc);
-                }
-            }
+            release_unconfirmed = !usb.release();
         }
         self.set_status(t("Acquisition stopped"));
+        if release_unconfirmed {
+            self.set_warning(t(
+                "DAP-Link did not confirm disconnect: the device may still appear occupied to other tools. Unplug and replug the DAP-Link if Keil cannot connect.",
+            ));
+        }
     }
 
     // ---- 多 scope 管理 ----
@@ -2988,14 +2987,9 @@ impl Drop for DapSamplerApp {
             handle.stop();
         }
         // 显式释放 USB：发送 DAP_Disconnect + release_interface
+        // （release 只借 &self，经 Arc 直接调用，见 stop_acquisition 注释）
         if let Some(usb) = self.active_usb.take() {
-            match Arc::try_unwrap(usb) {
-                Ok(mut bulk) => { bulk.release(); }
-                Err(arc) => {
-                    if let Some(bulk) = Arc::get_mut(&mut arc.clone()) { bulk.release(); }
-                    drop(arc);
-                }
-            }
+            let _ = usb.release();
         }
     }
 }

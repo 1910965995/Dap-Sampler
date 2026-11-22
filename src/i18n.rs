@@ -179,6 +179,10 @@ const ZH_TABLE: &[(&str, &str)] = &[
     // ---- 采集 ----
     ("Acquisition started", "开始采集"),
     ("Acquisition stopped", "采集已停止"),
+    (
+        "DAP-Link did not confirm disconnect: the device may still appear occupied to other tools. Unplug and replug the DAP-Link if Keil cannot connect.",
+        "DAP-Link 未确认断开：设备在其他工具中可能仍显示被占用。若 Keil 无法连接，请重新插拔 DAP-Link。",
+    ),
     ("Failed to start acquisition: {}", "启动采集失败: {}"),
     ("Acquisition aborted: {}", "采集异常中止: {}"),
     ("Buffer capacity changed to {} points (applies on next Start)", "缓冲容量已改为 {} 点（下次开始采集时生效）"),

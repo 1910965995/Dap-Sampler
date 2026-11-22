@@ -1,5 +1,6 @@
 use rusb;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use crate::error::*;
 use crate::usb::device;
 
@@ -11,8 +12,10 @@ pub struct BulkTransfer {
     timeout: Duration,
     /// 已 claim 的 USB 接口号，释放时需要 release_interface
     interface_num: u8,
-    /// 是否已显式 release（避免 Drop 时重复释放）
-    released: bool,
+    /// 是否已显式 release（避免 Drop 时重复释放）。
+    /// 原子类型使 release() 可以只借 &self——经 Arc 直接调用，不再依赖
+    /// Arc::try_unwrap（旧实现在还有其他 Arc 引用时静默跳过释放）。
+    released: AtomicBool,
 }
 
 impl BulkTransfer {
@@ -27,7 +30,7 @@ impl BulkTransfer {
             ep_in,
             timeout: Duration::from_millis(1000),
             interface_num,
-            released: false,
+            released: AtomicBool::new(false),
         };
         // 清空 USB IN 端点缓冲区中可能残留的数据
         // （流水线非阻塞写入后可能残留未读响应）
@@ -37,42 +40,85 @@ impl BulkTransfer {
 
     /// 显式释放 USB 接口和设备
     ///
-    /// 高采样率下停止时，DAP-Link IN 端点可能堆积大量未读响应。
-    /// 必须先排空这些残留响应，否则 DAP_Disconnect 命令会被淹没，
-    /// DAP-Link 固件仍处于忙状态，Keil 等工具无法重新连接。
-    pub fn release(&mut self) {
-        if self.released {
-            return;
+    /// 返回 `true` 表示固件已确认 DAP_Disconnect（收到 0x03 回显）；
+    /// `false` 表示未确认——部分厂家固件在流水线高负载停止后不处理
+    /// 排队命令，调试会话残留，设备在其他工具（Keil/pyOCD 等）看来
+    /// 仍处于占用状态，需要重新插拔恢复。
+    ///
+    /// 释放序列对齐 Keil 停止调试会话的行为（这是两个厂家 DAP-Link
+    /// 在 Keil 下都能正常释放、在我们的应用下表现不一致的根源——
+    /// Keil 只在会话空闲时断开，旧实现在流水线仍有在途响应时就断开，
+    /// 且从不确认固件真的收到了 DAP_Disconnect）：
+    ///
+    /// 1. 排空 IN 端点全部残留响应（等待 100ms 静默，总上限 2s），
+    ///    让固件先处理完在途 DAP_Transfer，断开命令不会被淹没
+    /// 2. DAP_Disconnect 并**确认回显**，未确认则重试（最多 3 次）
+    /// 3. DAP_HostStatus(connected=0, running=0) 关闭连接状态
+    /// 4. release_interface
+    pub fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return true;
         }
-        self.released = true;
-        // 1. 排空 USB IN 端点的所有残留响应
-        //    高速采样时可能有上千个未读响应堆积在缓冲区中
-        let mut drain_count = 0;
         let mut buf = [0u8; 1024];
+
+        // 1. 排空 USB IN 端点的所有残留响应
+        //    高速采样时可能有上千个未读响应堆积在缓冲区中；停止瞬间
+        //    固件可能仍在执行在途命令（WAIT 重试），响应会晚到，因此
+        //    以 100ms 无数据为静默判据，并设总上限防止固件异常时卡死
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        let mut drained = 0usize;
         loop {
-            match self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(50)) {
-                Ok(n) if n > 0 => {
-                    drain_count += 1;
-                    // 继续读，直到超时无数据
-                }
+            match self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(100)) {
+                Ok(n) if n > 0 => drained += n,
                 _ => break,
             }
+            if Instant::now() >= drain_deadline {
+                log::warn!("drain hit 2s deadline, IN endpoint may still have pending responses");
+                break;
+            }
         }
-        if drain_count > 0 {
-            log::info!("drained {} stale USB responses", drain_count);
+        if drained > 0 {
+            log::info!("drained {} stale USB bytes", drained);
         }
 
-        // 2. 发送 DAP_Disconnect 命令，清理 CMSIS-DAP 连接状态
+        // 2. 发送 DAP_Disconnect 命令，清理 CMSIS-DAP 连接状态。
+        //    读到的回显必须是 0x03（命令码）——之前只读不验证，厂家
+        //    固件丢掉这条命令时应用毫无感知，固件永远停在连接态。
         log::info!("sending DAP_Disconnect command");
         let disconnect_cmd = [crate::dap::commands::DAP_DISCONNECT];
-        if let Err(e) = self.handle.write_bulk(self.ep_out, &disconnect_cmd, Duration::from_millis(200)) {
-            log::warn!("DAP_Disconnect send failed: {}", e);
+        let mut confirmed = false;
+        for attempt in 1..=3 {
+            if let Err(e) = self.handle.write_bulk(self.ep_out, &disconnect_cmd, Duration::from_millis(200)) {
+                log::warn!("DAP_Disconnect send failed (attempt {}): {}", attempt, e);
+                continue;
+            }
+            // 跳过迟到的旧响应，直到读到 0x03 回显（上限 600ms）
+            let echo_deadline = Instant::now() + Duration::from_millis(600);
+            while Instant::now() < echo_deadline {
+                match self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(200)) {
+                    Ok(n) if n > 0 && buf[0] == crate::dap::commands::DAP_DISCONNECT => {
+                        confirmed = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            if confirmed {
+                break;
+            }
+            log::warn!("DAP_Disconnect not confirmed (attempt {}), retrying", attempt);
+        }
+        if confirmed {
+            log::info!("DAP_Disconnect confirmed by firmware");
         } else {
-            // 读取 DAP_Disconnect 响应
-            let _ = self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(200));
+            log::warn!(
+                "DAP_Disconnect NOT confirmed after 3 attempts: firmware may keep the debug \
+                 session active and the device stays occupied for other tools until replug"
+            );
         }
 
-        // 3. 发送 DAP_HostStatus (Connect LED off)
+        // 3. 发送 DAP_HostStatus (connected=0, running=0)，关闭连接状态
         let host_status_cmd = [crate::dap::commands::DAP_LED, 0x00, 0x00];
         if self.handle.write_bulk(self.ep_out, &host_status_cmd, Duration::from_millis(200)).is_ok() {
             let _ = self.handle.read_bulk(self.ep_in, &mut buf, Duration::from_millis(200));
@@ -85,6 +131,7 @@ impl BulkTransfer {
         }
 
         log::info!("DAP-Link released");
+        confirmed
     }
 
     /// 设置超时
@@ -145,12 +192,12 @@ unsafe impl Sync for BulkTransfer {}
 impl Drop for BulkTransfer {
     /// 兜底释放：如果未显式调用 release()，Drop 时自动执行。
     ///
-    /// 这确保即使 Arc::try_unwrap 失败（如 PipelineEngine 仍持有引用），
+    /// 这确保即使调用方遗漏显式释放（或仍有其他 Arc 引用），
     /// USB 接口也能在最后一个引用释放时被正确释放，避免 DAP-Link 卡死。
     fn drop(&mut self) {
-        if !self.released {
+        if !self.released.load(Ordering::SeqCst) {
             log::warn!("BulkTransfer not explicitly released, auto-releasing on Drop");
-            self.release();
+            let _ = self.release();
         }
     }
 }

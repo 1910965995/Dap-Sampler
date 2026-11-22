@@ -1814,8 +1814,43 @@ impl DapSamplerApp {
                     switch_to = Some(i);
                 }
             }
-            // "+" 快捷新建
-            if ui.small_button("+").clicked() {
+            // "+" 快捷新建：矢量绘制，十字精确交于按钮几何中心——文本
+            // "+" 字形在 small_button 里偏右偏下，视觉不居中
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(SCOPE_TAB_H, SCOPE_TAB_H),
+                egui::Sense::click(),
+            );
+            let resp = resp.on_hover_text(t("New Oscilloscope"));
+            if ui.is_rect_visible(rect) {
+                let bg = if resp.hovered() {
+                    egui::Color32::from_gray(240)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                if bg != egui::Color32::TRANSPARENT {
+                    ui.painter().rect_filled(rect, egui::CornerRadius::same(4), bg);
+                }
+                let color = if resp.hovered() {
+                    egui::Color32::from_rgb(70, 74, 82)
+                } else {
+                    egui::Color32::from_rgb(110, 118, 128)
+                };
+                let c = rect.center();
+                let d = 4.0;
+                let stroke = egui::Stroke::new(1.2, color);
+                ui.painter().line_segment(
+                    [egui::pos2(c.x - d, c.y), egui::pos2(c.x + d, c.y)],
+                    stroke,
+                );
+                ui.painter().line_segment(
+                    [egui::pos2(c.x, c.y - d), egui::pos2(c.x, c.y + d)],
+                    stroke,
+                );
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
                 self.create_scope();
             }
         });
@@ -3412,11 +3447,19 @@ mod scope_tab_tests {
         })
     }
 
-    /// 从绘制形状中提取各标签 × 的中心点（每个 × 画 2 条线段，中点相同）
+    /// 从绘制形状中提取各标签 × 的中心点（每个 × 画 2 条对角线段，中点相同）
+    ///
+    /// 只取对角线段：scope 标签条上 "+" 快捷新建按钮画的十字是水平/垂直
+    /// 轴对齐线段，按斜率过滤排除
     fn x_centers(output: &egui::FullOutput) -> Vec<egui::Pos2> {
         let mut mids: Vec<egui::Pos2> = Vec::new();
         for clipped in &output.shapes {
             if let egui::Shape::LineSegment { points, .. } = &clipped.shape {
+                let dx = (points[1].x - points[0].x).abs();
+                let dy = (points[1].y - points[0].y).abs();
+                if dx < 0.5 || dy < 0.5 {
+                    continue; // 轴对齐线段（"+" 按钮），不是 ×
+                }
                 mids.push(egui::pos2(
                     (points[0].x + points[1].x) * 0.5,
                     (points[0].y + points[1].y) * 0.5,

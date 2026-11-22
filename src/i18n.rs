@@ -176,7 +176,12 @@ const ZH_TABLE: &[(&str, &str)] = &[
         "ELF file not found or failed to load:\n{}\n\nThe project will continue with saved variable addresses.",
         "ELF 文件未找到或加载失败:\n{}\n\n工程将继续使用已保存的变量地址。",
     ),
-    // ---- 采集 ----
+    // ---- 连接 / 采集 ----
+    ("\u{25b6} Connect", "▶ 连接"),
+    ("\u{23f9} Disconnect", "⏹ 断开连接"),
+    ("DAP-Link connected", "已连接 DAP-Link"),
+    ("DAP-Link disconnected", "已断开 DAP-Link"),
+    ("Connect the DAP-Link first", "请先连接 DAP-Link"),
     ("Acquisition started", "开始采集"),
     ("Acquisition stopped", "采集已停止"),
     (
@@ -194,6 +199,7 @@ const ZH_TABLE: &[(&str, &str)] = &[
     // ---- 示波器 scope ----
     ("Scope {}", "示波器 {}"),
     ("Switched to {}", "已切换到 {}"),
+    ("Switched to {} (disconnected: press Connect then Start)", "已切换到 {}（未连接：请先连接再开始）"),
     ("Switched to {} (no channels: press Start after adding variables)", "已切换到 {}（无通道: 添加变量后点击开始）"),
     ("Last oscilloscope removed, created a new empty one", "已删除最后一个示波器，新建了一个空示波器"),
     ("Oscilloscope removed, now on {}", "示波器已删除，当前为 {}"),

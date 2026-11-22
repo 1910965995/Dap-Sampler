@@ -380,3 +380,67 @@ impl SwdLink {
         Ok(f32::from_bits(raw))
     }
 }
+
+/// 在**已初始化的 SWD 会话**上写入一个变量（按字节大小 1/2/4/8）
+///
+/// 与 [`SwdLink::write_variable`] 相同的写入逻辑（子字读-改-写、64 位拆字），
+/// 但不拥有连接——不重连、不重新初始化。供 Pause 保持 USB 连接时的 Watch
+/// 写入复用：重连的初始化序列会让目标 MCU 复位。
+///
+/// 调用前提：该会话已完成 [`SwdLink::init_with_clock`]（DP 已上电、AP 已
+/// 选中）；写入请求自带 TAR 设置，自包含，不依赖会话的 TAR/AP 状态。
+pub fn write_variable_on_session(
+    dap: &DapProtocol,
+    usb: &BulkTransfer,
+    address: u32,
+    byte_size: u32,
+    value: u64,
+) -> Result<()> {
+    let execute = |requests: &[TransferRequest]| -> Result<()> {
+        let resp = dap.execute_transfer(usb, requests)?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
+        Ok(())
+    };
+    let acc = MemAccess::from_addr_size(address, byte_size);
+    if acc.words > 1 {
+        // 非 4 字节对齐时首尾字与相邻变量共享，无法安全写入
+        if acc.aligned_addr & 3 != 0 {
+            return Err(Error::Other(format!(
+                "8-byte variable at 0x{:08X} is not 4-byte aligned, cannot write",
+                address
+            )));
+        }
+        let (low, high) = MemAccess::split_wide(value);
+        return execute(&[
+            TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
+            TransferRequest::write_ap(AP_REG_DRW, low),
+            TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr.wrapping_add(4)),
+            TransferRequest::write_ap(AP_REG_DRW, high),
+        ]);
+    }
+    if acc.mask == u32::MAX {
+        return execute(&[
+            TransferRequest::write_ap(AP_REG_TAR, address),
+            TransferRequest::write_ap(AP_REG_DRW, value as u32),
+        ]);
+    }
+    // 子字变量：读对齐整字 → 合并 lane → 写回
+    let resp = dap.execute_transfer(
+        usb,
+        &[
+            TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
+            TransferRequest::read_ap(AP_REG_DRW),
+        ],
+    )?;
+    if resp.status != TRANSFER_OK {
+        return Err(Error::TransferFailed(resp.status, resp.count));
+    }
+    let current = resp.data.first().copied().unwrap_or(0);
+    let merged = acc.merge(current, value as u32);
+    execute(&[
+        TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
+        TransferRequest::write_ap(AP_REG_DRW, merged),
+    ])
+}

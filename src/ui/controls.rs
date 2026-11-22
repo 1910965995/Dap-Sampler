@@ -2,7 +2,7 @@
 use crate::i18n::t;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AcquisitionState {
-    /// 空闲（未开始）
+    /// 空闲（未采样；连接可以存在也可以不存在）
     Idle,
     /// 采集中
     Running,
@@ -11,7 +11,13 @@ pub enum AcquisitionState {
 /// 用户操作命令
 #[derive(Debug, Clone, Copy)]
 pub enum AcquisitionCommand {
+    /// 连接设备（USB + SWD 初始化，目标 MCU 会复位）
+    Connect,
+    /// 断开并释放设备
+    Disconnect,
+    /// 开始采样（要求已连接）
     Start,
+    /// 停止采样（不释放设备）
     Stop,
 }
 
@@ -60,26 +66,53 @@ impl ControlPanel {
         }
     }
 
-    /// 渲染采集控制按钮（Idle 显 Start，Running 显 Stop），返回用户操作
+    /// 渲染采集控制按钮，返回用户操作
     ///
-    /// 与参数输入分离，便于外部在按钮与参数之间插入其他控件（如 Follow）。
-    /// 不设 Pause：Stop 后波形冻结在屏上（下次 Start 才清空），重连 USB
-    /// 只需几百毫秒，暂停带来的状态区分与限制反成负担。
-    pub fn show_buttons(&mut self, ui: &mut egui::Ui) -> Option<AcquisitionCommand> {
+    /// 两个翻转按钮：`Connect ↔ Disconnect`（连接生命周期）与
+    /// `Start ↔ Stop`（采样生命周期，未连接时 Start 禁用——必须先
+    /// Connect；Stop 只停采样不释放设备，再次 Start 不重连不复位）。
+    /// 连接时序由用户显式控制：Connect 的初始化序列会让目标 MCU 复位，
+    /// 因此采样被 Stop 后无需重新连接即可继续 Start。
+    pub fn show_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        connected: bool,
+    ) -> Option<AcquisitionCommand> {
         let mut cmd = None;
 
-        // --- 采集控制按钮 ---
-        match self.state {
-            AcquisitionState::Idle => {
-                if ui.button(t("\u{25b6} Start")).clicked() {
-                    cmd = Some(AcquisitionCommand::Start);
-                }
-            }
-            AcquisitionState::Running => {
-                if ui.button(t("\u{23f9} Stop")).clicked() {
-                    cmd = Some(AcquisitionCommand::Stop);
-                }
-            }
+        // --- 连接控制：Connect ↔ Disconnect ---
+        let connect_label = if connected {
+            t("\u{23f9} Disconnect")
+        } else {
+            t("\u{25b6} Connect")
+        };
+        if ui.button(connect_label).clicked() {
+            cmd = Some(if connected {
+                AcquisitionCommand::Disconnect
+            } else {
+                AcquisitionCommand::Connect
+            });
+        }
+
+        // --- 采样控制：Start ↔ Stop（未连接时 Start 禁用）---
+        let sampling = self.state == AcquisitionState::Running;
+        let start_label = if sampling {
+            t("\u{23f9} Stop")
+        } else {
+            t("\u{25b6} Start")
+        };
+        let resp = ui.add_enabled(connected, egui::Button::new(start_label));
+        let resp = if !connected {
+            resp.on_disabled_hover_text(t("Connect the DAP-Link first"))
+        } else {
+            resp
+        };
+        if resp.clicked() {
+            cmd = Some(if sampling {
+                AcquisitionCommand::Stop
+            } else {
+                AcquisitionCommand::Start
+            });
         }
 
         cmd

@@ -357,8 +357,13 @@ impl Scope {
 /// DAP Sampler 主应用
 pub struct DapSamplerApp {
     pipeline: Option<PipelineHandle>,
-    /// 活跃的 USB 连接（Idle 时为 None，Start 时建立，Stop 时释放）
+    /// 活跃的 USB 连接（Connect 时建立，Disconnect/拔线时释放；
+    /// Stop 采样不释放——重新 Start 不重连、不复位）
     active_usb: Option<Arc<BulkTransfer>>,
+    /// 当前连接初始化时所用的 SWD 时钟（MHz）。SWD Clock 参数被修改
+    ///（或加载了不同时钟的 scope/工程）而连接仍是旧时钟时，连接会被
+    /// 断开，需要重新 Connect 以新时钟初始化
+    session_clock_mhz: u32,
     /// 手工模式地址（通过 --addresses 传入）
     manual_addresses: Vec<u32>,
     /// 采集开始时间（用于计算实际采样率）
@@ -647,7 +652,8 @@ impl DapSamplerApp {
 
         Self {
             pipeline: None,
-            active_usb: None,  // USB 连接推迟到 Start 时建立
+            active_usb: None,  // USB 连接推迟到 Connect 时建立
+            session_clock_mhz: swd_clock_mhz,
             manual_addresses,
             acquisition_start: None,
             display_buf: DisplayBuffer::new(crate::ui::controls::DEFAULT_BUFFER_CAPACITY),
@@ -1456,28 +1462,11 @@ impl DapSamplerApp {
         self.current_names = channel_names.clone();
         self.current_types = types.clone();
 
-        // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
+        // 2. 必须先连接（Connect 按钮）才能开始采样：Start 复用现有连接，
+        // 不重连、不重新初始化（重连的初始化序列会让目标 MCU 复位）
         if self.active_usb.is_none() {
-            let mut swd = match SwdLink::new() {
-                Ok(s) => s,
-                Err(e) => {
-                    self.set_error_with_hint(
-                        tf("Failed to connect to DAP-Link: {}", &[&e.to_string()]),
-                        t(CONNECTION_HINT),
-                    );
-                    return;
-                }
-            };
-            let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
-            if let Err(e) = swd.init_with_clock(clock_hz) {
-                self.set_error_with_hint(
-                    tf("SWD initialization failed: {}", &[&e.to_string()]),
-                    t(CONNECTION_HINT),
-                );
-                return;
-            }
-            let (usb, _) = swd.into_parts();
-            self.active_usb = Some(Arc::new(usb));
+            self.set_error(t("Connect the DAP-Link first"));
+            return;
         }
 
         // 3. 更新波形面板（通道名和类型）
@@ -1527,11 +1516,41 @@ impl DapSamplerApp {
         self.controls.actual_rate_hz = 0.0;
     }
 
-    fn stop_acquisition(&mut self) {
+    /// 连接设备：USB 打开 + SWD 初始化（目标 MCU 会复位——探针固件的
+    /// 连接行为，已由用户确认接受）。只连接，不开始采样。
+    fn connect_device(&mut self) {
+        if self.active_usb.is_some() {
+            return; // 已连接
+        }
+        let mut swd = match SwdLink::new() {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_error_with_hint(
+                    tf("Failed to connect to DAP-Link: {}", &[&e.to_string()]),
+                    t(CONNECTION_HINT),
+                );
+                return;
+            }
+        };
+        let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
+        if let Err(e) = swd.init_with_clock(clock_hz) {
+            self.set_error_with_hint(
+                tf("SWD initialization failed: {}", &[&e.to_string()]),
+                t(CONNECTION_HINT),
+            );
+            return;
+        }
+        let (usb, _) = swd.into_parts();
+        self.session_clock_mhz = self.swd_clock_mhz;
+        self.active_usb = Some(Arc::new(usb));
+        self.set_status(t("DAP-Link connected"));
+    }
+
+    /// 断开设备：停止采样（若在采）并释放 USB（DAP_Disconnect +
+    /// release_interface），设备交还给其他工具使用
+    fn disconnect_device(&mut self) {
         self.stop_pipeline();
         self.controls.set_stopped();
-        // 释放 USB 设备：发送 DAP_Disconnect + release_interface
-        // 不发送 DAP_Disconnect 会导致 DAP-Link 固件认为调试器仍连接着。
         // release 只借 &self，经 Arc 直接调用：即使残留其他 Arc 引用也
         // 立即执行（旧实现的 Arc::try_unwrap 失败分支从不释放，把释放
         // 推迟到最后一个引用 Drop，固件断开被无限期推迟）
@@ -1539,12 +1558,20 @@ impl DapSamplerApp {
         if let Some(usb) = self.active_usb.take() {
             release_unconfirmed = !usb.release();
         }
-        self.set_status(t("Acquisition stopped"));
+        self.set_status(t("DAP-Link disconnected"));
         if release_unconfirmed {
             self.set_warning(t(
                 "DAP-Link did not confirm disconnect: the device may still appear occupied to other tools. Unplug and replug the DAP-Link if Keil cannot connect.",
             ));
         }
+    }
+
+    /// 停止采样：只停流水线，**不释放设备**——SWD 会话保持，重新 Start
+    /// 不重连、不复位。释放设备走 Disconnect。
+    fn stop_acquisition(&mut self) {
+        self.stop_pipeline();
+        self.controls.set_stopped();
+        self.set_status(t("Acquisition stopped"));
     }
 
     // ---- 多 scope 管理 ----
@@ -1609,13 +1636,24 @@ impl DapSamplerApp {
 
     /// 切换完成后的收尾：按「采样状态跟随切换」规则决定是否自动开始
     ///
-    /// 切换前在采集/暂停 → 用新 scope 自己的参数自动重新开始；本来就空闲
-    /// → 保持空闲。新 scope 没有通道时无法采样，提示先添加变量。
+    /// 切换前在采样且连接可用（新 scope 时钟与会话一致）→ 自动重新开始；
+    /// 时钟不一致已被断开 → 不自动开始，提示先 Connect 再 Start；新 scope
+    /// 没有通道时无法采样，提示先添加变量。
     fn finish_scope_switch(&mut self, was_running: bool) {
+        // 新 scope 的 SWD Clock 与当前连接会话不一致时必须断开重连
+        if self.active_usb.is_some() && self.session_clock_mhz != self.swd_clock_mhz {
+            self.disconnect_device();
+        }
+        let connected = self.active_usb.is_some();
         let name = self.scopes[self.active_scope].name.clone();
-        if was_running && !self.scopes[self.active_scope].channels.is_empty() {
+        if was_running && connected && !self.scopes[self.active_scope].channels.is_empty() {
             self.set_status(tf("Switched to {}", &[&name]));
             self.start_acquisition();
+        } else if was_running && !connected {
+            self.set_status(tf(
+                "Switched to {} (disconnected: press Connect then Start)",
+                &[&name],
+            ));
         } else if was_running {
             self.set_status(tf(
                 "Switched to {} (no channels: press Start after adding variables)",
@@ -1628,8 +1666,9 @@ impl DapSamplerApp {
 
     /// 切换到 scopes[idx]（点击 scope 标签）
     ///
-    /// 每个 scope 的 SWD Clock 独立，连接必须以新时钟重新初始化，因此
-    /// 切换总是先停止采集并释放 USB（自动开始的 Start 会重新连接）。
+    /// 切换先停止采样（保持连接）；若新 scope 的 SWD Clock 与当前连接
+    /// 会话不一致，连接会被断开（见 finish_scope_switch），需要重新
+    /// Connect 以新时钟初始化。
     fn switch_to_scope(&mut self, idx: usize) {
         if idx >= self.scopes.len() || idx == self.active_scope {
             return;
@@ -1874,59 +1913,95 @@ impl DapSamplerApp {
                 }
             }
         } else {
-            // 采集未运行时，直接通过 SwdLink 写入。
-            // 按 Watch 行的实时地址写入（current_* 是上次运行的快照，已过期）
-            match SwdLink::new() {
-                Ok(mut swd) => {
-                    let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
-                    if let Err(e) = swd.init_with_clock(clock_hz) {
-                        log::error!("SWD initialization failed before write: {}", e);
-                        self.set_error_with_hint(
-                            tf("Write failed: SWD initialization failed: {}", &[&e.to_string()]),
-                            t(CONNECTION_HINT),
-                        );
-                        return;
-                    }
-                    for w in &writes {
-                        let Some(entry) = self
-                            .watch_panel
-                            .entries
-                            .iter()
-                            .find(|e| e.name == w.channel_name)
-                        else {
-                            log::warn!(
-                                "write request dropped: channel '{}' not in the Watch list",
-                                w.channel_name
-                            );
+            // 采集未运行时的写入：优先复用 Pause 保持的 SWD 会话——不重连、
+            // 不重新初始化（重连的初始化序列会让目标 MCU 复位）；仅在无
+            // 连接时新建并初始化。按 Watch 行的实时地址写入
+            //（current_* 是上次运行的快照，已过期）。
+            let mut resolved: Vec<(String, u32, u32, u64)> = Vec::with_capacity(writes.len());
+            for w in &writes {
+                let Some(entry) = self
+                    .watch_panel
+                    .entries
+                    .iter()
+                    .find(|e| e.name == w.channel_name)
+                else {
+                    log::warn!(
+                        "write request dropped: channel '{}' not in the Watch list",
+                        w.channel_name
+                    );
+                    self.set_error(tf(
+                        "Write failed: channel '{}' is not in the Watch list",
+                        &[&w.channel_name],
+                    ));
+                    continue;
+                };
+                resolved.push((
+                    w.channel_name.clone(),
+                    entry.address,
+                    entry.value_type.byte_size(),
+                    w.raw_value,
+                ));
+            }
+
+            if let Some(usb) = self.active_usb.clone() {
+                // Pause 保持的会话仍有效：直接在其上写入
+                let dap = DapProtocol::new();
+                for (name, address, byte_size, value) in &resolved {
+                    match crate::dap::swd::write_variable_on_session(
+                        &dap,
+                        &usb,
+                        *address,
+                        *byte_size,
+                        *value,
+                    ) {
+                        Ok(()) => log::info!(
+                            "wrote channel '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
+                            name, value, address, byte_size
+                        ),
+                        Err(e) => {
+                            log::error!("failed to write channel '{}': {}", name, e);
                             self.set_error(tf(
-                                "Write failed: channel '{}' is not in the Watch list",
-                                &[&w.channel_name],
+                                "Write failed for channel '{}': {}",
+                                &[name, &e.to_string()],
                             ));
-                            continue;
-                        };
-                        match swd.write_variable(entry.address, entry.value_type.byte_size(), w.raw_value) {
-                            Ok(()) => log::info!(
-                                "wrote channel '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
-                                w.channel_name, w.raw_value, entry.address, entry.value_type.byte_size()
-                            ),
-                            Err(e) => {
-                                log::error!(
-                                    "failed to write channel '{}': {}", w.channel_name, e
-                                );
-                                self.set_error(tf(
-                                    "Write failed for channel '{}': {}",
-                                    &[&w.channel_name, &e.to_string()],
-                                ));
-                            }
                         }
                     }
                 }
-                Err(e) => {
-                    log::error!("failed to connect to DAP-Link for write: {}", e);
-                    self.set_error_with_hint(
-                        tf("Write failed: cannot connect to DAP-Link: {}", &[&e.to_string()]),
-                        t(CONNECTION_HINT),
-                    );
+            } else {
+                match SwdLink::new() {
+                    Ok(mut swd) => {
+                        let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
+                        if let Err(e) = swd.init_with_clock(clock_hz) {
+                            log::error!("SWD initialization failed before write: {}", e);
+                            self.set_error_with_hint(
+                                tf("Write failed: SWD initialization failed: {}", &[&e.to_string()]),
+                                t(CONNECTION_HINT),
+                            );
+                            return;
+                        }
+                        for (name, address, byte_size, value) in &resolved {
+                            match swd.write_variable(*address, *byte_size, *value) {
+                                Ok(()) => log::info!(
+                                    "wrote channel '{}': 0x{:08X} → 0x{:08X} ({} bytes)",
+                                    name, value, address, byte_size
+                                ),
+                                Err(e) => {
+                                    log::error!("failed to write channel '{}': {}", name, e);
+                                    self.set_error(tf(
+                                        "Write failed for channel '{}': {}",
+                                        &[name, &e.to_string()],
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("failed to connect to DAP-Link for write: {}", e);
+                        self.set_error_with_hint(
+                            tf("Write failed: cannot connect to DAP-Link: {}", &[&e.to_string()]),
+                            t(CONNECTION_HINT),
+                        );
+                    }
                 }
             }
         }
@@ -2300,6 +2375,11 @@ impl eframe::App for DapSamplerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 统一浅色主题 + 滚动条灰色风格（见 apply_theme 注释）
         apply_theme(ctx);
+        // SWD Clock 被修改（改参数/加载工程/切 scope）而连接仍是旧时钟：
+        // 断开连接，让用户重新 Connect 以新时钟初始化
+        if self.active_usb.is_some() && self.session_clock_mhz != self.swd_clock_mhz {
+            self.disconnect_device();
+        }
         // Idle 状态检测 ELF 文件变化（无其他弹窗占用时）
         if self.controls.state == AcquisitionState::Idle
             && self.elf_ctx.is_some()
@@ -2325,7 +2405,8 @@ impl eframe::App for DapSamplerApp {
                 None
             };
             if let Some(msg) = fatal {
-                self.stop_acquisition();
+                // 致命错误多为设备拔出/管道损坏：连接已不可用，断开释放
+                self.disconnect_device();
                 // 中止原因基本是 USB 读/写失败（设备拔出等），附带连接排障建议
                 self.set_error_with_hint(tf("Acquisition aborted: {}", &[&msg]), t(CONNECTION_HINT));
             }
@@ -2618,13 +2699,14 @@ impl eframe::App for DapSamplerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // 工具栏：采集控制 + 参数 + 显示模式
             ui.horizontal_wrapped(|ui| {
-                if let Some(cmd) = self.controls.show_buttons(ui) {
+                if let Some(cmd) =
+                    self.controls
+                        .show_buttons(ui, self.active_usb.is_some())
+                {
                     match cmd {
-                        AcquisitionCommand::Start => {
-                            if self.controls.state == AcquisitionState::Idle {
-                                self.start_acquisition();
-                            }
-                        }
+                        AcquisitionCommand::Connect => self.connect_device(),
+                        AcquisitionCommand::Disconnect => self.disconnect_device(),
+                        AcquisitionCommand::Start => self.start_acquisition(),
                         AcquisitionCommand::Stop => self.stop_acquisition(),
                     }
                 }
@@ -2976,7 +3058,8 @@ impl eframe::App for DapSamplerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.stop_acquisition();
+        // 退出时断开设备：停止采样并释放 USB
+        self.disconnect_device();
     }
 }
 

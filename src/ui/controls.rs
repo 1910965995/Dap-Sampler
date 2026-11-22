@@ -44,7 +44,7 @@ pub const BUFFER_CAPACITY_MAX: usize = 1_000_000;
 pub const DEFAULT_BUFFER_CAPACITY: usize = 200_000;
 
 /// SWD 时钟可选档位（MHz）
-pub const SWD_CLOCK_OPTIONS: &[u32] = &[1, 2, 5, 10, 20, 30, 50];
+pub const SWD_CLOCK_OPTIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 50];
 
 impl ControlPanel {
     pub fn new(sample_rate: u32, target_count: Option<u64>, swd_clock_mhz: u32) -> Self {

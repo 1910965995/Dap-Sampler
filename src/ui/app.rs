@@ -16,6 +16,7 @@ use super::variable_browser::VariableBrowser;
 use super::channel_panel::{ChannelPanel, ChannelEntry};
 use super::watch_panel::{WatchPanel, WatchEntry};
 use crate::project::{ProjectFile, ProjectScope, ProjectVariable, PROJECT_VERSION};
+use crate::i18n::{t, tf};
 
 /// Idle 状态下 ELF 文件变化检测的轮询间隔
 const ELF_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -636,7 +637,7 @@ impl DapSamplerApp {
             .and_then(|m| m.modified().ok());
 
         // 默认 scope（"Scope 1"）：参数取 CLI 注入值，与全局镜像保持一致
-        let mut default_scope = Scope::new("Scope 1".to_string());
+        let mut default_scope = Scope::new(tf("Scope {}", &["1"]));
         default_scope.id = 1;
         default_scope.rate_hz =
             rate_hz.clamp(crate::ui::controls::RATE_MIN, crate::ui::controls::RATE_MAX);
@@ -677,7 +678,7 @@ impl DapSamplerApp {
             display_mode,
             window_size: 2000,
             // 启动时状态栏默认显示 Ready
-            status_text: Some("Ready".to_string()),
+            status_text: Some(t("Ready").to_string()),
             status_is_error: false,
             status_is_warning: false,
             status_hint: None,
@@ -797,7 +798,7 @@ impl DapSamplerApp {
             None => message,
         };
         self.warning_popup = Some(WarningPopup {
-            title: "Error",
+            title: t("Error"),
             message,
         });
     }
@@ -848,7 +849,7 @@ impl DapSamplerApp {
         // 重置为单个默认空 scope：通道 / Watch / 参数全部回默认
         // （与启动一致：5000 Hz / 2000 点 / 1 MHz / Line）
         self.buffer_capacity = crate::ui::controls::DEFAULT_BUFFER_CAPACITY;
-        self.scopes = vec![self.make_scope("Scope 1".to_string())];
+        self.scopes = vec![self.make_scope(tf("Scope {}", &["1"]))];
         self.active_scope = 0;
         self.scope_rename = None;
         self.scope_rename_needs_focus = false;
@@ -856,7 +857,7 @@ impl DapSamplerApp {
         self.watch_panel.reset_col_widths();
         self.controls.target_count = None;
         self.project_path = None;
-        self.set_status("New project created (config cleared)");
+        self.set_status(t("New project created (config cleared)"));
     }
 
     /// 弹出 ELF 文件选择对话框并加载
@@ -876,10 +877,10 @@ impl DapSamplerApp {
                     let variable_count = ctx.variables.len();
                     self.elf_ctx = Some(ctx);
                     self.refresh_elf_mtime();
-                    self.set_status(format!("ELF loaded: {} variables", variable_count));
+                    self.set_status(tf("ELF loaded: {} variables", &[&variable_count.to_string()]));
                 }
                 Err(e) => {
-                    self.set_error(format!("ELF load failed: {}", e));
+                    self.set_error(tf("ELF load failed: {}", &[&e.to_string()]));
                 }
             }
         }
@@ -888,7 +889,7 @@ impl DapSamplerApp {
     /// 将缓冲区全部数据导出为 CSV（Files → Export data to…）
     fn export_data(&mut self) {
         if self.display_buf.is_empty() {
-            self.set_error("No data to export: buffer is empty");
+            self.set_error(t("No data to export: buffer is empty"));
             return;
         }
         let Some(path) = rfd::FileDialog::new()
@@ -913,8 +914,8 @@ impl DapSamplerApp {
                 .and_then(|f| crate::export::write_csv(f, samples, &names, &types))
         };
         match result {
-            Ok(n) => self.set_status(format!("Data exported: {} samples to {}", n, path.display())),
-            Err(e) => self.set_error(format!("Failed to export data: {}", e)),
+            Ok(n) => self.set_status(tf("Data exported: {} samples to {}", &[&n.to_string(), &path.display().to_string()])),
+            Err(e) => self.set_error(tf("Failed to export data: {}", &[&e.to_string()])),
         }
     }
 
@@ -927,6 +928,7 @@ impl DapSamplerApp {
             elf_path: self.elf_ctx.as_ref().map(|c| c.file_path.clone()),
             buffer_capacity: self.buffer_capacity,
             watch_col_widths: self.watch_panel.col_widths().to_vec(),
+            language: crate::i18n::current().code().to_string(),
             scopes: self
                 .scopes
                 .iter()
@@ -975,9 +977,9 @@ impl DapSamplerApp {
         match std::fs::write(&path, json) {
             Ok(()) => {
                 self.project_path = Some(path.display().to_string());
-                self.set_status(format!("Project saved: {}", path.display()));
+                self.set_status(tf("Project saved: {}", &[&path.display().to_string()]));
             }
-            Err(e) => self.set_error(format!("Failed to save project: {}", e)),
+            Err(e) => self.set_error(tf("Failed to save project: {}", &[&e.to_string()])),
         }
     }
 
@@ -997,7 +999,7 @@ impl DapSamplerApp {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                self.set_error(format!("Failed to read project file: {}", e));
+                self.set_error(tf("Failed to read project file: {}", &[&e.to_string()]));
                 return;
             }
         };
@@ -1008,6 +1010,8 @@ impl DapSamplerApp {
                 return;
             }
         };
+        // 恢复界面语言（旧工程文件无此字段 → 英文默认）
+        crate::i18n::set_language(crate::i18n::Language::from_code(&file.language));
         // 所有 scope 的变量并集：ELF 同步 diff 与「使用工程地址」都按名字
         // 作用于全部 scope（同名变量共享同一地址）
         let all_variables: Vec<ProjectVariable> = file
@@ -1043,14 +1047,14 @@ impl DapSamplerApp {
                     // 只写状态栏不弹通用错误弹窗：下方 elf_warning 已是
                     // 专属弹窗，两个弹窗叠加反而干扰
                     log::error!("ELF load failed, continuing with saved variable addresses: {}", e);
-                    self.status_text = Some(format!("ELF load failed, continuing with saved variable addresses: {}", e));
+                    self.status_text = Some(tf("ELF load failed, continuing with saved variable addresses: {}", &[&e.to_string()]));
                     self.status_is_error = true;
                     self.status_is_warning = false;
                     self.status_hint = None;
                     // 弹窗警告：状态栏红字容易被忽略，ELF 缺失是打开工程的关键异常
-                    self.elf_warning = Some(format!(
+                    self.elf_warning = Some(tf(
                         "ELF file not found or failed to load:\n{}\n\nThe project will continue with saved variable addresses.",
-                        elf_path
+                        &[elf_path],
                     ));
                     self.show_elf_warning = true;
                     false
@@ -1074,14 +1078,13 @@ impl DapSamplerApp {
             restored.push(scope);
         }
         if !missing_all.is_empty() {
-            self.set_error(format!(
+            self.set_error(tf(
                 "{} variables in project not found in ELF, skipped: {}",
-                missing_all.len(),
-                missing_all.join(", ")
+                &[&missing_all.len().to_string(), &missing_all.join(", ")],
             ));
         }
         if restored.is_empty() {
-            restored.push(self.make_scope("Scope 1".to_string()));
+            restored.push(self.make_scope(tf("Scope {}", &["1"])));
         }
         self.scopes = restored;
         self.active_scope = 0;
@@ -1102,7 +1105,7 @@ impl DapSamplerApp {
         // 6. 记录工程路径
         self.project_path = Some(path.display().to_string());
         if !self.status_is_error {
-            self.set_status(format!("Project opened: {}", path.display()));
+            self.set_status(tf("Project opened: {}", &[&path.display().to_string()]));
         }
     }
 
@@ -1261,10 +1264,9 @@ impl DapSamplerApp {
         let addresses = self.collect_channel_addresses();
         self.watch_panel.sync_from_channels(&names, &types, &addresses);
         // 4. 反馈
-        self.set_status(format!(
+        self.set_status(tf(
             "ELF synchronized: {} addresses updated, {} variables removed",
-            prompt.address_diffs.len(),
-            prompt.missing.len()
+            &[&prompt.address_diffs.len().to_string(), &prompt.missing.len().to_string()],
         ));
         self.refresh_elf_mtime();
     }
@@ -1292,7 +1294,7 @@ impl DapSamplerApp {
             .map(|c| map.get(&c.name).copied().unwrap_or(0))
             .collect();
         self.watch_panel.sync_from_channels(&names, &types, &addresses);
-        self.set_status("Using saved variable addresses (ELF not synchronized)");
+        self.set_status(t("Using saved variable addresses (ELF not synchronized)"));
         self.refresh_elf_mtime();
     }
 
@@ -1319,7 +1321,7 @@ impl DapSamplerApp {
                     .as_ref()
                     .map(|c| c.file_path.clone())
                     .unwrap_or_default();
-                self.set_error(format!("ELF file is missing: {}", path));
+                self.set_error(tf("ELF file is missing: {}", &[&path]));
                 self.refresh_elf_mtime();
             } else {
                 // 文件被修改（mtime 变化）→ 弹 Reload 问答
@@ -1381,10 +1383,10 @@ impl DapSamplerApp {
                 let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
                 let addresses = self.collect_channel_addresses();
                 self.watch_panel.sync_from_channels(&names, &types, &addresses);
-                self.set_status(format!("ELF reloaded: {} variables", variable_count));
+                self.set_status(tf("ELF reloaded: {} variables", &[&variable_count.to_string()]));
             }
             Err(e) => {
-                self.set_error(format!("ELF reload failed: {}", e));
+                self.set_error(tf("ELF reload failed: {}", &[&e.to_string()]));
             }
         }
         self.refresh_elf_mtime();
@@ -1413,7 +1415,7 @@ impl DapSamplerApp {
                 // ELF 缺失/差异也能按工程值采样），再按 ELF 解析
                 let channels = &self.channel_panel.channels;
                 if channels.is_empty() {
-                    self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
+                    self.set_error(t("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses"));
                     return;
                 }
                 let overrides = self.scopes[self.active_scope].saved_addresses.clone();
@@ -1433,7 +1435,7 @@ impl DapSamplerApp {
                     .collect();
 
                 if matched.is_empty() {
-                    self.set_error("Channels selected but no matching variable addresses found: check ELF symbols/debug info");
+                    self.set_error(t("Channels selected but no matching variable addresses found: check ELF symbols/debug info"));
                     return;
                 }
 
@@ -1445,7 +1447,7 @@ impl DapSamplerApp {
             };
 
         if addresses.is_empty() {
-            self.set_error("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses");
+            self.set_error(t("No sampling channel selected: load an ELF and check variables, or specify addresses with --addresses"));
             return;
         }
 
@@ -1460,8 +1462,8 @@ impl DapSamplerApp {
                 Ok(s) => s,
                 Err(e) => {
                     self.set_error_with_hint(
-                        format!("Failed to connect to DAP-Link: {}", e),
-                        CONNECTION_HINT,
+                        tf("Failed to connect to DAP-Link: {}", &[&e.to_string()]),
+                        t(CONNECTION_HINT),
                     );
                     return;
                 }
@@ -1469,8 +1471,8 @@ impl DapSamplerApp {
             let clock_hz = self.swd_clock_mhz.saturating_mul(1_000_000);
             if let Err(e) = swd.init_with_clock(clock_hz) {
                 self.set_error_with_hint(
-                    format!("SWD initialization failed: {}", e),
-                    CONNECTION_HINT,
+                    tf("SWD initialization failed: {}", &[&e.to_string()]),
+                    t(CONNECTION_HINT),
                 );
                 return;
             }
@@ -1509,9 +1511,9 @@ impl DapSamplerApp {
                 self.pipeline = Some(handle);
                 self.controls.set_running();
                 self.acquisition_start = Some(Instant::now());
-                self.set_status("Acquisition started");
+                self.set_status(t("Acquisition started"));
             }
-            Err(e) => self.set_error(format!("Failed to start acquisition: {}", e)),
+            Err(e) => self.set_error(tf("Failed to start acquisition: {}", &[&e.to_string()])),
         }
     }
 
@@ -1543,7 +1545,7 @@ impl DapSamplerApp {
                 }
             }
         }
-        self.set_status("Acquisition stopped");
+        self.set_status(t("Acquisition stopped"));
     }
 
     // ---- 多 scope 管理 ----
@@ -1613,15 +1615,15 @@ impl DapSamplerApp {
     fn finish_scope_switch(&mut self, was_running: bool) {
         let name = self.scopes[self.active_scope].name.clone();
         if was_running && !self.scopes[self.active_scope].channels.is_empty() {
-            self.set_status(format!("Switched to {}", name));
+            self.set_status(tf("Switched to {}", &[&name]));
             self.start_acquisition();
         } else if was_running {
-            self.set_status(format!(
+            self.set_status(tf(
                 "Switched to {} (no channels: press Start after adding variables)",
-                name
+                &[&name],
             ));
         } else {
-            self.set_status(format!("Switched to {}", name));
+            self.set_status(tf("Switched to {}", &[&name]));
         }
     }
 
@@ -1669,7 +1671,7 @@ impl DapSamplerApp {
             self.scopes.push(scope);
             self.active_scope = 0;
             self.load_scope_views(0);
-            self.set_status("Last oscilloscope removed, created a new empty one");
+            self.set_status(t("Last oscilloscope removed, created a new empty one"));
             return;
         }
         if idx == self.active_scope {
@@ -1684,7 +1686,7 @@ impl DapSamplerApp {
                 self.active_scope -= 1;
             }
             let name = self.scopes[self.active_scope].name.clone();
-            self.set_status(format!("Oscilloscope removed, now on {}", name));
+            self.set_status(tf("Oscilloscope removed, now on {}", &[&name]));
         }
     }
 
@@ -1700,7 +1702,7 @@ impl DapSamplerApp {
     fn next_scope_name(&self) -> String {
         let mut n = 1;
         loop {
-            let candidate = format!("Scope {}", n);
+            let candidate = tf("Scope {}", &[&n.to_string()]);
             if self.scopes.iter().all(|s| s.name != candidate) {
                 return candidate;
             }
@@ -1821,7 +1823,7 @@ impl DapSamplerApp {
             .get(var_idx)
             .cloned()
             .unwrap_or_else(|| format!("channel #{}", var_idx));
-        format!("Write to '{}' was skipped: {}", name, reason)
+        tf("Write to '{}' was skipped: {}", &[&name, reason])
     }
 
     /// 处理 Watch 表格中的值写入请求
@@ -1836,7 +1838,7 @@ impl DapSamplerApp {
 
         if self.current_names.is_empty() {
             log::warn!("write request ignored: no sampling channels");
-            self.set_error("Write failed: no sampling channels");
+            self.set_error(t("Write failed: no sampling channels"));
             return;
         }
 
@@ -1855,9 +1857,9 @@ impl DapSamplerApp {
                             "write request dropped: channel '{}' not in the current sampling set",
                             w.channel_name
                         );
-                        self.set_error(format!(
+                        self.set_error(tf(
                             "Write failed: channel '{}' is not in the current sampling set",
-                            w.channel_name
+                            &[&w.channel_name],
                         ));
                     }
                 }
@@ -1881,8 +1883,8 @@ impl DapSamplerApp {
                     if let Err(e) = swd.init_with_clock(clock_hz) {
                         log::error!("SWD initialization failed before write: {}", e);
                         self.set_error_with_hint(
-                            format!("Write failed: SWD initialization failed: {}", e),
-                            CONNECTION_HINT,
+                            tf("Write failed: SWD initialization failed: {}", &[&e.to_string()]),
+                            t(CONNECTION_HINT),
                         );
                         return;
                     }
@@ -1897,9 +1899,9 @@ impl DapSamplerApp {
                                 "write request dropped: channel '{}' not in the Watch list",
                                 w.channel_name
                             );
-                            self.set_error(format!(
+                            self.set_error(tf(
                                 "Write failed: channel '{}' is not in the Watch list",
-                                w.channel_name
+                                &[&w.channel_name],
                             ));
                             continue;
                         };
@@ -1912,9 +1914,9 @@ impl DapSamplerApp {
                                 log::error!(
                                     "failed to write channel '{}': {}", w.channel_name, e
                                 );
-                                self.set_error(format!(
+                                self.set_error(tf(
                                     "Write failed for channel '{}': {}",
-                                    w.channel_name, e
+                                    &[&w.channel_name, &e.to_string()],
                                 ));
                             }
                         }
@@ -1923,8 +1925,8 @@ impl DapSamplerApp {
                 Err(e) => {
                     log::error!("failed to connect to DAP-Link for write: {}", e);
                     self.set_error_with_hint(
-                        format!("Write failed: cannot connect to DAP-Link: {}", e),
-                        CONNECTION_HINT,
+                        tf("Write failed: cannot connect to DAP-Link: {}", &[&e.to_string()]),
+                        t(CONNECTION_HINT),
                     );
                 }
             }
@@ -1947,9 +1949,9 @@ impl DapSamplerApp {
         }
 
         let label = if changes.len() == 1 {
-            "Changed variable"
+            t("Changed variable")
         } else {
-            "Changed variables"
+            t("Changed variables")
         };
         let names = changes
             .iter()
@@ -1958,12 +1960,12 @@ impl DapSamplerApp {
             .join(", ");
         // 状态栏：单行，超宽由 Label::truncate 显示省略号。
         // set_error 会先弹通用错误弹窗，下面再用专属弹窗覆盖
-        self.set_error("Stop acquisition before changing watched variables");
+        self.set_error(t("Stop acquisition before changing watched variables"));
         self.warning_popup = Some(WarningPopup {
-            title: "Acquisition Running",
-            message: format!(
+            title: t("Acquisition Running"),
+            message: tf(
                 "Stop acquisition before changing watched variables.\n{}: {}",
-                label, names
+                &[label, &names],
             ),
         });
     }
@@ -2022,23 +2024,23 @@ impl DapSamplerApp {
 
         if !rejected.is_empty() {
             let label = if rejected.len() == 1 {
-                "Unselected channel variable"
+                t("Unselected channel variable")
             } else {
-                "Unselected channel variables"
+                t("Unselected channel variables")
             };
             let names = rejected.join(", ");
             // 状态栏：单行，超宽由 Label::truncate 显示省略号。
             // set_error 会先弹通用错误弹窗，下面再用专属弹窗覆盖
-            self.set_error(format!(
+            self.set_error(tf(
                 "Only {} channels can be watched at a time. {}: {}",
-                MAX_VALUES, label, names
+                &[&MAX_VALUES.to_string(), label, &names],
             ));
             // 专属弹窗：多行，信息完整
             self.warning_popup = Some(WarningPopup {
-                title: "Channel Limit",
-                message: format!(
+                title: t("Channel Limit"),
+                message: tf(
                     "Only {} channels can be watched at a time.\n{}: {}",
-                    MAX_VALUES, label, names
+                    &[&MAX_VALUES.to_string(), label, &names],
                 ),
             });
         }
@@ -2080,7 +2082,7 @@ impl DapSamplerApp {
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
         // 未放置任何光标时：提示文字在标签页内容区内居中占满
         if self.cursor.cursor1.is_none() && self.cursor.cursor2.is_none() {
-            super::text::centered_hint(ui, "Click waveform to place cursor");
+            super::text::centered_hint(ui, t("Click waveform to place cursor"));
             return;
         }
         let types = self.waveform.value_types().to_vec();
@@ -2103,7 +2105,7 @@ impl DapSamplerApp {
         let c2 = self.cursor.cursor2;
         // 光标滑出缓冲提示用的缓冲区范围（提前取值，滚动闭包内只持有所有权值）
         let range_text = if self.display_buf.is_empty() {
-            "(buffer cleared)".to_string()
+            t("(buffer cleared)").to_string()
         } else {
             format!(
                 "[{} ~ {}]",
@@ -2117,7 +2119,7 @@ impl DapSamplerApp {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             // ---- Delta ----
             if let Some((dt, dv)) = delta {
-                ui.label(egui::RichText::new("Delta").strong());
+                ui.label(egui::RichText::new(t("Delta")).strong());
                 ui.label(egui::RichText::new(format!("\u{0394}T: {:.6} s", dt)).monospace());
                 for (i, v) in dv.iter().enumerate() {
                     let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
@@ -2130,7 +2132,7 @@ impl DapSamplerApp {
 
             // ---- Cursor 1 ----
             if let Some(r) = r1 {
-                ui.label(egui::RichText::new("Cursor 1").strong());
+                ui.label(egui::RichText::new(t("Cursor 1")).strong());
                 // 时刻紧跟标题：通道读数多时也不会被挤到看不见的位置
                 ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
                 for (i, v) in r.values.iter().enumerate() {
@@ -2145,13 +2147,13 @@ impl DapSamplerApp {
                 // 而不是静默不显示读数
                 ui.colored_label(
                     egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                    format!("⚠ Cursor 1 @ seq {} slid out of buffer range {}", seq, range_text),
+                    tf("⚠ Cursor 1 @ seq {} slid out of buffer range {}", &[&seq.to_string(), &range_text]),
                 );
             }
 
             // ---- Cursor 2 ----
             if let Some(r) = r2 {
-                ui.label(egui::RichText::new("Cursor 2").strong());
+                ui.label(egui::RichText::new(t("Cursor 2")).strong());
                 ui.label(egui::RichText::new(format!("T: {:.6} s", r.time_sec)).monospace());
                 for (i, v) in r.values.iter().enumerate() {
                     let color = colors.get(i).copied().unwrap_or(egui::Color32::WHITE);
@@ -2164,7 +2166,7 @@ impl DapSamplerApp {
                 // Cursor2 已滑出缓冲（窗口滚动后）
                 ui.colored_label(
                     egui::Color32::from_rgb(0xc0, 0x82, 0x00),
-                    "⚠ Cursor 2 slid out of buffer range",
+                    t("⚠ Cursor 2 slid out of buffer range"),
                 );
             }
         });
@@ -2224,15 +2226,15 @@ impl DapSamplerApp {
             let (color, tip) = if pct < 90.0 {
                 (
                     egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
-                    Some(
+                    Some(t(
                         "DAP-Link throughput insufficient, actual sample rate is below target.\nThe waveform time axis uses real timestamps, so the shape should be correct.\nLower the sample rate for more uniform sampling intervals.",
-                    ),
+                    )),
                 )
             } else {
                 (ui.visuals().text_color(), None)
             };
             items.push((
-                format!("Actual Rate: {:.0} Hz ({:.0}%)", self.controls.actual_rate_hz, pct),
+                tf("Actual Rate: {} Hz ({}%)", &[&format!("{:.0}", self.controls.actual_rate_hz), &format!("{:.0}", pct)]),
                 color,
                 tip,
             ));
@@ -2240,7 +2242,7 @@ impl DapSamplerApp {
         if self.controls.total_samples > 0 {
             let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
             items.push((
-                format!("Samples: {} ({:.1}s)", self.controls.total_samples, duration),
+                tf("Samples: {} ({}s)", &[&self.controls.total_samples.to_string(), &format!("{:.1}", duration)]),
                 ui.visuals().text_color(),
                 None,
             ));
@@ -2248,18 +2250,18 @@ impl DapSamplerApp {
         // 采样进度（限次采集时显示）
         if let Some(target) = self.controls.target_count {
             let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
-            items.push((format!("Progress: {:.0}%", pct), ui.visuals().text_color(), None));
+            items.push((tf("Progress: {}%", &[&format!("{:.0}", pct)]), ui.visuals().text_color(), None));
         }
         // 消费端落后提示：环形缓冲覆盖了旧采样点（数据丢失）
         if let Some(ref handle) = self.pipeline {
             let overwritten = handle.overwritten_samples();
             if overwritten > 0 {
                 items.push((
-                    format!("Overwritten: {}", overwritten),
+                    tf("Overwritten: {}", &[&overwritten.to_string()]),
                     egui::Color32::from_rgb(0xd0, 0x7a, 0x00),
-                    Some(
+                    Some(t(
                         "UI consumption is slower than sampling, the ring buffer has overwritten old samples (data loss).\nUsually caused by window dragging, modal dialogs or an overly high sample rate.",
-                    ),
+                    )),
                 ));
             }
         }
@@ -2326,7 +2328,7 @@ impl eframe::App for DapSamplerApp {
             if let Some(msg) = fatal {
                 self.stop_acquisition();
                 // 中止原因基本是 USB 读/写失败（设备拔出等），附带连接排障建议
-                self.set_error_with_hint(format!("Acquisition aborted: {}", msg), CONNECTION_HINT);
+                self.set_error_with_hint(tf("Acquisition aborted: {}", &[&msg]), t(CONNECTION_HINT));
             }
         }
         // 引擎非致命故障通知：写入被跳过（用户主动发起的写失败，弹窗
@@ -2366,12 +2368,12 @@ impl eframe::App for DapSamplerApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
                 // ---- 文件菜单：工程操作 ----
-                self.hover_menu(ui, "file", "Project(P)", |ui, app| {
-                    if menu_item(ui, "New Project").clicked() {
+                self.hover_menu(ui, "file", t("Project(P)"), |ui, app| {
+                    if menu_item(ui, t("New Project")).clicked() {
                         app.new_project();
                         return true;
                     }
-                    if menu_item(ui, "Open Project…").clicked() {
+                    if menu_item(ui, t("Open Project…")).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("DAP Sampler Project", &["dapsproj"])
                             .pick_file()
@@ -2380,7 +2382,7 @@ impl eframe::App for DapSamplerApp {
                         }
                         return true;
                     }
-                    if menu_item(ui, "Save Project").clicked() {
+                    if menu_item(ui, t("Save Project")).clicked() {
                         app.save_project();
                         return true;
                     }
@@ -2388,12 +2390,12 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 导入/导出菜单 ----
-                self.hover_menu(ui, "tools", "Files(F)", |ui, app| {
-                    if menu_item(ui, "Import ELF File…").clicked() {
+                self.hover_menu(ui, "tools", t("Files(F)"), |ui, app| {
+                    if menu_item(ui, t("Import ELF File…")).clicked() {
                         app.import_elf();
                         return true;
                     }
-                    if menu_item(ui, "Export data to…").clicked() {
+                    if menu_item(ui, t("Export data to…")).clicked() {
                         app.export_data();
                         return true;
                     }
@@ -2401,8 +2403,8 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 示波器菜单：多 scope 管理 ----
-                self.hover_menu(ui, "oscilloscope", "Oscilloscope(O)", |ui, app| {
-                    if menu_item(ui, "New Oscilloscope").clicked() {
+                self.hover_menu(ui, "oscilloscope", t("Oscilloscope(O)"), |ui, app| {
+                    if menu_item(ui, t("New Oscilloscope")).clicked() {
                         app.create_scope();
                         return true;
                     }
@@ -2410,8 +2412,8 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 设置菜单 ----
-                self.hover_menu(ui, "settings", "Settings(S)", |ui, app| {
-                    if menu_item(ui, "General Settings…").clicked() {
+                self.hover_menu(ui, "settings", t("Settings(S)"), |ui, app| {
+                    if menu_item(ui, t("General Settings…")).clicked() {
                         app.show_settings = true;
                         return true;
                     }
@@ -2419,8 +2421,8 @@ impl eframe::App for DapSamplerApp {
                 });
 
                 // ---- 帮助菜单 ----
-                self.hover_menu(ui, "help", "Help(H)", |ui, app| {
-                    if menu_item(ui, "About").clicked() {
+                self.hover_menu(ui, "help", t("Help(H)"), |ui, app| {
+                    if menu_item(ui, t("About")).clicked() {
                         app.show_about = true;
                         return true;
                     }
@@ -2480,9 +2482,9 @@ impl eframe::App for DapSamplerApp {
                                 SidebarTab::Cursor,
                             ] {
                                 let label = match tab {
-                                    SidebarTab::Variables => "Variables",
-                                    SidebarTab::Channels => "Channels",
-                                    SidebarTab::Cursor => "Cursor",
+                                    SidebarTab::Variables => t("Variables"),
+                                    SidebarTab::Channels => t("Channels"),
+                                    SidebarTab::Cursor => t("Cursor"),
                                 };
                                 if vertical_tab(ui, label, self.sidebar_active_tab == tab) {
                                     self.sidebar_active_tab = tab;
@@ -2527,10 +2529,12 @@ impl eframe::App for DapSamplerApp {
                                 // 空态时隐藏计数标题，让 "No channels" 真正
                                 // 居中占满整个内容区
                                 if self.channel_panel.channel_count() > 0 {
-                                    ui.strong(format!(
+                                    ui.strong(tf(
                                         "Channels ({}/{})",
-                                        self.channel_panel.channel_count(),
-                                        MAX_VALUES
+                                        &[
+                                            &self.channel_panel.channel_count().to_string(),
+                                            &MAX_VALUES.to_string(),
+                                        ],
                                     ));
                                 }
                                 let action =
@@ -2546,9 +2550,7 @@ impl eframe::App for DapSamplerApp {
                                     // 采集中通道集合被引擎快照固定：删除会使
                                     // Watch 行号与采样数据错位，必须先停止
                                     if self.controls.state != AcquisitionState::Idle {
-                                        self.set_error(
-                                            "Stop acquisition before removing channels",
-                                        );
+                                        self.set_error(t("Stop acquisition before removing channels"));
                                     } else {
                                         let name = self.channel_panel.channels[remove_idx]
                                             .name
@@ -2630,9 +2632,9 @@ impl eframe::App for DapSamplerApp {
 
                 // Follow 按钮（Start/Stop 之后、Rate 之前）
                 let follow_text = if self.waveform.is_follow() {
-                    "\u{23f8} Follow: ON"
+                    t("\u{23f8} Follow: ON")
                 } else {
-                    "\u{25b6} Follow: OFF"
+                    t("\u{25b6} Follow: OFF")
                 };
                 if ui.button(follow_text).clicked() {
                     self.waveform.set_follow(!self.waveform.is_follow());
@@ -2646,44 +2648,44 @@ impl eframe::App for DapSamplerApp {
                     self.interval_us = 1_000_000.0 / self.rate_hz as f64;
                     self.waveform.set_interval(self.interval_us);
                     self.scopes[self.active_scope].rate_hz = self.rate_hz;
-                    self.set_status(format!("Sample rate changed to {} Hz", self.rate_hz));
+                    self.set_status(tf("Sample rate changed to {} Hz", &[&self.rate_hz.to_string()]));
                 }
 
                 // 检测 SWD 时钟变化（仅记录日志，下次连接时生效）
                 if self.controls.swd_clock_mhz != self.swd_clock_mhz {
                     self.swd_clock_mhz = self.controls.swd_clock_mhz;
                     self.scopes[self.active_scope].swd_clock_mhz = self.swd_clock_mhz;
-                    self.set_status(format!("SWD clock changed to {} MHz (applies on next DAP-Link connection)", self.swd_clock_mhz));
+                    self.set_status(tf("SWD clock changed to {} MHz (applies on next DAP-Link connection)", &[&self.swd_clock_mhz.to_string()]));
                 }
 
                 // 检测窗口大小变化
                 if self.controls.window_size != self.window_size {
                     self.window_size = self.controls.window_size;
                     self.scopes[self.active_scope].window_size = self.window_size;
-                    self.set_status(format!("Display window size changed to {} points", self.window_size));
+                    self.set_status(tf("Display window size changed to {} points", &[&self.window_size.to_string()]));
                 }
 
                 // 波形显示模式切换
-                ui.label("Display:");
+                ui.label(t("Display:"));
                 let mut mode = self.display_mode;
                 egui::ComboBox::from_id_salt("display_mode")
                     .selected_text(match mode {
-                        WaveformDisplayMode::Line => "Line",
-                        WaveformDisplayMode::Point => "Point",
+                        WaveformDisplayMode::Line => t("Line"),
+                        WaveformDisplayMode::Point => t("Point"),
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut mode, WaveformDisplayMode::Line, "Line");
-                        ui.selectable_value(&mut mode, WaveformDisplayMode::Point, "Point");
+                        ui.selectable_value(&mut mode, WaveformDisplayMode::Line, t("Line"));
+                        ui.selectable_value(&mut mode, WaveformDisplayMode::Point, t("Point"));
                     });
                 if mode != self.display_mode {
                     self.display_mode = mode;
                     self.scopes[self.active_scope].display_mode = mode;
                     self.waveform.set_display_mode(mode);
                     let mode_label = match mode {
-                        WaveformDisplayMode::Line => "Line",
-                        WaveformDisplayMode::Point => "Point",
+                        WaveformDisplayMode::Line => t("Line"),
+                        WaveformDisplayMode::Point => t("Point"),
                     };
-                    self.set_status(format!("Display mode switched to {}", mode_label));
+                    self.set_status(tf("Display mode switched to {}", &[mode_label]));
                 }
             });
 
@@ -2712,15 +2714,36 @@ impl eframe::App for DapSamplerApp {
             let was_active = self.controls.state != AcquisitionState::Idle;
             let old_capacity = self.buffer_capacity;
             let mut change_elf = false;
-            egui::Window::new("General Settings")
+            // 语言是否在本帧被切换（窗口闭包内置位，闭包外提交状态栏提示）
+            let mut lang_changed = None;
+            egui::Window::new(t("General Settings"))
                 .open(&mut self.show_settings)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(500.0);
+                    // ---- 语言切换（立即生效，下一帧全部文本切换）----
+                    // 状态栏提示在窗口闭包外提交：闭包与 .open(&mut self...)
+                    // 的字段借用冲突，不能在里面调用 self 方法
                     ui.horizontal(|ui| {
-                        ui.label("Buffer capacity:");
+                        ui.label(t("Language:"));
+                        let mut lang = crate::i18n::current();
+                        egui::ComboBox::from_id_salt("language_combo")
+                            .selected_text(lang.label())
+                            .show_ui(ui, |ui| {
+                                for l in crate::i18n::ALL_LANGUAGES {
+                                    ui.selectable_value(&mut lang, l, l.label());
+                                }
+                            });
+                        if lang != crate::i18n::current() {
+                            crate::i18n::set_language(lang);
+                            lang_changed = Some(lang);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(t("Buffer capacity:"));
                         ui.add(
                             egui::DragValue::new(&mut self.buffer_capacity)
                                 .range(
@@ -2737,9 +2760,9 @@ impl eframe::App for DapSamplerApp {
                     let seconds =
                         self.buffer_capacity as f64 / self.controls.sample_rate.max(1) as f64;
                     ui.label(
-                        egui::RichText::new(format!(
-                            "≈ {:.1} s of history @ {} Hz",
-                            seconds, self.controls.sample_rate
+                        egui::RichText::new(tf(
+                            "≈ {} s of history @ {} Hz",
+                            &[&format!("{:.1}", seconds), &self.controls.sample_rate.to_string()],
                         ))
                         .size(11.0)
                         .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
@@ -2754,7 +2777,7 @@ impl eframe::App for DapSamplerApp {
                         .map(|c| c.file_path.clone())
                         .unwrap_or_default();
                     ui.horizontal(|ui| {
-                        ui.label("Current ELF:");
+                        ui.label(t("Current ELF:"));
                         // 文本框样式：TextEdit 同款背景（extreme_bg_color）+ 浅灰边框
                         let text_style = ui.style().clone();
                         // 预留按钮宽度（约 110px），路径框占满剩余宽度
@@ -2769,7 +2792,7 @@ impl eframe::App for DapSamplerApp {
                                 ui.set_min_width(path_width - 12.0);
                                 if elf_path.is_empty() {
                                     ui.label(
-                                        egui::RichText::new("No ELF file loaded")
+                                        egui::RichText::new(t("No ELF file loaded"))
                                             .size(11.0)
                                             .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                                     );
@@ -2781,7 +2804,7 @@ impl eframe::App for DapSamplerApp {
                                     );
                                 }
                             });
-                        if ui.button("Change ELF…").clicked() {
+                        if ui.button(t("Change ELF…")).clicked() {
                             change_elf = true;
                         }
                     });
@@ -2790,11 +2813,15 @@ impl eframe::App for DapSamplerApp {
             if change_elf {
                 self.import_elf();
             }
+            // 语言切换提示（同样在闭包外提交，理由同上）
+            if lang_changed.is_some() {
+                self.set_status(t("Language changed"));
+            }
             // 采集运行/暂停中改动容量 → 提示下次 Start 生效
             if was_active && self.buffer_capacity != old_capacity {
-                self.set_status(format!(
+                self.set_status(tf(
                     "Buffer capacity changed to {} points (applies on next Start)",
-                    self.buffer_capacity
+                    &[&self.buffer_capacity.to_string()],
                 ));
             }
         }
@@ -2804,14 +2831,14 @@ impl eframe::App for DapSamplerApp {
         if let Some(prompt) = self.elf_sync_prompt.clone() {
             let mut chose_yes = false;
             let mut chose_no = false;
-            egui::Window::new("ELF Synchronization")
+            egui::Window::new(t("ELF Synchronization"))
                 .open(&mut self.elf_sync_open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(380.0);
-                    ui.label("The ELF file has changed. Should it be synchronized?");
+                    ui.label(t("The ELF file has changed. Should it be synchronized?"));
                     ui.add_space(6.0);
                     if !prompt.address_diffs.is_empty() {
                         ui.label(egui::RichText::new(format!(
@@ -2827,10 +2854,10 @@ impl eframe::App for DapSamplerApp {
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
+                        if ui.button(t("Yes")).clicked() {
                             chose_yes = true;
                         }
-                        if ui.button("No").clicked() {
+                        if ui.button(t("No")).clicked() {
                             chose_no = true;
                         }
                     });
@@ -2852,20 +2879,20 @@ impl eframe::App for DapSamplerApp {
             let mut chose_yes = false;
             let mut chose_no = false;
             let mut open = true;
-            egui::Window::new("ELF Changed")
+            egui::Window::new(t("ELF Changed"))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(320.0);
-                    ui.label("The ELF file has changed on disk. Reload it?");
+                    ui.label(t("The ELF file has changed on disk. Reload it?"));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
+                        if ui.button(t("Yes")).clicked() {
                             chose_yes = true;
                         }
-                        if ui.button("No").clicked() {
+                        if ui.button(t("No")).clicked() {
                             chose_no = true;
                         }
                     });
@@ -2884,7 +2911,7 @@ impl eframe::App for DapSamplerApp {
         // ---- ELF 加载失败警告弹窗（打开工程时 ELF 缺失，状态栏红字易被忽略）----
         // 右上角 X 关闭（.open 关联 show_elf_warning，X 点击自动置 false）
         if let Some(msg) = self.elf_warning.clone() {
-            egui::Window::new("Warning")
+            egui::Window::new(t("Warning"))
                 .open(&mut self.show_elf_warning)
                 .collapsible(false)
                 .resizable(false)
@@ -2901,7 +2928,7 @@ impl eframe::App for DapSamplerApp {
 
         // ---- About 窗口（Help → About）----
         if self.show_about {
-            egui::Window::new("About DAP Sampler")
+            egui::Window::new(t("About DAP Sampler"))
                 .open(&mut self.show_about)
                 .collapsible(false)
                 .resizable(false)
@@ -2910,17 +2937,17 @@ impl eframe::App for DapSamplerApp {
                     ui.set_min_width(400.0);
                     ui.heading("DAP Sampler");
                     ui.add_space(4.0);
-                    ui.label(format!("Version: v{}", env!("CARGO_PKG_VERSION")));
+                    ui.label(tf("Version: v{}", &[env!("CARGO_PKG_VERSION")]));
                     ui.add_space(2.0);
                     // 开源仓库地址（可点击打开浏览器）
                     ui.horizontal(|ui| {
-                        ui.label("github:");
+                        ui.label(t("github:"));
                         ui.hyperlink("https://github.com/1910965995/Dap-Sampler");
                     });
                     ui.add_space(6.0);
                     ui.separator();
                     ui.label(
-                        "High-speed variable sampler & visualization tool\nbased on the CMSIS-DAP v2 protocol for ARM Cortex-M",
+                        t("High-speed variable sampler & visualization tool\nbased on the CMSIS-DAP v2 protocol for ARM Cortex-M"),
                     );
                     ui.add_space(6.0);
                 });

@@ -1,4 +1,5 @@
 /// 采集状态
+use crate::i18n::t;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AcquisitionState {
     /// 空闲（未开始）
@@ -70,12 +71,12 @@ impl ControlPanel {
         // --- 采集控制按钮 ---
         match self.state {
             AcquisitionState::Idle => {
-                if ui.button("\u{25b6} Start").clicked() {
+                if ui.button(t("\u{25b6} Start")).clicked() {
                     cmd = Some(AcquisitionCommand::Start);
                 }
             }
             AcquisitionState::Running => {
-                if ui.button("\u{23f9} Stop").clicked() {
+                if ui.button(t("\u{23f9} Stop")).clicked() {
                     cmd = Some(AcquisitionCommand::Stop);
                 }
             }
@@ -89,7 +90,7 @@ impl ControlPanel {
         // --- 参数输入（仅 Idle 时可修改）---
         let is_idle = self.state == AcquisitionState::Idle;
         ui.add_enabled_ui(is_idle, |ui| {
-            ui.label("Rate:");
+            ui.label(t("Rate:"));
             ui.add(
                 egui::DragValue::new(&mut self.sample_rate)
                     .range(RATE_MIN..=RATE_MAX)
@@ -97,7 +98,7 @@ impl ControlPanel {
                     .speed(100.0)
                     .suffix(" Hz")
             );
-            ui.label("Window:");
+            ui.label(t("Window:"));
             ui.add(
                 egui::DragValue::new(&mut self.window_size)
                     .range(WINDOW_MIN..=WINDOW_MAX)
@@ -105,7 +106,7 @@ impl ControlPanel {
                     .speed(10.0)
                     .suffix(" pts")
             );
-            ui.label("SWD Clock:");
+            ui.label(t("SWD Clock:"));
             egui::ComboBox::from_id_salt("swd_clock_combo")
                 .selected_text(format!("{} MHz", self.swd_clock_mhz))
                 .show_ui(ui, |ui| {

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use crate::elf::{ElfContext, ElfVariable};
+use crate::i18n::t;
 
 /// Split a variable path into display segments.
 ///
@@ -277,7 +278,7 @@ impl VariableBrowser {
     ) -> Vec<(String, bool)> {
         if elf_ctx.is_none() {
             // 空态提示在标签页内容区内水平+垂直居中
-            super::text::centered_hint(ui, "No ELF file loaded");
+            super::text::centered_hint(ui, t("No ELF file loaded"));
             return vec![];
         }
 
@@ -287,7 +288,7 @@ impl VariableBrowser {
         // 搜索框
         ui.add(
             egui::TextEdit::singleline(&mut self.search_text)
-                .hint_text("🔍 Search variable name..."),
+                .hint_text(t("🔍 Search variable name...")),
         );
         ui.add_space(4.0);
 
@@ -355,7 +356,7 @@ impl VariableBrowser {
             let g = var
                 .source_file
                 .clone()
-                .unwrap_or_else(|| "Globals".to_string());
+                .unwrap_or_else(|| t("Globals").to_string());
             if !groups.contains_key(&g) {
                 group_order.push(g.clone());
             }

@@ -1,3 +1,4 @@
+use crate::i18n::{t, tf};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoint, Points};
 
 /// 波形 Plot 的 egui 内存键：用于跨帧读取图例点击产生的 hidden 集
@@ -145,12 +146,12 @@ impl WaveformPanel {
             ui.vertical_centered(|ui| {
                 ui.add_space(((ui.available_height() - 40.0) * 0.5).max(0.0));
                 ui.label(
-                    egui::RichText::new("Waiting for data...")
+                    egui::RichText::new(t("Waiting for data..."))
                         .size(14.0)
                         .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                 );
                 ui.label(
-                    egui::RichText::new("Press Start to begin sampling")
+                    egui::RichText::new(t("Press Start to begin sampling"))
                         .size(11.0)
                         .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                 );
@@ -218,12 +219,12 @@ impl WaveformPanel {
 
         // 动态 X 轴标签（使用上一帧的可视范围）
         let x_label = match self.last_x_range {
-            Some(r) => format!("Time (s) [window: {:.2}s]", r),
-            None => "Time (s)".to_string(),
+            Some(r) => tf("Time (s) [window: {}s]", &[&format!("{:.2}", r)]),
+            None => t("Time (s)").to_string(),
         };
 
         // Y 轴标签
-        let y_label = "Value".to_string();
+        let y_label = t("Value").to_string();
 
         // 始终允许缩放/拖拽，auto_scroll 只决定 X 轴是否跟随最新数据
         let auto_scroll = self.auto_scroll;

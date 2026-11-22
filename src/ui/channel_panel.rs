@@ -1,4 +1,5 @@
 use super::text::layout_elided;
+use crate::i18n::t;
 use crate::pipeline::sample::{ValueType, MAX_VALUES};
 
 // ── 圆形图标按钮配色 ──
@@ -126,7 +127,7 @@ impl ChannelPanel {
 
         if self.channels.is_empty() {
             // 空态提示在标签页内容区内水平+垂直居中
-            super::text::centered_hint(ui, "No channels");
+            super::text::centered_hint(ui, t("No channels"));
             return action;
         }
 
@@ -215,7 +216,7 @@ impl ChannelPanel {
                                 if remove.clicked() {
                                     action.remove = Some(i);
                                 }
-                                remove.on_hover_text("Remove channel");
+                                remove.on_hover_text(t("Remove channel"));
                                 let visible = ch.visible;
                                 let eye = icon_button_custom(
                                     ui,
@@ -227,9 +228,9 @@ impl ChannelPanel {
                                     ch.visible = !ch.visible;
                                 }
                                 eye.on_hover_text(if visible {
-                                    "Hide channel"
+                                    t("Hide channel")
                                 } else {
-                                    "Show channel"
+                                    t("Show channel")
                                 });
                             });
                         });

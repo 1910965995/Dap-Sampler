@@ -3,6 +3,7 @@
 //! 公共 API 导出，供集成测试使用。
 
 pub mod error;
+pub mod i18n;
 pub mod usb;
 pub mod dap;
 pub mod pipeline;

@@ -27,6 +27,9 @@ pub struct ProjectFile {
     /// 示波器 scope 列表（v2 起每个 scope 独立参数与变量）
     #[serde(default)]
     pub scopes: Vec<ProjectScope>,
+    /// 界面语言代码（"en" / "zh"；空 = 英文。缺省字段向后兼容旧文件）
+    #[serde(default)]
+    pub language: String,
 }
 
 /// 单个示波器 scope 的配置
@@ -148,6 +151,7 @@ fn migrate_v1(v1: ProjectFileV1) -> ProjectFile {
     ProjectFile {
         version: PROJECT_VERSION,
         elf_path: v1.elf_path,
+        language: String::new(),
         buffer_capacity: v1.buffer_capacity,
         watch_col_widths: v1.watch_col_widths,
         scopes: vec![ProjectScope {
@@ -197,6 +201,7 @@ mod tests {
             version: PROJECT_VERSION,
             elf_path: Some("C:/fw/firmware.elf".to_string()),
             buffer_capacity: 200_000,
+            language: "en".to_string(),
             watch_col_widths: crate::ui::watch_panel::DEFAULT_COL_WIDTHS.to_vec(),
             scopes: vec![
                 ProjectScope {

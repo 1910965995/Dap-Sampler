@@ -1,4 +1,5 @@
 use super::text::layout_elided;
+use crate::i18n::t;
 use crate::pipeline::sample::ValueType;
 
 /// 待写入 MCU 的请求（通道名 + 原始值）
@@ -258,7 +259,7 @@ impl WatchPanel {
         // 顶部标题
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Watch Window")
+                egui::RichText::new(t("Watch Window"))
                     .font(TITLE_FONT)
                     .strong()
                     .color(TEXT_DARK),
@@ -271,9 +272,9 @@ impl WatchPanel {
             // 精确垂直居中：两行标签约 40px，偏移可用高度的一半减内容一半
             ui.vertical_centered(|ui| {
                 ui.add_space(((ui.available_height() - 40.0) * 0.5).max(0.0));
-                ui.label(egui::RichText::new("No watch variables").size(14.0).color(TEXT_MUTED));
+                ui.label(egui::RichText::new(t("No watch variables")).size(14.0).color(TEXT_MUTED));
                 ui.label(
-                    egui::RichText::new("Import ELF or add channels to start watching")
+                    egui::RichText::new(t("Import ELF or add channels to start watching"))
                         .size(11.0)
                         .color(TEXT_MUTED),
                 );
@@ -311,7 +312,7 @@ impl WatchPanel {
                 );
                 ui.painter().rect_filled(hdr_rect, 0.0, HEADER_BG);
                 for (i, col) in COLUMNS.iter().enumerate() {
-                    paint_text_cell(ui, cell(hdr_rect, i), col.title, &HEADER_FONT, TEXT_DARK);
+                    paint_text_cell(ui, cell(hdr_rect, i), t(col.title), &HEADER_FONT, TEXT_DARK);
                 }
 
                 // ---- 数据行 ----

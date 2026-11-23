@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::*;
+use crate::usb::async_bulk::AsyncSession;
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::commands::*;
@@ -38,6 +39,12 @@ const WRITE_BUDGET_REQUESTS: usize = 4;
 ///
 /// 吞吐充足时该值不会成为瓶颈（在途数远小于上限）。
 const MAX_IN_FLIGHT: usize = 4;
+
+/// 常驻挂起的 IN transfer 数
+///
+/// IN 端点始终有人收，响应的到达时刻与提交线程无关。2 条即可覆盖
+/// "一条正在填充、一条已就绪"的背靠背场景。
+const IN_POOL_SIZE: usize = 4;
 
 /// 计算一条 DAP_Transfer 命令的读取块请求数
 ///
@@ -318,6 +325,14 @@ impl PipelineEngine {
         let ring = Arc::new(RingBuffer::new(capacity));
         let start_time = Instant::now();
 
+        // 异步 USB 会话：OUT 池深度 = 原有在途上限语义（背压由
+        // submit 返回 false 表达），IN 池常驻挂起以平滑响应到达。
+        let session = Arc::new(AsyncSession::start(
+            &self.usb,
+            MAX_IN_FLIGHT,
+            IN_POOL_SIZE,
+        )?);
+
         // 子线程致命错误槽（USB 写失败、设备拔出等）。此前子线程直接
         // break 退出且无任何上报通道，UI 会永远显示 Running（原缺陷 ⑨）。
         // UI 每帧轮询 thread_error() / threads_alive() 触发自动停止。
@@ -332,11 +347,13 @@ impl PipelineEngine {
         // 保证显示的采样间隔严格一致。无需跨线程队列传递。
 
         let submit = self.spawn_submit_thread(
+            Arc::clone(&session),
             start_time,
             Arc::clone(&thread_error),
             Arc::clone(&notices),
         )?;
         let collect = self.spawn_collect_thread(
+            Arc::clone(&session),
             Arc::clone(&ring),
             Arc::clone(&thread_error),
             Arc::clone(&notices),
@@ -350,17 +367,19 @@ impl PipelineEngine {
             write_queue: Arc::clone(&self.write_queue),
             thread_error,
             notices,
+            // 会话必须在两个线程 join 完之后才 stop（Drop 兜底）
+            session: Some(session),
         })
     }
 
     /// 启动提交线程
     fn spawn_submit_thread(
         &self,
+        session: Arc<AsyncSession>,
         start_time: Instant,
         thread_error: Arc<Mutex<Option<String>>>,
         notices: Arc<Mutex<Vec<PipelineNotice>>>,
     ) -> Result<JoinHandle<()>> {
-        let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
         let accesses = self.accesses.clone();
         let running = Arc::clone(&self.running);
@@ -419,6 +438,14 @@ impl PipelineEngine {
                 let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
+                    // 致命错误（设备拔出 / 异步写失败）：接收线程可能先
+                    // 发现并上报，提交线程也需退出，避免继续空转占 CPU
+                    if let Some(err) = session.fatal_error() {
+                        if let Ok(mut slot) = thread_error.lock() {
+                            slot.get_or_insert(err);
+                        }
+                        break;
+                    }
                     // --- 背压控制 ---
                     // 在途命令数达到上限（接收线程尚未消费完前一批响应）时
                     // 跳过本轮：实际采样率自动匹配 DAP-Link 吞吐，避免
@@ -584,41 +611,18 @@ impl PipelineEngine {
                     // 回填实际请求数
                     cmd[count_pos] = n_requests as u8;
 
-                    // --- 发送命令（200ms 超时）---
-                    // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
+                    // --- 提交命令（异步入队，≈2µs）---
                     if !pending_writes.is_empty() {
                         log::info!(
                             "submit thread injecting {} write requests (seq={})",
                             pending_writes.len(), seq
                         );
                     }
-                    match usb.write_nonblock(&cmd) {
-                        Ok(n) if n == cmd.len() => {} // 发送成功
-                        Ok(n) => {
-                            // 短写：只有部分命令字节到达设备，设备按不完整
-                            // 命令解析，响应流必然失步。按致命错误处理并
-                            // 上报 UI（此前短写被当作成功，协议从此错乱）。
-                            let msg = format!(
-                                "USB short write: {}/{} bytes",
-                                n, cmd.len()
-                            );
-                            log::error!("submit thread {} (seq={}), exiting", msg, seq);
-                            if running.load(Ordering::Relaxed) {
-                                if let Ok(mut slot) = thread_error.lock() {
-                                    slot.get_or_insert(msg);
-                                }
-                            }
-                            break;
-                        }
-                        Err(Error::Usb(rusb::Error::Timeout)) => {
-                            // 写超时（0 字节发出）：设备忙或已拔出。本周期
-                            // 没有命令发出、也就没有对应响应，直接跳过；
-                            // 未消费的写入请求重新入队。单次超时不应终止
-                            // 采集（此前任何写错误都会让线程静默退出）。
-                            if !running.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            log::warn!("submit thread write timeout (seq={}), skipping this cycle", seq);
+                    match session.submit(&cmd) {
+                        Ok(true) => {} // 已挂入 OUT 槽位
+                        Ok(false) => {
+                            // 在途已满：设备吞吐跟不上。跳过本轮（与旧实现的
+                            // MAX_IN_FLIGHT 背压语义一致），未消费的写入重新入队。
                             if !pending_writes.is_empty() {
                                 if let Ok(mut wq) = write_queue.lock() {
                                     for (idx, v) in pending_writes.iter().rev() {
@@ -636,14 +640,11 @@ impl PipelineEngine {
                         }
                         Err(e) => {
                             if !running.load(Ordering::Relaxed) {
-                                // 停止中遇到的超时/错误，正常退出
                                 log::info!("submit thread received stop signal, exiting");
                                 break;
                             }
-                            // 致命错误（设备拔出、管道错误等）：上报 UI
-                            // 后退出，不再无声死亡（原缺陷 ⑨）
-                            let msg = format!("USB write failed: {}", e);
-                            log::error!("submit thread USB write failed (seq={}): {}, exiting", seq, e);
+                            let msg = format!("USB submit failed: {}", e);
+                            log::error!("submit thread {} (seq={}), exiting", msg, seq);
                             if let Ok(mut slot) = thread_error.lock() {
                                 slot.get_or_insert(msg);
                             }
@@ -682,11 +683,11 @@ impl PipelineEngine {
     /// 启动接收线程
     fn spawn_collect_thread(
         &self,
+        session: Arc<AsyncSession>,
         ring: Arc<RingBuffer>,
         thread_error: Arc<Mutex<Option<String>>>,
         notices: Arc<Mutex<Vec<PipelineNotice>>>,
     ) -> Result<JoinHandle<()>> {
-        let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
         let accesses = self.accesses.clone();
         let num_vars = accesses.len();
@@ -699,7 +700,6 @@ impl PipelineEngine {
         let handle = thread::Builder::new()
             .name("dap-collect".into())
             .spawn(move || {
-                let mut buf = vec![0u8; 4096];
                 // carry-over buffer：保存上次读取的不完整响应尾部，
                 // 下次读取时拼接到开头再解析，避免解析错位。
                 let mut carry: Vec<u8> = Vec::new();
@@ -711,19 +711,13 @@ impl PipelineEngine {
                 let mut last_err_log: Option<Instant> = None;
 
                 while running.load(Ordering::Relaxed) {
-                    // 读取 USB 响应（超时 200ms，允许优雅退出）
-                    let n = match usb.read_timeout(&mut buf, Duration::from_millis(200)) {
-                        Ok(n) => n,
-                        Err(Error::Usb(rusb::Error::Timeout)) => {
-                            // rusb 对 0 字节超时返回 Err(Timeout)：设备暂无
-                            // 响应的例行空转，静默继续（read_timeout 阻塞
-                            // 至多 200ms，天然限速）
-                            continue;
-                        }
+                    // 等待下一条完整响应（异步 IN 池在事件泵线程里收）
+                    let chunk = match session.next_response(Duration::from_millis(200)) {
+                        Ok(Some(c)) => c,
+                        Ok(None) => continue, // 例行超时，检查停止标志后继续
                         Err(e) => {
                             // 设备拔出 / 管道错误等致命错误：上报 UI（触发
                             // 自动停止并提示）、限频日志、短暂休眠避免忙转。
-                            // 循环继续检查 running 标志以便优雅退出。
                             if running.load(Ordering::Relaxed) {
                                 if let Ok(mut slot) = thread_error.lock() {
                                     slot.get_or_insert(format!("USB read failed: {}", e));
@@ -745,10 +739,10 @@ impl PipelineEngine {
                     // （复用缓冲区，仅重置长度，不重新分配）
                     data.clear();
                     data.extend_from_slice(&carry);
-                    data.extend_from_slice(&buf[..n]);
+                    data.extend_from_slice(&chunk);
                     carry.clear();
 
-                    // 一次 read_bulk 可能读到多个响应（USB Bulk 合并短包）。
+                    // 一条 IN transfer 可能包含多个响应（USB Bulk 合并短包）。
                     // 响应长度是动态的（FAULT/WAIT 时设备提前中止，count
                     // 小于发出的请求数），必须按响应头 [0x05, count, status]
                     // 逐条计算长度，绝不能按固定长度切帧。
@@ -955,6 +949,9 @@ pub struct PipelineHandle {
     thread_error: Arc<Mutex<Option<String>>>,
     /// 非致命故障通知队列（写入被跳过、协议失步丢数据）
     notices: Arc<Mutex<Vec<PipelineNotice>>>,
+    /// 异步 USB 会话（必须在两个工作线程 join 完之后再 stop）。
+    /// 单元测试构造 handle 时无真实设备，为 None。
+    session: Option<Arc<AsyncSession>>,
 }
 
 impl PipelineHandle {
@@ -1031,6 +1028,11 @@ impl PipelineHandle {
         log::info!("waiting for collect thread to exit...");
         let _ = self.collect_handle.join();
         log::info!("collect thread exited");
+        // 两个工作线程都已退出：此时才可安全取消在途 transfer
+        // （事件泵回调仍会访问槽位，提前停止会有 use-after-free 风险）
+        if let Some(s) = &self.session {
+            s.stop();
+        }
         log::info!("pipeline stopped");
     }
 }
@@ -1402,6 +1404,7 @@ mod tests {
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
             thread_error: Arc::clone(&te),
             notices: Arc::clone(&notices),
+            session: None,
         };
 
         // 两个线程都阻塞在 recv 上：必须判定为存活

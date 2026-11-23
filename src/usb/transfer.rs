@@ -183,6 +183,30 @@ impl BulkTransfer {
             log::info!("cleared {} bytes of stale USB buffer data", flushed);
         }
     }
+
+    /// OUT 端点地址（异步传输层需要）
+    pub fn ep_out(&self) -> u8 {
+        self.ep_out
+    }
+
+    /// IN 端点地址（异步传输层需要）
+    pub fn ep_in(&self) -> u8 {
+        self.ep_in
+    }
+
+    /// 原始 libusb 设备句柄（异步传输层需要）
+    ///
+    /// 安全性：句柄生命周期由本结构持有；调用方必须在 `BulkTransfer`
+    /// 存活期间使用，且不得在异步传输挂起期间做同步收发（会与事件泵冲突）。
+    pub fn raw_handle(&self) -> *mut rusb::ffi::libusb_device_handle {
+        self.handle.as_raw()
+    }
+
+    /// 原始 libusb 上下文指针（异步传输层的事件泵需要）
+    pub fn raw_context(&self) -> *mut rusb::ffi::libusb_context {
+        use rusb::UsbContext;
+        self.handle.context().as_raw()
+    }
 }
 
 // rusb::DeviceHandle 是 Send + Sync 的，所以 BulkTransfer 也可以

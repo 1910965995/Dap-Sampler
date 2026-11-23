@@ -115,7 +115,7 @@ cargo test
 
 - 仅支持 CMSIS-DAP v2（Bulk 传输），不支持 v1（HID）
 - 单次最多 16 个变量
-- 采样率上限 20 kHz（USB bulk 固定开销几十us无法消除，因此哪怕SWD速率再快采样率也上不去）
+- 单32位变量采样率上限 25 kHz，5个32位变量10khz采样（受限于daplink本身处理数据耗时和数据传输）
 - 目标 MCU 开启读保护（RDP）时无法访问
 
 ## 项目结构
@@ -198,14 +198,6 @@ Dap-Sampler/
 - **ELF/DWARF**：object 0.36 + gimli 0.31
 - **CLI**：clap 4
 - **资源嵌入**：winres（Windows exe 图标）
-
-## 版本演进
-
-- **P1**：基础通信（list / info / read / monitor），SWD 初始化与内存读写
-- **P2**：双线程流水线采集引擎，无锁环形缓冲区，多变量 CSV 输出
-- **P3**：egui GUI 实时波形显示，通道/游标/Follow 模式
-- **P4**：ELF/DWARF 变量浏览器、Watch 监视面板、UI 重构与性能优化
-- **v1.0.0**：增加 write 子命令、SWD 时钟可调、采样率上限扩至 100kHz、Windows 优化（无控制台弹出 + 圆角图标嵌入）
 
 ## 许可证
 

@@ -66,9 +66,11 @@ fn reg_a3(addr: u8) -> bool { (addr >> 3) & 0x01 != 0 }
 // ============================================================
 /// DP 寄存器地址: bits[3:2] = A3,A2
 pub const DP_REG_DPIDR: u8 = 0x00;
+pub const DP_REG_ABORT: u8 = 0x00;
 pub const DP_REG_CTRL_STAT: u8 = 0x04;
 pub const DP_REG_SELECT: u8 = 0x08;
 pub const DP_REG_RDBUFF: u8 = 0x0C;
+pub const DP_ABORT_CLEAR_STICKY: u32 = 0x1E;
 
 /// 读 DP 寄存器请求字节
 pub fn req_read_dp(addr: u8) -> u8 {
@@ -86,7 +88,8 @@ pub fn req_write_dp(addr: u8) -> u8 {
 pub const AP_REG_CSW: u8 = 0x00;
 pub const AP_REG_TAR: u8 = 0x04;
 pub const AP_REG_DRW: u8 = 0x0C;
-pub const AP_REG_IDR: u8 = 0x0C; // 同 DRW (CSW=0 时返回 IDR)
+pub const AP_REG_IDR: u8 = 0x0C; // AP IDR 位于偏移 0xFC，低 4 位地址为 0xC
+pub const AP_BANK_IDR: u8 = 0x0F; // DP SELECT.APBANKSEL
 
 /// 读 AP 寄存器请求字节
 pub fn req_read_ap(addr: u8) -> u8 {

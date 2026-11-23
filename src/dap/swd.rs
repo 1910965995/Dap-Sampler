@@ -213,10 +213,12 @@ impl SwdLink {
 
     /// 调试电源上电
     fn power_up_debug(&self) -> Result<()> {
-        // SWD 读操作有流水线延迟：前一个读的数据在 RDBUFF 中。
-        // 两次 DPIDR 读后，需要先读 RDBUFF 清空流水线，再做写操作。
-        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
-        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
+        // 清除先前的 sticky overrun / write / sticky 错误，避免后续 DP 访问继续 FAULT。
+        let abort_req = TransferRequest::write_dp(DP_REG_ABORT, DP_ABORT_CLEAR_STICKY);
+        let abort_resp = self.dap.execute_transfer(self.usb(), &[abort_req])?;
+        if abort_resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(abort_resp.status, abort_resp.count));
+        }
 
         // 请求系统调试电源（写 CTRL/STAT）
         let req1 = TransferRequest::write_dp(DP_REG_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ);
@@ -228,11 +230,10 @@ impl SwdLink {
         // 读 CTRL/STAT 确认电源就绪（此 DAP-Link 无流水线延迟，直接返回）
         let req2 = TransferRequest::read_dp(DP_REG_CTRL_STAT);
         let resp = self.dap.execute_transfer(self.usb(), &[req2])?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
         let ctrl_stat = resp.data.first().copied().unwrap_or(0);
-
-        // 读 RDBUFF 消耗流水线中的残留数据
-        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
-        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
 
         if (ctrl_stat & (CSYSPWRUPACK | CDBGPWRUPACK)) != (CSYSPWRUPACK | CDBGPWRUPACK) {
             return Err(Error::Swd(format!("debug power not ready: CTRL/STAT=0x{:08X}", ctrl_stat)));
@@ -242,9 +243,10 @@ impl SwdLink {
     }
 
     /// 选择 AP 端口
-    fn select_ap(&self, ap: u8) -> Result<()> {
+    fn select_ap(&self, ap: u8, bank: u8) -> Result<()> {
         // DP SELECT 寄存器: APSEL=[31:24], APBANKSEL=[7:4]
-        let req = TransferRequest::write_dp(DP_REG_SELECT, (ap as u32) << 24);
+        let value = ((ap as u32) << 24) | ((bank as u32) << 4);
+        let req = TransferRequest::write_dp(DP_REG_SELECT, value);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
         if resp.status != TRANSFER_OK {
             return Err(Error::Swd(format!("failed to select AP{}", ap)));
@@ -254,12 +256,9 @@ impl SwdLink {
 
     /// 扫描 AP 端口
     fn scan_ap(&mut self) -> Result<u32> {
-        // 选择 AP0 并读取 IDR
-        self.select_ap(0)?;
+        // AP IDR 位于 bank F 的偏移 0xC。
+        self.select_ap(0, AP_BANK_IDR)?;
 
-        // 通过读 AP IDR 来验证 AP 是否存在
-        // CSW 默认配置下，读 DRW 寄存器返回的是 IDR
-        // 需要先写 CSW 设置 32-bit 访问，简化处理使用默认值
         let req = TransferRequest::read_ap(AP_REG_IDR);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
 
@@ -267,6 +266,7 @@ impl SwdLink {
             return Err(Error::Swd("AP scan failed".into()));
         }
 
+        self.select_ap(0, 0)?;
         self.ap_index = 0;
         Ok(resp.data[0])
     }

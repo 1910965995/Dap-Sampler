@@ -115,7 +115,7 @@ cargo test
 
 - 仅支持 CMSIS-DAP v2（Bulk 传输），不支持 v1（HID）
 - 单次最多 16 个变量
-- 采样率上限 100 kHz
+- 采样率上限 20 kHz（USB bulk 固定开销几十us无法消除，因此哪怕SWD速率再快采样率也上不去）
 - 目标 MCU 开启读保护（RDP）时无法访问
 
 ## 项目结构

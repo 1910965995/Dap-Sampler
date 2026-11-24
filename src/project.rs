@@ -2,14 +2,16 @@
 //!
 //! v2 起支持多示波器 scope：每个 scope 携带独立的采样参数与变量列表，
 //! ELF 路径 / Buffer capacity / Watch 列宽仍为全局共享。
+//! v3 增加全局的采样时间戳模式（grid / real）。
 
 use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
+use crate::pipeline::engine::TimestampMode;
 use crate::pipeline::sample::ValueType;
 use crate::ui::waveform::WaveformDisplayMode;
 
 /// 当前支持的工程文件版本（将来格式变化时递增并做迁移）
-pub const PROJECT_VERSION: u32 = 2;
+pub const PROJECT_VERSION: u32 = 3;
 
 /// 工程文件顶层结构（与 .dapsproj 文件内容一一对应，v2）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -30,6 +32,9 @@ pub struct ProjectFile {
     /// 界面语言代码（"en" / "zh"；空 = 英文。缺省字段向后兼容旧文件）
     #[serde(default)]
     pub language: String,
+    /// 采样时间戳模式（"grid" / "real"；空 = grid。v3 新增，缺省向后兼容）
+    #[serde(default)]
+    pub timestamp_mode: String,
 }
 
 /// 单个示波器 scope 的配置
@@ -133,6 +138,17 @@ impl ProjectFile {
             let file: ProjectFile = serde_json::from_value(value)
                 .map_err(|e| Error::Other(format!("Project file parse failed: {}", e)))?;
             Ok(file)
+        } else if version == 2 {
+            // v2 → v3：新增 timestamp_mode 字段，serde default 回退 grid；
+            // 载入后把版本号归一为当前版本，并把空模式规范化为 "grid"，
+            // 避免再次保存时写出空字符串
+            let mut file: ProjectFile = serde_json::from_value(value)
+                .map_err(|e| Error::Other(format!("Project file parse failed: {}", e)))?;
+            file.version = PROJECT_VERSION;
+            if file.timestamp_mode.is_empty() {
+                file.timestamp_mode = TimestampMode::Grid.label().to_string();
+            }
+            Ok(file)
         } else if version == 1 {
             let v1: ProjectFileV1 = serde_json::from_value(value)
                 .map_err(|e| Error::Other(format!("Project file parse failed: {}", e)))?;
@@ -154,6 +170,7 @@ fn migrate_v1(v1: ProjectFileV1) -> ProjectFile {
         language: String::new(),
         buffer_capacity: v1.buffer_capacity,
         watch_col_widths: v1.watch_col_widths,
+        timestamp_mode: TimestampMode::Grid.label().to_string(),
         scopes: vec![ProjectScope {
             name: "Scope 1".to_string(),
             sample_rate_hz: v1.sample_rate_hz,
@@ -162,6 +179,13 @@ fn migrate_v1(v1: ProjectFileV1) -> ProjectFile {
             display_mode: v1.display_mode,
             variables: v1.variables,
         }],
+    }
+}
+
+impl ProjectFile {
+    /// 解析时间戳模式（未知/空 → 默认 grid）
+    pub fn timestamp_mode(&self) -> TimestampMode {
+        TimestampMode::from_label(&self.timestamp_mode)
     }
 }
 
@@ -202,6 +226,7 @@ mod tests {
             elf_path: Some("C:/fw/firmware.elf".to_string()),
             buffer_capacity: 200_000,
             language: "en".to_string(),
+            timestamp_mode: "real".to_string(),
             watch_col_widths: crate::ui::watch_panel::DEFAULT_COL_WIDTHS.to_vec(),
             scopes: vec![
                 ProjectScope {
@@ -304,6 +329,59 @@ mod tests {
         );
         assert_eq!(restored.scopes.len(), 1);
         assert!(restored.scopes[0].variables.is_empty());
+    }
+
+    #[test]
+    fn v2_file_migrates_to_v3_with_default_grid_timestamps() {
+        // v2 文件没有 timestamp_mode 字段：必须能打开，且回退默认 grid
+        let json = r#"{
+            "version": 2,
+            "elf_path": "C:/fw/firmware.elf",
+            "buffer_capacity": 200000,
+            "watch_col_widths": [120.0, 110.0, 80.0, 90.0, 70.0, 120.0],
+            "language": "en",
+            "scopes": [{
+                "name": "Scope 1",
+                "sample_rate_hz": 5000,
+                "swd_clock_mhz": 10,
+                "window_size": 2000,
+                "display_mode": "line",
+                "variables": []
+            }]
+        }"#;
+        let restored = ProjectFile::from_json(json).unwrap();
+        assert_eq!(restored.version, PROJECT_VERSION, "版本号应归一为当前版本");
+        assert_eq!(restored.timestamp_mode(), TimestampMode::Grid, "缺省回退 grid");
+        assert_eq!(restored.scopes.len(), 1);
+        // 再次保存必须是 v3 且带 timestamp_mode
+        let json2 = restored.to_json().unwrap();
+        assert!(json2.contains("\"version\": 3"));
+        assert!(json2.contains("\"timestamp_mode\": \"grid\""));
+    }
+
+    #[test]
+    fn timestamp_mode_round_trips_through_project_file() {
+        for mode in [TimestampMode::Grid, TimestampMode::Real] {
+            let mut file = sample_file();
+            file.timestamp_mode = mode.label().to_string();
+            let restored = ProjectFile::from_json(&file.to_json().unwrap()).unwrap();
+            assert_eq!(restored.timestamp_mode(), mode);
+        }
+    }
+
+    #[test]
+    fn v1_file_gets_default_timestamp_mode() {
+        let json = r#"{
+            "version": 1,
+            "elf_path": null,
+            "sample_rate_hz": 5000,
+            "swd_clock_mhz": 10,
+            "window_size": 2000,
+            "display_mode": "line",
+            "variables": []
+        }"#;
+        let restored = ProjectFile::from_json(json).unwrap();
+        assert_eq!(restored.timestamp_mode(), TimestampMode::Grid);
     }
 
     #[test]

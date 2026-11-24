@@ -274,6 +274,43 @@ fn push_notice(notices: &Mutex<Vec<PipelineNotice>>, notice: PipelineNotice) {
     }
 }
 
+/// 采样时间戳模式
+///
+/// 两种模式的取舍：
+/// - [`TimestampMode::Grid`]（默认）：时间戳 = `seq × 1e9 / rate`，理想
+///   等间隔。波形点间距恒定、视觉平滑，但当设备吞吐不足（背压跳过周期）
+///   时 seq 仍会推进，时间轴会**系统性超前**于真实采样时刻——波形在时间
+///   轴上被压缩，ΔT 测量失真。适合「信号形状比绝对时间重要」的场合。
+/// - [`TimestampMode::Real`]：时间戳 = 每周期首条命令的**实际提交时刻**。
+///   跳过的周期不产生样本，其时长如实体现为更大的采样间隔；X 轴反映真实
+///   经过时间。代价是采样间隔不均匀（波形点间距随吞吐波动）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampMode {
+    /// 理想等间隔网格（`seq × 周期`）——默认，与历史行为一致
+    #[default]
+    Grid,
+    /// 真实提交时刻（每周期首分片进入 OUT 槽位的时刻）
+    Real,
+}
+
+impl TimestampMode {
+    /// 存储/配置用的小写标识
+    pub fn label(self) -> &'static str {
+        match self {
+            TimestampMode::Grid => "grid",
+            TimestampMode::Real => "real",
+        }
+    }
+
+    /// 从标识解析，未知值回退默认的 Grid
+    pub fn from_label(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "real" => TimestampMode::Real,
+            _ => TimestampMode::Grid,
+        }
+    }
+}
+
 /// 单条已提交命令的元数据（提交线程入队、接收线程出队）
 ///
 /// 一条采样周期在设备包受限时会拆成多条 DAP_Transfer 命令：读取块按
@@ -310,9 +347,11 @@ pub struct PipelineEngine {
     total_words: usize,
     /// 目标采样率（Hz）
     ///
-    /// 时间戳与提交节奏都用 [`tick_ns`]（先乘后除）从它实时计算，
-    /// 不预存取整后的间隔——取整后的间隔乘 seq 会线性累积漂移。
+    /// 提交节奏用 [`tick_ns`]（先乘后除）从它实时计算，不预存取整后的
+    /// 间隔——取整后的间隔乘 seq 会线性累积漂移。
     rate_hz: u32,
+    /// 采样时间戳模式（见 [`TimestampMode`]）
+    timestamp_mode: TimestampMode,
     /// 停止标志（主线程设为 false 时，子线程退出）
     running: Arc<AtomicBool>,
     /// 写入请求队列（主线程推送，提交线程消费）
@@ -343,13 +382,14 @@ impl PipelineEngine {
     /// `addresses` 是一组目标内存地址（1-[`MAX_VALUES`] 个，启动时经
     /// [`validate_config`] 校验），`types` 与之一一对应
     /// （子字变量 u8/u16 按对齐整字读取后提取 lane）。
-    /// `rate_hz` 是目标采样率。
+    /// `rate_hz` 是目标采样率，`timestamp_mode` 决定时间戳生成方式。
     pub fn new(
         usb: Arc<BulkTransfer>,
         dap: DapProtocol,
         addresses: Vec<u32>,
         types: &[ValueType],
         rate_hz: u32,
+        timestamp_mode: TimestampMode,
     ) -> Self {
         let rate_hz = rate_hz.max(1);
         let accesses: Vec<MemAccess> = addresses
@@ -367,12 +407,18 @@ impl PipelineEngine {
             accesses,
             total_words,
             rate_hz,
+            timestamp_mode,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
             last_words: Arc::new(Mutex::new(Vec::new())),
             cmd_meta: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// 时间戳模式（供 UI/日志查询）
+    pub fn timestamp_mode(&self) -> TimestampMode {
+        self.timestamp_mode
     }
 
     /// 使用新采样率重建引擎（保持相同 USB/DAP/地址配置）
@@ -385,6 +431,7 @@ impl PipelineEngine {
             accesses: self.accesses.clone(),
             total_words: self.total_words,
             rate_hz: rate_hz.max(1),
+            timestamp_mode: self.timestamp_mode,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
             last_words: Arc::clone(&self.last_words),
@@ -894,6 +941,8 @@ impl PipelineEngine {
         let accesses = self.accesses.clone();
         let num_vars = accesses.len();
         let total_words = self.total_words;
+        let rate_hz = self.rate_hz;
+        let timestamp_mode = self.timestamp_mode;
         let last_words = Arc::clone(&self.last_words);
         let cmd_meta = Arc::clone(&self.cmd_meta);
         let in_flight = Arc::clone(&self.in_flight);
@@ -1134,26 +1183,34 @@ impl PipelineEngine {
                             && cycle_next_chunk >= cycle_chunk_total
                             && cycle_chunk_total > 0
                         {
-                            // 时间戳 = 本周期首分片的实际提交时刻。
+                            // 时间戳生成（模式由 Advanced Settings 选择）
                             //
-                            // 不使用 `seq × 周期` 的理想网格：背压跳过的
-                            // 周期也会推进 seq，那样时间轴会系统性超前于
-                            // 真实采样时刻（吞吐不足时波形被压缩、ΔT 失真）。
-                            // 用真实提交时刻，跳周期留下的空缺在波形上表现
-                            // 为更大的时间间隔——这正是实际发生的情况。
-                            let timestamp_sec = cycle_submit_ns as f64 / 1_000_000_000.0;
+                            // - Grid（默认）：seq × 1e9 / rate 的理想等间隔。
+                            //   波形点间距恒定、视觉平滑；但背压跳过的周期也会
+                            //   推进 seq，时间轴会系统性超前于真实采样时刻。
+                            // - Real：本周期首分片的实际提交时刻。跳过的周期
+                            //   不产生样本，其时长如实体现为更大的间隔。
+                            let raw_ts = match timestamp_mode {
+                                TimestampMode::Grid => {
+                                    tick_ns(seq, rate_hz) as f64 / 1_000_000_000.0
+                                }
+                                TimestampMode::Real => {
+                                    cycle_submit_ns as f64 / 1_000_000_000.0
+                                }
+                            };
 
                             // 时间戳必须严格递增（波形点集的二分查找依赖
-                            // 单调性）。同一采样周期被重复提交或时钟分辨率
-                            // 不足时钳到上一个样本之后 1ns。
+                            // 单调性）。Real 模式下同一采样周期被重复提交或
+                            // 时钟分辨率不足时可能相等；Grid 模式在纳秒取整
+                            // 极小间隔时也可能相等。统一钳到上一时间戳 +1ns。
                             let timestamp_sec = if let Some(prev) = last_timestamp_sec {
-                                if timestamp_sec <= prev {
+                                if raw_ts <= prev {
                                     prev + 1e-9
                                 } else {
-                                    timestamp_sec
+                                    raw_ts
                                 }
                             } else {
-                                timestamp_sec
+                                raw_ts
                             };
                             last_timestamp_sec = Some(timestamp_sec);
 
@@ -2112,6 +2169,97 @@ mod tests {
         // 响应侧：首包读字数对应的数据 + 3 字节头也必须 ≤ 包大小
         let resp = RESPONSE_HEADER_BYTES + first * 4;
         assert!(resp <= packet, "resp={resp} must fit");
+    }
+
+    // ---- 时间戳模式（grid / real 可配置） ----
+
+    #[test]
+    fn timestamp_mode_defaults_to_grid() {
+        // 默认必须是 grid：与历史行为一致，避免升级后波形突然变得疏密不均
+        assert_eq!(TimestampMode::default(), TimestampMode::Grid);
+    }
+
+    #[test]
+    fn timestamp_mode_label_round_trip() {
+        for mode in [TimestampMode::Grid, TimestampMode::Real] {
+            assert_eq!(TimestampMode::from_label(mode.label()), mode);
+        }
+        // 未知/空值回退默认 grid（工程文件损坏时不至于打不开）
+        assert_eq!(TimestampMode::from_label(""), TimestampMode::Grid);
+        assert_eq!(TimestampMode::from_label("bogus"), TimestampMode::Grid);
+        // 大小写不敏感（手写工程文件容错）
+        assert_eq!(TimestampMode::from_label("REAL"), TimestampMode::Real);
+        assert_eq!(TimestampMode::from_label("Grid"), TimestampMode::Grid);
+    }
+
+    #[test]
+    fn grid_mode_timestamps_are_uniform_but_drift_from_real_time() {
+        // Grid 模式：即使设备只跑出 4 kHz（目标 10 kHz），时间戳仍按
+        // 100 µs 等差——这就是「假时间戳」的特性，作为可选模式保留
+        let rate = 10_000u32;
+        let real_period_ns = 250_000u64;
+        let mut prev: Option<f64> = None;
+        let mut ts = Vec::new();
+        for seq in 0..10u64 {
+            // Grid 模式只看 seq，完全忽略真实提交时刻
+            let raw = tick_ns(seq, rate) as f64 / 1e9;
+            let t = match prev {
+                Some(p) if raw <= p => p + 1e-9,
+                _ => raw,
+            };
+            prev = Some(t);
+            ts.push(t);
+            let _ = real_period_ns; // 真实时刻在此模式下不参与
+        }
+        // 间隔恒为 100 µs
+        for w in ts.windows(2) {
+            assert!((w[1] - w[0] - 1e-4).abs() < 1e-9, "grid interval must be uniform");
+        }
+        // 但 10 个样本只覆盖 0.9 ms，真实已过 2.25 ms → 时间轴超前
+        assert!(ts[9] < 0.001, "grid时间轴远小于真实经过时间");
+    }
+
+    #[test]
+    fn real_mode_timestamps_follow_actual_submit_times() {
+        // Real 模式：时间戳直接取提交时刻，跳周期体现为更大间隔
+        let submits = [0u64, 100_000, 200_000, 500_000];
+        let mut prev: Option<f64> = None;
+        let mut ts = Vec::new();
+        for &s in &submits {
+            let raw = s as f64 / 1e9;
+            let t = match prev {
+                Some(p) if raw <= p => p + 1e-9,
+                _ => raw,
+            };
+            prev = Some(t);
+            ts.push(t);
+        }
+        assert!((ts[1] - ts[0] - 1e-4).abs() < 1e-9);
+        assert!((ts[2] - ts[1] - 1e-4).abs() < 1e-9);
+        // 第 3→4 个样本之间跳过 2 个周期
+        assert!((ts[3] - ts[2] - 3e-4).abs() < 1e-9, "skipped cycles show as 300µs gap");
+    }
+
+    #[test]
+    fn both_modes_keep_timestamps_strictly_increasing() {
+        // 两种模式都必须满足波形的单调性要求
+        for mode in [TimestampMode::Grid, TimestampMode::Real] {
+            let mut prev: Option<f64> = None;
+            // 故意制造相等/倒退的原始值
+            let raws = [1.0e-3, 1.0e-3, 5.0e-4, 2.0e-3];
+            let mut out = Vec::new();
+            for raw in raws {
+                let t = match prev {
+                    Some(p) if raw <= p => p + 1e-9,
+                    _ => raw,
+                };
+                prev = Some(t);
+                out.push(t);
+            }
+            for w in out.windows(2) {
+                assert!(w[1] > w[0], "mode {mode:?} must stay strictly increasing: {out:?}");
+            }
+        }
     }
 
     #[test]

@@ -15,7 +15,10 @@ use crate::pipeline::sample::ValueType;
 use super::sample::{Sample, MAX_VALUES};
 use super::ring_buffer::RingBuffer;
 
-/// 第 `seq` 个采样点相对起点的理想时刻（纳秒）
+/// 第 `seq` 个采样周期相对起点的**目标**时刻（纳秒），用于提交节奏
+///
+/// 仅决定何时下发命令，不用于样本时间戳——时间戳取的是命令实际提交
+/// 时刻（见 [`CmdMeta::submit_ns`]），跳过周期不会污染时间轴。
 ///
 /// 必须用「先乘后除」而不是 `interval_ns * seq`：`1e9 / rate` 对不能整除
 /// 的采样率有截断误差（44100 Hz → 22675 ns，隐含 44106 Hz），乘以 seq
@@ -285,6 +288,12 @@ struct CmdMeta {
     chunk_index: u16,
     /// 本周期共拆成几个分片
     chunk_total: u16,
+    /// 本周期首分片**实际提交**的时刻（相对采集起点，纳秒）
+    ///
+    /// 只有 `chunk_index == 0` 的记录有意义（同一周期的所有分片携带
+    /// 同一个值）。这是样本的真实采样时刻：同一采样周期的数据在此刻
+    /// 之后才从目标内存读出，与 USB 响应何时到达无关。
+    submit_ns: u64,
 }
 
 /// 流水线采集引擎
@@ -445,12 +454,11 @@ impl PipelineEngine {
         // 无感知，UI 每帧 drain 后转为错误弹窗
         let notices: Arc<Mutex<Vec<PipelineNotice>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // 时间戳完全由接收线程的 seq 计算：
-        //   timestamp = seq * 1e9 / rate_hz（先乘后除，无累积漂移）
-        // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
-        // 保证显示的采样间隔严格一致。无需跨线程队列传递。
-        // （已知局限：背压跳过的周期也占一个 seq，低于目标采样率运行时
-        //  时间轴会系统性超前。此项本次不改。）
+        // 时间戳由提交线程记录、随 CmdMeta 传给接收线程：
+        //   submit_ns = 本周期首分片实际进入 OUT 槽位的时刻（相对起点）
+        // 接收线程据此生成 timestamp_sec，并强制严格单调递增。
+        // 背压跳过/丢帧的周期不产生样本，因此不会像理想网格那样让
+        // 时间轴系统性超前——跳过的时长如实体现为更大的采样间隔。
 
         let submit = self.spawn_submit_thread(
             Arc::clone(&session),
@@ -721,6 +729,10 @@ impl PipelineEngine {
                     let chunk_total = read_parts.len().max(1);
                     let mut submitted = 0usize;
                     let mut aborted = false;
+                    // 本周期首分片的真实提交时刻（相对采集起点，纳秒）。
+                    // 这是样本的时间戳来源：跳过周期不会再让后续样本
+                    // 的时间轴超前。
+                    let mut cycle_submit_ns: u64 = 0;
                     for (chunk_index, part) in read_parts.iter().enumerate() {
                         let wait_deadline = Instant::now() + Duration::from_secs(2);
                         while in_flight.load(Ordering::Relaxed) >= in_flight_limit {
@@ -790,12 +802,20 @@ impl PipelineEngine {
 
                         match session.submit(&cmd) {
                             Ok(true) => {
+                                // 首分片提交成功的那一刻就是本样本的采样
+                                // 时刻（命令已进入 USB OUT 槽位，设备随后
+                                // 立即执行内存读）。整个周期共用这个值。
+                                if chunk_index == 0 {
+                                    cycle_submit_ns =
+                                        start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                                }
                                 if let Ok(mut q) = cmd_meta.lock() {
                                     q.push_back(CmdMeta {
                                         write_reqs: wreqs_this as u8,
                                         chunk_words: chunk_words[chunk_index],
                                         chunk_index: chunk_index as u16,
                                         chunk_total: chunk_total as u16,
+                                        submit_ns: cycle_submit_ns,
                                     });
                                 }
                                 in_flight.fetch_add(1, Ordering::SeqCst);
@@ -874,7 +894,6 @@ impl PipelineEngine {
         let accesses = self.accesses.clone();
         let num_vars = accesses.len();
         let total_words = self.total_words;
-        let rate_hz = self.rate_hz;
         let last_words = Arc::clone(&self.last_words);
         let cmd_meta = Arc::clone(&self.cmd_meta);
         let in_flight = Arc::clone(&self.in_flight);
@@ -900,8 +919,12 @@ impl PipelineEngine {
                 let mut cycle_next_chunk: u16 = 0;
                 let mut cycle_chunk_total: u16 = 0;
                 let mut cycle_written_words: usize = 0;
+                // 本周期首分片的真实提交时刻（纳秒，来自提交线程）
+                let mut cycle_submit_ns: u64 = 0;
                 // 周期中途出现非 OK 状态 / 分片丢失 → 整个周期作废
                 let mut cycle_broken = false;
+                // 上一个已产出样本的时间戳（保证严格单调递增）
+                let mut last_timestamp_sec: Option<f64> = None;
 
                 while running.load(Ordering::Relaxed) {
                     // 等待下一条完整响应（异步 IN 池在事件泵线程里收）
@@ -1080,6 +1103,7 @@ impl PipelineEngine {
                             // 未完整到达的残留分片）
                             cycle_chunk_total = meta.chunk_total;
                             cycle_written_words = 0;
+                            cycle_submit_ns = meta.submit_ns;
                             cycle_broken = false;
                         }
 
@@ -1110,9 +1134,28 @@ impl PipelineEngine {
                             && cycle_next_chunk >= cycle_chunk_total
                             && cycle_chunk_total > 0
                         {
-                            // 时间戳完全由 seq 计算（理想网格时间戳），
-                            // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
-                            let timestamp_sec = tick_ns(seq, rate_hz) as f64 / 1_000_000_000.0;
+                            // 时间戳 = 本周期首分片的实际提交时刻。
+                            //
+                            // 不使用 `seq × 周期` 的理想网格：背压跳过的
+                            // 周期也会推进 seq，那样时间轴会系统性超前于
+                            // 真实采样时刻（吞吐不足时波形被压缩、ΔT 失真）。
+                            // 用真实提交时刻，跳周期留下的空缺在波形上表现
+                            // 为更大的时间间隔——这正是实际发生的情况。
+                            let timestamp_sec = cycle_submit_ns as f64 / 1_000_000_000.0;
+
+                            // 时间戳必须严格递增（波形点集的二分查找依赖
+                            // 单调性）。同一采样周期被重复提交或时钟分辨率
+                            // 不足时钳到上一个样本之后 1ns。
+                            let timestamp_sec = if let Some(prev) = last_timestamp_sec {
+                                if timestamp_sec <= prev {
+                                    prev + 1e-9
+                                } else {
+                                    timestamp_sec
+                                }
+                            } else {
+                                timestamp_sec
+                            };
+                            last_timestamp_sec = Some(timestamp_sec);
 
                             // 按 accesses.words 顺序把读回的字归组后再拼值
                             let mut vals = [0u64; MAX_VALUES];
@@ -1791,7 +1834,113 @@ mod tests {
     }
 
     fn meta(write_reqs: u8, chunk_words: u16, chunk_index: u16, chunk_total: u16) -> CmdMeta {
-        CmdMeta { write_reqs, chunk_words, chunk_index, chunk_total }
+        CmdMeta { write_reqs, chunk_words, chunk_index, chunk_total, submit_ns: 0 }
+    }
+
+    fn meta_at(
+        write_reqs: u8,
+        chunk_words: u16,
+        chunk_index: u16,
+        chunk_total: u16,
+        submit_ns: u64,
+    ) -> CmdMeta {
+        CmdMeta { write_reqs, chunk_words, chunk_index, chunk_total, submit_ns }
+    }
+
+    // ---- 真实时间戳（不是 ideal grid） ----
+
+    /// 模拟接收线程的时间戳逻辑：使用周期首分片的真实提交时刻，
+    /// 并强制严格单调递增
+    fn next_timestamp(prev: Option<f64>, submit_ns: u64) -> f64 {
+        let ts = submit_ns as f64 / 1_000_000_000.0;
+        match prev {
+            Some(p) if ts <= p => p + 1e-9,
+            _ => ts,
+        }
+    }
+
+    #[test]
+    fn timestamp_uses_real_submit_time_not_grid() {
+        // 目标 10 kHz（网格 100 µs/点），但设备实际 4 kHz（250 µs/点）。
+        // 旧实现用 seq×100µs，20 个样本后时间轴只走了 1.9 ms，实际过了
+        // 4.75 ms——波形被压缩近 2.5 倍。真实时间戳必须反映 250 µs 间隔。
+        let rate = 10_000u64;
+        let grid_period_ns = 1_000_000_000 / rate; // 100 µs
+        let real_period_ns = 250_000u64; // 实际 4 kHz
+
+        let mut prev: Option<f64> = None;
+        let mut ts = Vec::new();
+        for seq in 0..20u64 {
+            // 真实的提交时刻（设备跟不上，按 250 µs 节拍）
+            let submit_ns = real_period_ns * seq;
+            let t = next_timestamp(prev, submit_ns);
+            prev = Some(t);
+            ts.push(t);
+            // 与 ideal grid 的差距随时间线性拉大
+            let grid = (grid_period_ns * seq) as f64 / 1e9;
+            if seq >= 10 {
+                assert!(
+                    (t - grid) > 1e-4,
+                    "seq={seq}: real {t:.6}s must diverge from grid {grid:.6}s"
+                );
+            }
+        }
+        // 相邻间隔必须等于真实间隔，而不是目标间隔
+        for w in ts.windows(2) {
+            let dt = w[1] - w[0];
+            assert!(
+                (dt - 2.5e-4).abs() < 1e-6,
+                "interval {dt:.6} must be the real 250µs, not the 100µs grid"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_reflects_skipped_cycles_as_larger_gaps() {
+        // 背压跳过若干周期：时间戳跨度必须包含跳过的时长，
+        // 而不是把空缺「填平」（那样波形频率会显得偏高）
+        let mut prev: Option<f64> = None;
+        // 样本 0 在 0 µs，样本 1 在 100 µs，样本 2 在 400 µs（中间跳过 2 个周期）
+        let submits = [0u64, 100_000, 400_000];
+        let mut ts = Vec::new();
+        for &s in &submits {
+            let t = next_timestamp(prev, s);
+            prev = Some(t);
+            ts.push(t);
+        }
+        assert!((ts[1] - ts[0] - 1e-4).abs() < 1e-9);
+        assert!(
+            (ts[2] - ts[1] - 3e-4).abs() < 1e-9,
+            "skipped cycles must appear as a 300µs gap, got {}",
+            ts[2] - ts[1]
+        );
+    }
+
+    #[test]
+    fn timestamps_stay_strictly_increasing_on_duplicate_submit_time() {
+        // 时钟分辨率不足 / 同一周期被重复处理：时间戳不得相等或倒退，
+        // 否则波形的二分查找与可见范围裁剪会失效
+        let mut prev: Option<f64> = None;
+        let values = [1_000_000u64, 1_000_000, 900_000, 2_000_000];
+        let mut out = Vec::new();
+        for v in values {
+            let t = next_timestamp(prev, v);
+            prev = Some(t);
+            out.push(t);
+        }
+        for w in out.windows(2) {
+            assert!(w[1] > w[0], "timestamps must strictly increase: {:?}", out);
+        }
+    }
+
+    #[test]
+    fn chunk_meta_carries_cycle_submit_time_to_all_chunks() {
+        // 同一周期的所有分片共享首分片的提交时刻（接收线程只在
+        // chunk_index==0 时读取，但值必须一路带着）
+        let first = meta_at(0, 6, 0, 2, 123_456_789);
+        assert_eq!(first.submit_ns, 123_456_789);
+        let second = meta_at(0, 2, 1, 2, 123_456_789);
+        assert_eq!(second.submit_ns, first.submit_ns);
     }
 
     #[test]

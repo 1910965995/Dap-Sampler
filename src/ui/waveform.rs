@@ -256,15 +256,37 @@ impl WaveformPanel {
             let cur_bounds = plot_ui.plot_bounds();
             let cur_x_max = cur_bounds.max()[0];
 
+            // 窗口时长：优先用 buffer 中真实时间戳跨度。
+            //
+            // 不能用 `点数 × 目标间隔`：时间戳现在来自真实提交时刻，
+            // 实际采样率低于目标时（吞吐不足、背压跳周期）真实间隔更大，
+            // 按目标间隔算出的窗口会偏短，导致视野内点数超出预期。
+            let window_duration = |view_len: usize| -> f64 {
+                if view_len == 0 || buffer_len == 0 {
+                    return 0.0;
+                }
+                let end = latest_ts;
+                let start_idx = buffer_len.saturating_sub(view_len);
+                let start = buffer[start_idx].timestamp_sec;
+                let span = end - start;
+                if span > 0.0 {
+                    // 用真实跨度，并按点数补齐最后一个间隔（跨度只覆盖
+                    // n-1 个间隔）
+                    span + span / view_len.max(1) as f64
+                } else {
+                    view_len as f64 * interval_us / 1_000_000.0
+                }
+            };
+
             // 用户拖拽/缩放检测：如果 X 轴右边界偏离了上一帧位置（超过 1% 窗口时长），
             // 说明用户在手动操作，自动暂停跟随
             if auto_scroll && buffer_len > 0 {
                 let view_len = view_points.min(buffer_len);
-                let window_duration = view_len as f64 * interval_us / 1_000_000.0;
+                let window = window_duration(view_len);
                 if let Some(prev) = prev_x_max {
                     // X 右边界变化超过 1% 窗口时长 → 用户在操作
                     let drift = (cur_x_max - prev).abs();
-                    if drift > window_duration * 0.01 {
+                    if drift > window * 0.01 {
                         self.auto_scroll = false;
                     }
                 }
@@ -274,11 +296,11 @@ impl WaveformPanel {
             // Y 轴基准先用本帧视野范围重扫（首帧即可正确，无延迟）
             if auto_scroll && buffer_len > 0 {
                 let view_len = view_points.min(buffer_len);
-                let window_duration = view_len as f64 * interval_us / 1_000_000.0;
-                self.rescan_y_max(buffer, latest_ts - window_duration, latest_ts);
+                let window = window_duration(view_len);
+                self.rescan_y_max(buffer, latest_ts - window, latest_ts);
                 let y_bound = 2.0 * self.auto_y_max_abs;
                 let new_bounds = PlotBounds::from_min_max(
-                    [latest_ts - window_duration, -y_bound],
+                    [latest_ts - window, -y_bound],
                     [latest_ts, y_bound],
                 );
                 plot_ui.set_plot_bounds(new_bounds);

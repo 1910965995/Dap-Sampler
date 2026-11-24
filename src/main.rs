@@ -584,6 +584,8 @@ fn cmd_sample(
         (0..1024).map(|_| dap_sampler::pipeline::sample::Sample::default()).collect();
 
     let mut last_progress = 0u64;
+    // 最后一个已写出样本的真实时间戳（用于结束时报告实际时长）
+    let mut last_sample_ts: Option<f64> = None;
 
     while total_collected < max_samples {
         let n = handle.drain_samples(&mut sample_buf);
@@ -608,6 +610,7 @@ fn cmd_sample(
             }
             writeln!(writer)?;
 
+            last_sample_ts = Some(sample.timestamp_sec);
             total_collected += 1;
             if total_collected >= max_samples {
                 break;
@@ -620,7 +623,7 @@ fn cmd_sample(
             log::info!(
                 "captured {} samples ({:.1}s), {} available in buffer",
                 total_collected,
-                total_collected as f64 / rate as f64,
+                last_sample_ts.unwrap_or(0.0),
                 handle.available_samples()
             );
         }
@@ -632,7 +635,11 @@ fn cmd_sample(
     let actual_count = total_collected;
     println!("\n\u{2705} capture finished: {} samples", actual_count);
     if actual_count > 0 {
-        let actual_duration = actual_count as f64 / rate as f64;
+        // 用真实时间戳报告时长：时间戳来自实际提交时刻，按目标采样率
+        // 换算会在吞吐不足时低估实际经过的时间
+        let actual_duration = last_sample_ts.unwrap_or_else(|| {
+            actual_count as f64 / rate as f64
+        });
         println!("   actual duration: {:.3}s", actual_duration);
     }
 

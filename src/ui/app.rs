@@ -2349,7 +2349,17 @@ impl DapSamplerApp {
             ));
         }
         if self.controls.total_samples > 0 {
-            let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
+            // 时长优先用真实时间戳（最后一个样本的时刻）。按目标采样率
+            // 估算会在实际速率不足时偏小——时间轴现在反映真实采样时刻。
+            let duration = self
+                .display_buf
+                .last()
+                .map(|s| s.timestamp_sec)
+                .filter(|d| *d > 0.0)
+                .unwrap_or_else(|| {
+                    self.controls.total_samples as f64
+                        / self.controls.sample_rate.max(1) as f64
+                });
             items.push((
                 tf("Samples: {} ({}s)", &[&self.controls.total_samples.to_string(), &format!("{:.1}", duration)]),
                 ui.visuals().text_color(),

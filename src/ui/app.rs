@@ -2977,7 +2977,6 @@ impl eframe::App for DapSamplerApp {
 
         // ---- Advanced Settings 窗口（Settings → Advanced Settings…）----
         if self.show_advanced_settings {
-            let was_running = self.controls.state == AcquisitionState::Running;
             let old_mode = self.timestamp_mode;
             egui::Window::new(t("Advanced Settings"))
                 .open(&mut self.show_advanced_settings)
@@ -3009,23 +3008,17 @@ impl eframe::App for DapSamplerApp {
                             });
                     });
                     ui.add_space(2.0);
-                    // 模式说明：两种取舍直接写在窗口里，避免用户凭猜测选择
+                    // 模式说明：只保留两种模式的取舍要点（平滑 vs 时间准确）
                     let desc = match self.timestamp_mode {
                         TimestampMode::Grid => t(
-                            "Timestamps use the ideal sampling grid (seq × period).\nPoints are evenly spaced and the waveform looks smooth.\nIf the device cannot sustain the target rate, the time axis runs ahead of real sampling time (the waveform appears compressed and delta-T is inaccurate).",
+                            "Evenly spaced points, smooth waveform.\nIf throughput falls short, the time axis runs ahead of real time (waveform looks compressed, delta-T is off).",
                         ),
                         TimestampMode::Real => t(
-                            "Timestamps use the actual submit time of each sampling cycle.\nThe X axis reflects real elapsed time; when cycles are skipped the gap shows up as a larger interval.\nSampling intervals are not perfectly uniform, so the waveform may look slightly uneven.",
+                            "X axis uses the real sample time; skipped cycles appear as larger gaps.\nIntervals may be uneven.",
                         ),
                     };
                     ui.label(
                         egui::RichText::new(desc)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(t("Applies on next Start."))
                             .size(11.0)
                             .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
                     );
@@ -3035,10 +3028,7 @@ impl eframe::App for DapSamplerApp {
                     TimestampMode::Grid => t("Grid (ideal equal spacing)"),
                     TimestampMode::Real => t("Real (actual submit time)"),
                 };
-                self.set_status(tf(
-                    "Timestamp mode changed to {}{}",
-                    &[label, if was_running { t(" (applies on next Start)") } else { "" }],
-                ));
+                self.set_status(tf("Timestamp mode changed to {}", &[label]));
             }
         }
 

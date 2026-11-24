@@ -192,7 +192,10 @@ fn ap_register_addresses() {
     assert_eq!(AP_REG_CSW, 0x00);
     assert_eq!(AP_REG_TAR, 0x04);
     assert_eq!(AP_REG_DRW, 0x0C);
-    assert_eq!(AP_REG_IDR, 0x0C); // Same as DRW when CSW=0
+    // IDR 是 0xFC（只读寄存器），不是 DRW 的 0x0C：
+    // 仅当 CSW.SIZE=0（8 位）时 DRW 才别名到 IDR，而 CSW 已显式配置
+    // 为 32 位访问，不能依赖该别名
+    assert_eq!(AP_REG_IDR, 0xFC);
 }
 
 // ================================================================

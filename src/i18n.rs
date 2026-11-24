@@ -114,6 +114,7 @@ const ZH_TABLE: &[(&str, &str)] = &[
     ("New Oscilloscope", "新建示波器"),
     ("Settings(S)", "设置(S)"),
     ("General Settings…", "常规设置…"),
+    ("Advanced Settings…", "高级设置…"),
     ("Help(H)", "帮助(H)"),
     ("About", "关于"),
     // ---- 采集控制 / 参数 ----
@@ -134,6 +135,20 @@ const ZH_TABLE: &[(&str, &str)] = &[
     ("No", "否"),
     ("Change ELF…", "更换 ELF…"),
     ("General Settings", "常规设置"),
+    ("Advanced Settings", "高级设置"),
+    ("Sampling", "采样"),
+    ("Timestamp mode:", "时间戳模式:"),
+    ("Grid (ideal equal spacing)", "网格（理想等间隔）"),
+    ("Real (actual submit time)", "真实（实际提交时刻）"),
+    (
+        "Evenly spaced points, smooth waveform.\nIf throughput falls short, the time axis runs ahead of real time (waveform looks compressed, delta-T is off).",
+        "采样点等间隔，波形平滑。\n实际吞吐不足时，时间轴会超前于真实时间（波形看起来被压缩，ΔT 不准）。",
+    ),
+    (
+        "X axis uses the real sample time; skipped cycles appear as larger gaps.\nIntervals may be uneven.",
+        "X 轴使用真实采样时刻；跳过的周期体现为更大的间隔。\n采样间隔可能不均匀。",
+    ),
+    ("Timestamp mode changed to {}", "时间戳模式已切换为 {}"),
     ("Buffer capacity:", "缓冲容量:"),
     ("≈ {} s of history @ {} Hz", "≈ {} 秒历史数据 @ {} Hz"),
     ("Current ELF:", "当前 ELF:"),

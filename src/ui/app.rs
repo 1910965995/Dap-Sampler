@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::pipeline::sample::Sample;
 use crate::pipeline::sample::ValueType;
 use crate::pipeline::sample::MAX_VALUES;
-use crate::pipeline::engine::{PipelineEngine, PipelineHandle, PipelineNotice};
+use crate::pipeline::engine::{PipelineEngine, PipelineHandle, PipelineNotice, TimestampMode};
 use crate::usb::transfer::BulkTransfer;
 use crate::dap::protocol::DapProtocol;
 use crate::dap::swd::SwdLink;
@@ -441,6 +441,10 @@ pub struct DapSamplerApp {
     buffer_capacity: usize,
     /// 设置窗口是否显示（设置 → 常规设置）
     show_settings: bool,
+    /// 高级设置窗口是否显示（设置 → 高级设置）
+    show_advanced_settings: bool,
+    /// 采样时间戳模式（grid = 理想等间隔，real = 真实提交时刻）
+    timestamp_mode: TimestampMode,
     /// 关于窗口是否显示（帮助 → 关于）
     show_about: bool,
     /// ELF 加载失败警告弹窗内容（Some = 显示；打开工程时 ELF 缺失时弹出）
@@ -693,6 +697,8 @@ impl DapSamplerApp {
             hover_menu: None,
             buffer_capacity: crate::ui::controls::DEFAULT_BUFFER_CAPACITY,
             show_settings: false,
+            show_advanced_settings: false,
+            timestamp_mode: TimestampMode::default(),
             show_about: false,
             elf_warning: None,
             show_elf_warning: false,
@@ -703,6 +709,16 @@ impl DapSamplerApp {
             elf_sync_open: false,
             last_project_variables: Vec::new(),
         }
+    }
+
+    /// 设置采样时间戳模式（CLI 启动参数 / 工程加载用）
+    pub fn set_timestamp_mode(&mut self, mode: TimestampMode) {
+        self.timestamp_mode = mode;
+    }
+
+    /// 当前采样时间戳模式
+    pub fn timestamp_mode(&self) -> TimestampMode {
+        self.timestamp_mode
     }
 
     /// 状态栏内容（单行，超宽显示省略号 + 完整内容悬停提示）
@@ -935,6 +951,7 @@ impl DapSamplerApp {
             buffer_capacity: self.buffer_capacity,
             watch_col_widths: self.watch_panel.col_widths().to_vec(),
             language: crate::i18n::current().code().to_string(),
+            timestamp_mode: self.timestamp_mode.label().to_string(),
             scopes: self
                 .scopes
                 .iter()
@@ -1097,12 +1114,13 @@ impl DapSamplerApp {
         self.scope_rename = None;
         self.scope_rename_needs_focus = false;
 
-        // 4. 恢复全局设置：Buffer capacity 与 Watch 列宽
+        // 4. 恢复全局设置：Buffer capacity、Watch 列宽与时间戳模式
         //（旧版工程无这些字段时为默认值；非法值在面板内夹紧）
         self.buffer_capacity = file
             .buffer_capacity
             .clamp(crate::ui::controls::BUFFER_CAPACITY_MIN, crate::ui::controls::BUFFER_CAPACITY_MAX);
         self.watch_panel.set_col_widths(&file.watch_col_widths);
+        self.timestamp_mode = file.timestamp_mode();
 
         // 5. 清空运行时状态，回到 Idle（激活第一个 scope）
         self.load_scope_views(0);
@@ -1489,6 +1507,7 @@ impl DapSamplerApp {
             addresses,
             &types,
             self.rate_hz,
+            self.timestamp_mode,
         );
 
         // 同步 Watch 面板
@@ -2349,7 +2368,17 @@ impl DapSamplerApp {
             ));
         }
         if self.controls.total_samples > 0 {
-            let duration = self.controls.total_samples as f64 / self.controls.sample_rate.max(1) as f64;
+            // 时长优先用真实时间戳（最后一个样本的时刻）。按目标采样率
+            // 估算会在实际速率不足时偏小——时间轴现在反映真实采样时刻。
+            let duration = self
+                .display_buf
+                .last()
+                .map(|s| s.timestamp_sec)
+                .filter(|d| *d > 0.0)
+                .unwrap_or_else(|| {
+                    self.controls.total_samples as f64
+                        / self.controls.sample_rate.max(1) as f64
+                });
             items.push((
                 tf("Samples: {} ({}s)", &[&self.controls.total_samples.to_string(), &format!("{:.1}", duration)]),
                 ui.visuals().text_color(),
@@ -2530,6 +2559,10 @@ impl eframe::App for DapSamplerApp {
                 self.hover_menu(ui, "settings", t("Settings(S)"), |ui, app| {
                     if menu_item(ui, t("General Settings…")).clicked() {
                         app.show_settings = true;
+                        return true;
+                    }
+                    if menu_item(ui, t("Advanced Settings…")).clicked() {
+                        app.show_advanced_settings = true;
                         return true;
                     }
                     false
@@ -2942,6 +2975,63 @@ impl eframe::App for DapSamplerApp {
             }
         }
 
+        // ---- Advanced Settings 窗口（Settings → Advanced Settings…）----
+        if self.show_advanced_settings {
+            let old_mode = self.timestamp_mode;
+            egui::Window::new(t("Advanced Settings"))
+                .open(&mut self.show_advanced_settings)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(500.0);
+                    ui.label(egui::RichText::new(t("Sampling")).strong());
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(t("Timestamp mode:"));
+                        egui::ComboBox::from_id_salt("timestamp_mode_combo")
+                            .selected_text(match self.timestamp_mode {
+                                TimestampMode::Grid => t("Grid (ideal equal spacing)"),
+                                TimestampMode::Real => t("Real (actual submit time)"),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.timestamp_mode,
+                                    TimestampMode::Grid,
+                                    t("Grid (ideal equal spacing)"),
+                                );
+                                ui.selectable_value(
+                                    &mut self.timestamp_mode,
+                                    TimestampMode::Real,
+                                    t("Real (actual submit time)"),
+                                );
+                            });
+                    });
+                    ui.add_space(2.0);
+                    // 模式说明：只保留两种模式的取舍要点（平滑 vs 时间准确）
+                    let desc = match self.timestamp_mode {
+                        TimestampMode::Grid => t(
+                            "Evenly spaced points, smooth waveform.\nIf throughput falls short, the time axis runs ahead of real time (waveform looks compressed, delta-T is off).",
+                        ),
+                        TimestampMode::Real => t(
+                            "X axis uses the real sample time; skipped cycles appear as larger gaps.\nIntervals may be uneven.",
+                        ),
+                    };
+                    ui.label(
+                        egui::RichText::new(desc)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(0x6e, 0x76, 0x82)),
+                    );
+                });
+            if old_mode != self.timestamp_mode {
+                let label = match self.timestamp_mode {
+                    TimestampMode::Grid => t("Grid (ideal equal spacing)"),
+                    TimestampMode::Real => t("Real (actual submit time)"),
+                };
+                self.set_status(tf("Timestamp mode changed to {}", &[label]));
+            }
+        }
+
         // ---- ELF 同步询问弹窗（打开工程时变量地址与 ELF 不一致）----
         // X 关闭等价于 No（采用工程地址）
         if let Some(prompt) = self.elf_sync_prompt.clone() {
@@ -3125,6 +3215,22 @@ mod status_tests {
         let app = make_app();
         assert_eq!(app.status_text.as_deref(), Some("Ready"));
         assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn app_defaults_to_grid_timestamp_mode() {
+        // 默认必须是理想网格：与升级前的行为一致
+        let app = make_app();
+        assert_eq!(app.timestamp_mode(), TimestampMode::Grid);
+    }
+
+    #[test]
+    fn app_timestamp_mode_setter_takes_effect() {
+        let mut app = make_app();
+        app.set_timestamp_mode(TimestampMode::Real);
+        assert_eq!(app.timestamp_mode(), TimestampMode::Real);
+        app.set_timestamp_mode(TimestampMode::Grid);
+        assert_eq!(app.timestamp_mode(), TimestampMode::Grid);
     }
 
     #[test]

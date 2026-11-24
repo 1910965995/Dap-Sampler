@@ -103,6 +103,11 @@ enum Command {
         #[arg(long)]
         output: Option<String>,
 
+        /// Sample timestamp mode: "grid" (ideal equal spacing, default) or
+        /// "real" (actual submit time; skipped cycles show up as larger gaps)
+        #[arg(long, default_value = "grid")]
+        timestamp: String,
+
         /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
         swd_clock: u32,
@@ -131,6 +136,11 @@ enum Command {
         /// ELF firmware file path (P4: enables the variable browser)
         #[arg(long)]
         elf: Option<String>,
+
+        /// Sample timestamp mode: "grid" (default) or "real".
+        /// Can also be changed later in Settings → Advanced Settings…
+        #[arg(long, default_value = "grid")]
+        timestamp: String,
 
         /// SWD clock frequency (MHz, 1-50)
         #[arg(long, default_value = "1")]
@@ -173,6 +183,7 @@ fn main() -> anyhow::Result<()> {
         count: None,
         r#type: None,
         elf: None,
+        timestamp: "grid".to_string(),
         swd_clock: 1,
     }) {
         Command::List => cmd_list(),
@@ -182,11 +193,11 @@ fn main() -> anyhow::Result<()> {
         Command::Read { address, float, swd_clock } => cmd_read(&address, float, swd_clock),
         Command::Write { address, value, float, swd_clock } => cmd_write(&address, &value, float, swd_clock),
         Command::Monitor { address, rate, count, float, swd_clock } => cmd_monitor(&address, rate, count, float, swd_clock),
-        Command::Sample { addresses, rate, count, float, output, swd_clock } => {
-            cmd_sample(&addresses, rate, count, float, output.as_deref(), swd_clock)
+        Command::Sample { addresses, rate, count, float, output, timestamp, swd_clock } => {
+            cmd_sample(&addresses, rate, count, float, output.as_deref(), &timestamp, swd_clock)
         }
-        Command::Gui { addresses, rate, count, r#type, elf, swd_clock } => {
-            cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref(), swd_clock)
+        Command::Gui { addresses, rate, count, r#type, elf, timestamp, swd_clock } => {
+            cmd_gui(&addresses, rate, count, r#type.as_deref(), elf.as_deref(), &timestamp, swd_clock)
         }
     }
 }
@@ -518,6 +529,7 @@ fn cmd_sample(
     count: Option<u64>,
     as_float: bool,
     output_path: Option<&str>,
+    timestamp: &str,
     swd_clock_mhz: u32,
 ) -> anyhow::Result<()> {
     use std::io::Write;
@@ -562,7 +574,9 @@ fn cmd_sample(
     // 创建引擎并启动（CLI 模式无类型概念，全部按 u32 整字访问）
     let usb = Arc::new(usb);
     let types = vec![dap_sampler::pipeline::sample::ValueType::Uint32; addresses.len()];
-    let engine = PipelineEngine::new(usb, dap, addresses.clone(), &types, rate);
+    let ts_mode = dap_sampler::pipeline::engine::TimestampMode::from_label(timestamp);
+    println!("   timestamps: {}", ts_mode.label());
+    let engine = PipelineEngine::new(usb, dap, addresses.clone(), &types, rate, ts_mode);
     let handle = engine.start(dap_sampler::ui::controls::DEFAULT_BUFFER_CAPACITY)?;
 
     // 准备输出
@@ -584,6 +598,8 @@ fn cmd_sample(
         (0..1024).map(|_| dap_sampler::pipeline::sample::Sample::default()).collect();
 
     let mut last_progress = 0u64;
+    // 最后一个已写出样本的真实时间戳（用于结束时报告实际时长）
+    let mut last_sample_ts: Option<f64> = None;
 
     while total_collected < max_samples {
         let n = handle.drain_samples(&mut sample_buf);
@@ -608,6 +624,7 @@ fn cmd_sample(
             }
             writeln!(writer)?;
 
+            last_sample_ts = Some(sample.timestamp_sec);
             total_collected += 1;
             if total_collected >= max_samples {
                 break;
@@ -620,7 +637,7 @@ fn cmd_sample(
             log::info!(
                 "captured {} samples ({:.1}s), {} available in buffer",
                 total_collected,
-                total_collected as f64 / rate as f64,
+                last_sample_ts.unwrap_or(0.0),
                 handle.available_samples()
             );
         }
@@ -632,7 +649,11 @@ fn cmd_sample(
     let actual_count = total_collected;
     println!("\n\u{2705} capture finished: {} samples", actual_count);
     if actual_count > 0 {
-        let actual_duration = actual_count as f64 / rate as f64;
+        // 用真实时间戳报告时长：时间戳来自实际提交时刻，按目标采样率
+        // 换算会在吞吐不足时低估实际经过的时间
+        let actual_duration = last_sample_ts.unwrap_or_else(|| {
+            actual_count as f64 / rate as f64
+        });
         println!("   actual duration: {:.3}s", actual_duration);
     }
 
@@ -645,6 +666,7 @@ fn cmd_gui(
     count: Option<u64>,
     type_strs: Option<&[String]>,
     elf_path: Option<&str>,
+    timestamp: &str,
     swd_clock_mhz: u32,
 ) -> anyhow::Result<()> {
     use dap_sampler::ui::app::DapSamplerApp;
@@ -694,7 +716,7 @@ fn cmd_gui(
     };
 
     // 启动 egui 窗口（此时不连接 USB 设备）
-    let app = DapSamplerApp::new(
+    let mut app = DapSamplerApp::new(
         manual_addresses,
         address_strs.to_vec(),
         rate,
@@ -703,6 +725,8 @@ fn cmd_gui(
         manual_types,
         swd_clock_mhz,
     );
+    // CLI 指定的时间戳模式（默认 grid；窗口中可在 Settings → Advanced Settings… 再改）
+    app.set_timestamp_mode(dap_sampler::pipeline::engine::TimestampMode::from_label(timestamp));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

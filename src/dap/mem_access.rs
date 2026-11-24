@@ -15,13 +15,20 @@ pub struct MemAccess {
     pub aligned_addr: u32,
     /// 变量在首字中的位移（字节 ×8）
     ///
-    /// 1/2 字节类型按 lane 提取；8 字节类型只有在地址不是 4 的倍数时
-    /// 才非零（跨三个对齐字）。
+    /// 1/2 字节类型按 lane 提取；4 字节类型仅当地址不是 4 的倍数时非零
+    /// （跨两个对齐字）；8 字节类型只有在地址不是 4 的倍数时才非零
+    /// （跨三个对齐字）。
     pub shift: u32,
-    /// 变量在首字中的掩码
+    /// 变量在首字中的掩码（仅 1/2 字节类型用于读-改-写）
     pub mask: u32,
     /// 需要读取的 32 位字数（1..=3）
     pub words: u8,
+    /// 变量的字节大小（1/2/4/8）
+    ///
+    /// 写入路径必须按它区分类型语义：仅凭 `words` 无法区分「非对齐
+    /// 32 位（占 2 字）」与「64 位（占 2 字）」——按 words 判断会把
+    /// 非对齐 u32 误当成 u64 拆分写入，破坏相邻内存。
+    pub byte_size: u32,
 }
 
 impl MemAccess {
@@ -30,11 +37,45 @@ impl MemAccess {
         match byte_size {
             1 => {
                 let shift = (addr & 3) * 8;
-                Self { aligned_addr: addr & !3, shift, mask: 0xFFu32 << shift, words: 1 }
+                Self {
+                    aligned_addr: addr & !3,
+                    shift,
+                    mask: 0xFFu32 << shift,
+                    words: 1,
+                    byte_size,
+                }
             }
             2 => {
                 let shift = (addr & 2) * 8;
-                Self { aligned_addr: addr & !3, shift, mask: 0xFFFFu32 << shift, words: 1 }
+                Self {
+                    aligned_addr: addr & !3,
+                    shift,
+                    mask: 0xFFFFu32 << shift,
+                    words: 1,
+                    byte_size,
+                }
+            }
+            4 => {
+                // AHB-AP 不支持非对齐访问：非 4 字节对齐的 u32/float
+                // 横跨两个对齐字，必须读回两个字后再右移拼接
+                // （packed struct 的成员很常见，不能直接下发非对齐地址）
+                if addr & 3 == 0 {
+                    Self {
+                        aligned_addr: addr,
+                        shift: 0,
+                        mask: u32::MAX,
+                        words: 1,
+                        byte_size,
+                    }
+                } else {
+                    Self {
+                        aligned_addr: addr & !3,
+                        shift: (addr & 3) * 8,
+                        mask: u32::MAX,
+                        words: 2,
+                        byte_size,
+                    }
+                }
             }
             8 => {
                 // AHB-AP 以 32 位字为单位访问，8 字节变量按地址对齐情况
@@ -43,13 +84,31 @@ impl MemAccess {
                 // - 非 4 字节对齐：首尾字与相邻变量共享，跨 3 个字，
                 //   变量值在拼接后还需右移字内位移
                 if addr & 3 == 0 {
-                    Self { aligned_addr: addr, shift: 0, mask: u32::MAX, words: 2 }
+                    Self {
+                        aligned_addr: addr,
+                        shift: 0,
+                        mask: u32::MAX,
+                        words: 2,
+                        byte_size,
+                    }
                 } else {
                     let shift = (addr & 3) * 8;
-                    Self { aligned_addr: addr & !3, shift, mask: u32::MAX, words: 3 }
+                    Self {
+                        aligned_addr: addr & !3,
+                        shift,
+                        mask: u32::MAX,
+                        words: 3,
+                        byte_size,
+                    }
                 }
             }
-            _ => Self { aligned_addr: addr, shift: 0, mask: u32::MAX, words: 1 },
+            _ => Self {
+                aligned_addr: addr,
+                shift: 0,
+                mask: u32::MAX,
+                words: 1,
+                byte_size: 4,
+            },
         }
     }
 
@@ -63,10 +122,37 @@ impl MemAccess {
         (word & !self.mask) | ((value << self.shift) & self.mask)
     }
 
+    /// 读-改-写：把变量值按字节写进对齐窗口，其余字节保持窗口原值
+    ///
+    /// 适用于任意宽度与字内位移：
+    /// - 子字变量（u8/u16）：只改写窗口首字中的对应字节 lane
+    /// - 非对齐 32 位变量：跨两个对齐字，逐字节拼接
+    /// - 非对齐 64 位变量：跨三个对齐字，逐字节拼接
+    ///
+    /// `window` 长度必须 ≥ [`MemAccess::words`]，且内容为最近一次采样
+    /// 读回的原始对齐字。调用方负责保证窗口有效（未采到旧值时不得写）。
+    pub fn splice_into(&self, window: &mut [u32], value: u64) {
+        let src = value.to_le_bytes();
+        let len = (self.byte_size as usize).min(8);
+        let byte_off = (self.shift / 8) as usize;
+        for (i, &byte) in src.iter().take(len).enumerate() {
+            let pos = byte_off + i;
+            let word_idx = pos / 4;
+            let byte_in_word = pos % 4;
+            let Some(word) = window.get_mut(word_idx) else {
+                break;
+            };
+            let shift = (byte_in_word * 8) as u32;
+            *word = (*word & !(0xFFu32 << shift)) | ((byte as u32) << shift);
+        }
+    }
+
     /// 把连续读回的 32 位字拼成变量的原始位模式
     ///
     /// `words` 为按地址递增顺序读回的字。32 位及更窄类型取首字 lane 提取；
-    /// 64 位类型按小端拼成 u64（低字在前），跨 3 字时再按字内位移右移。
+    /// 4/8 字节类型按小端拼接（4 字节非对齐时跨两个字、8 字节非对齐时
+    /// 跨三个字），拼接后按字内位移右移，最后按变量宽度截断，去掉相邻
+    /// 变量占用的高位。
     pub fn extract_wide(&self, words: &[u32]) -> u64 {
         if self.words == 1 {
             return self.extract(words.first().copied().unwrap_or(0)) as u64;
@@ -75,9 +161,12 @@ impl MemAccess {
         for (i, &w) in words.iter().take(self.words as usize).enumerate() {
             acc |= u128::from(w) << (32 * i);
         }
-        // 3 字情形（非 4 字节对齐）变量起始于首字内的字节位移处，
-        // 右移去掉前面的填充字节；取低 64 位即变量值
-        ((acc >> self.shift) & u128::from(u64::MAX)) as u64
+        // 非 4 字节对齐：变量起始于首字内的字节位移处，右移去掉前面的
+        // 填充字节。拼接结果的高位属于后续变量，必须按变量宽度截断
+        // （4 字节非对齐时不清掉高位会让调用方看到相邻变量数据）。
+        let bits = self.byte_size.clamp(1, 8) * 8;
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        ((acc >> self.shift) as u64) & mask
     }
 
     /// 把 64 位值拆成 (低字, 高字) 供两次 DRW 写
@@ -212,5 +301,87 @@ mod tests {
         // 写入值超出变量宽度时按 lane 截断（watch 输入按类型解析，防御性）
         let acc = MemAccess::from_addr_size(0x2000_0002, 2);
         assert_eq!(acc.merge(0x2222_1111, 0x1_0005), 0x0005_1111);
+    }
+
+    // ---- 非对齐 32 位：必须对齐后跨字拼接 ----
+
+    #[test]
+    fn unaligned_u32_spans_two_words() {
+        // 非 4 字节对齐的 u32/float（packed struct 成员常见）：
+        // AHB-AP 不支持非对齐访问，必须读回两个字再拼接
+        let acc = MemAccess::from_addr_size(0x2000_0002, 4);
+        assert_eq!(acc.aligned_addr, 0x2000_0000);
+        assert_eq!(acc.shift, 16);
+        assert_eq!(acc.words, 2);
+        assert_eq!(acc.byte_size, 4);
+    }
+
+    #[test]
+    fn unaligned_u32_extracts_correct_bytes() {
+        // 内存布局：0x2000_0000: 0x1111_1111, 0x2000_0004: 0x2222_2222
+        // 变量 @+2 长度为 4 字节 → 字节 [11][11][22][22]（小端）
+        // 期望值 0x2222_1111
+        let acc = MemAccess::from_addr_size(0x2000_0002, 4);
+        assert_eq!(acc.extract_wide(&[0x1111_1111, 0x2222_2222]), 0x2222_1111);
+    }
+
+    #[test]
+    fn aligned_u32_still_single_word() {
+        let acc = MemAccess::from_addr_size(0x2000_0004, 4);
+        assert_eq!(acc.words, 1);
+        assert_eq!(acc.shift, 0);
+        assert_eq!(acc.aligned_addr, 0x2000_0004);
+    }
+
+    #[test]
+    fn unaligned_u32_splice_preserves_neighbours() {
+        // 向 @+2 的 u32 写 0xDEAD_BEEF：
+        // 窗口 [0x1111_1111, 0x2222_2222] →
+        // [0x1111_BEEF?] 不对：低 16 位来自新值的低 16 位 0xBEEF
+        // w0 = 0x1111_1111 的低 16 位保留(0x1111) + 新值低 16 位(0xBEEF) → 0xBEEF_1111
+        // w1 = 新值高 16 位(0xDEAD) + 0x2222_2222 的高 16 位(0x2222) → 0x2222_DEAD
+        let acc = MemAccess::from_addr_size(0x2000_0002, 4);
+        let mut window = [0x1111_1111u32, 0x2222_2222, 0];
+        acc.splice_into(&mut window, 0xDEAD_BEEFu64);
+        assert_eq!(window[0], 0xBEEF_1111);
+        assert_eq!(window[1], 0x2222_DEAD);
+        // 读回必须还原写入值
+        assert_eq!(acc.extract_wide(&window[..2]), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn splice_u16_high_lane_preserves_low_half() {
+        // 子字写入也必须走同一路径且行为正确
+        let acc = MemAccess::from_addr_size(0x2000_0002, 2);
+        let mut window = [0x2222_1111u32, 0, 0];
+        acc.splice_into(&mut window, 5);
+        assert_eq!(window[0], 0x0005_1111);
+    }
+
+    #[test]
+    fn splice_unaligned_u64_across_three_words() {
+        let value = 0x1122_3344_5566_7788u64;
+        let acc = MemAccess::from_addr_size(0x2000_0002, 8);
+        assert_eq!(acc.words, 3);
+        let mut window = [0xAAAA_AAAAu32, 0xBBBB_BBBB, 0xCCCC_CCCC];
+        acc.splice_into(&mut window, value);
+        // 读回必须还原写入值（中间的相邻字节被精确覆盖）
+        assert_eq!(acc.extract_wide(&window[..3]), value);
+        // 首字低 16 位与末字高 16 位必须保留
+        assert_eq!(window[0] & 0xFFFF, 0xAAAA);
+        assert_eq!(window[2] >> 16, 0xCCCC);
+    }
+
+    #[test]
+    fn byte_size_field_distinguishes_u32_from_u64() {
+        // 关键回归：仅凭 words 无法区分「非对齐 32 位（2 字）」与
+        // 「对齐 64 位（2 字）」。按 words 判断写入会把非对齐 u32
+        // 误当 u64 拆分写入，破坏相邻内存。
+        let unaligned_u32 = MemAccess::from_addr_size(0x2000_0002, 4);
+        let aligned_u64 = MemAccess::from_addr_size(0x2000_0000, 8);
+        assert_eq!(unaligned_u32.words, aligned_u64.words);
+        assert_ne!(unaligned_u32.byte_size, aligned_u64.byte_size);
+        assert_eq!(unaligned_u32.byte_size, 4);
+        assert_eq!(aligned_u64.byte_size, 8);
     }
 }

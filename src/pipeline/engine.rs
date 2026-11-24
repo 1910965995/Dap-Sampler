@@ -15,29 +15,50 @@ use crate::pipeline::sample::ValueType;
 use super::sample::{Sample, MAX_VALUES};
 use super::ring_buffer::RingBuffer;
 
-/// 单次 DAP_Transfer 命令的最大请求数（保守上限，避免超过 USB 包大小）
+/// 第 `seq` 个采样点相对起点的理想时刻（纳秒）
 ///
-/// CMSIS-DAP v2 单包请求受 packet_size 限制。每个请求 5 字节
-/// （1 字节 request + 4 字节 data），64 个请求 = 320 字节，远小于
-/// 典型 packet_size (512/1024)。同时避免 total_requests as u8 截断。
+/// 必须用「先乘后除」而不是 `interval_ns * seq`：`1e9 / rate` 对不能整除
+/// 的采样率有截断误差（44100 Hz → 22675 ns，隐含 44106 Hz），乘以 seq
+/// 后误差**线性累积**——600 秒可偏出 6 ms（180 个采样周期）。
+/// 先乘后除每次都是独立舍入，长期平均速率精确等于目标采样率。
+fn tick_ns(seq: u64, rate_hz: u32) -> u64 {
+    let rate = u64::from(rate_hz.max(1));
+    (u128::from(seq) * 1_000_000_000u128 / u128::from(rate)) as u64
+}
+
+/// 单条 DAP_Transfer 命令的请求数硬上限
+///
+/// 两个来源的限制取小：
+/// - `total_requests` 字段是 u8（≤255）
+/// - 超过设备 `packet_size` 的命令会被 DAPLink 固件**静默截断**
+///   （`DAP_queue_execute_buf` 里 `if (len > DAP_PACKET_SIZE) len = ...`）
+///
+/// 实际每包请求数由 [`max_requests_per_cmd`] 按设备上报的 packet_size
+/// 计算，本常量只是保守的绝对上限。
 const MAX_TRANSFER_REQUESTS: usize = 64;
+
+/// 每个 32 位字读取占用的请求数（写 TAR + 读 DRW）
+const REQUESTS_PER_WORD: usize = 2;
+/// 每个请求的字节数（1 字节 request + 4 字节数据）
+const BYTES_PER_REQUEST: usize = 5;
+/// DAP_Transfer 响应头字节数（命令回显 + count + status）
+const RESPONSE_HEADER_BYTES: usize = 3;
 
 /// 每周期为交互式写入预留的请求数
 ///
-/// 读取块若占满 MAX_TRANSFER_REQUESTS，写入预算 max_writes = 0，用户的
-/// 交互写入（Watch 面板）将永远排队得不到执行——静默故障。预留 4 条
-/// 恰好容纳一条最宽的 64 位写入（写 TAR + 写 DRW × 2 字）。
-const WRITE_BUDGET_REQUESTS: usize = 4;
+/// 读取块若占满单包预算，写入预算 max_writes = 0，用户的交互写入
+/// （Watch 面板）将永远排队得不到执行——静默故障。
+///
+/// 必须按**最宽的写入**预留：非 4 字节对齐的 64 位变量跨 3 个对齐字，
+/// 读-改-写需要 3 组 `[写 TAR, 写 DRW]` = 6 条请求。按 4 条预留时
+/// 64 字节包下的首包会超出包大小被固件静默截断。
+const WRITE_BUDGET_REQUESTS: usize = 6;
 
-/// 在途命令数上限（背压控制）
+/// 在途命令数上限（背压控制，绝对上限）
 ///
-/// 提交线程最多领先接收线程 MAX_IN_FLIGHT 条命令。当 DAP-Link 吞吐不足
-/// （SWD 时钟低、变量多、USB 全速带宽受限）时，提交线程自动跳过采样
-/// 周期，实际采样率平滑匹配设备吞吐，避免：
-/// - USB IN 端点无限堆积（停止时要排空数千条残留响应）
-/// - 响应延迟膨胀（Watch 面板显示的值越来越滞后）
-///
-/// 吞吐充足时该值不会成为瓶颈（在途数远小于上限）。
+/// 实际上限还要受设备 `packet_count`（固件响应缓冲数）约束：超出时
+/// 固件队列满会**丢弃**命令（`DAP_queue_execute_buf` 返回 FALSE），
+/// 该命令永远不会有响应，切帧与在途计数会永久失步。见 [`in_flight_limit`]。
 const MAX_IN_FLIGHT: usize = 4;
 
 /// 常驻挂起的 IN transfer 数
@@ -46,14 +67,55 @@ const MAX_IN_FLIGHT: usize = 4;
 /// "一条正在填充、一条已就绪"的背靠背场景。
 const IN_POOL_SIZE: usize = 4;
 
+/// 单条命令可携带的最大请求数（受设备包大小约束）
+fn max_requests_per_cmd(packet_size: u16) -> usize {
+    let by_bytes = (packet_size as usize)
+        .saturating_sub(RESPONSE_HEADER_BYTES)
+        / BYTES_PER_REQUEST;
+    by_bytes.min(MAX_TRANSFER_REQUESTS)
+}
+
+/// 单条命令可携带的最大读字数（同时受命令长度与响应长度约束）
+fn max_words_per_cmd(packet_size: u16) -> usize {
+    let by_request = max_requests_per_cmd(packet_size) / REQUESTS_PER_WORD;
+    let by_response = (packet_size as usize).saturating_sub(RESPONSE_HEADER_BYTES) / 4;
+    by_request.min(by_response)
+}
+
+/// 首包为交互式写入预留空间后能携带的读字数
+///
+/// 写入块并入首包，若首包仍按满额读字数构造，命令长度会超过
+/// packet_size 被固件截断。首包必须少放 `WRITE_BUDGET_REQUESTS` 条请求
+/// 对应空间的读字。无写入时首包会略小于满额（多出少量分包），可接受。
+fn first_chunk_words(packet_size: u16) -> usize {
+    let bytes_for_reads = (packet_size as usize)
+        .saturating_sub(RESPONSE_HEADER_BYTES)
+        .saturating_sub(WRITE_BUDGET_REQUESTS * BYTES_PER_REQUEST);
+    let by_request = (bytes_for_reads / BYTES_PER_REQUEST) / REQUESTS_PER_WORD;
+    let by_response = (packet_size as usize).saturating_sub(RESPONSE_HEADER_BYTES) / 4;
+    // 同样受 u8 请求数硬上限约束（否则大包下会算出比满额还多的字）
+    by_request.min(by_response).min(max_words_per_cmd(packet_size))
+}
+
+/// 在途命令上限 = min(绝对上限, 设备响应缓冲数)
+///
+/// `packet_count` 是固件队列深度：同时排队的命令超过它时，后者会被
+/// 固件丢弃且不产生响应，切帧将永久错位。宁可串行化也不能超发。
+fn in_flight_limit(packet_count: u8) -> usize {
+    MAX_IN_FLIGHT.min(packet_count.max(1) as usize)
+}
+
 /// 计算一条 DAP_Transfer 命令的读取块请求数
 ///
 /// 读取块按变量展开为 `words` 组 `[写 TAR, 读 DRW]`。每个字之前都重写
-/// TAR，而不是依赖 AP 的 CSW AddrInc 位自增——AHB-AP 的 CSW 复位值由
-/// 目标/探针固件决定，代码从未配置过它；若 AddrInc 未使能，第二次 DRW
-/// 访问会重复命中同一地址（64 位变量的高字恒等于低字）。
+/// TAR，而不是依赖 AP 的 CSW AddrInc 位自增（CSW 已在 init 中显式配置
+/// 为 32 位访问，但自增位仍不依赖，避免不同 AP 实现的差异）。
+#[cfg(test)]
 fn read_block_requests(accesses: &[MemAccess]) -> usize {
-    accesses.iter().map(|a| 2 * a.words as usize).sum()
+    accesses
+        .iter()
+        .map(|a| REQUESTS_PER_WORD * a.words as usize)
+        .sum()
 }
 
 /// 校验采样配置能否安全编码进流水线（启动前调用，返回明确错误）
@@ -61,13 +123,16 @@ fn read_block_requests(accesses: &[MemAccess]) -> usize {
 /// 两条硬约束，违反任一都会产生静默故障而非显式报错：
 /// - 变量数 > [`MAX_VALUES`]：`Sample.values` 是定长数组，`Sample::new`
 ///   会静默截断超出的值——波形上通道永远是一条平线却看不出原因
-/// - 读块请求数超过预算：DAP_Transfer 的计数字段是 u8，且命令总长受
-///   USB 端点包大小限制（MAX_TRANSFER_REQUESTS 已是保守值）；同时为
-///   交互式写入预留 WRITE_BUDGET_REQUESTS 条，否则写入永久饿死
+/// - 单个变量需要的字数 > 单包可携带字数：无法把该变量拆到两条命令
+///   （拆开就不是同一时刻的采样了），只能显式报错要求降低通道数或
+///   换支持更大包的探针
 ///
-/// 旧实现只有线程内的 debug_assert!（release 下编译剔除），超限时
-/// 命令直接损坏且无任何提示。
-fn validate_config(accesses: &[MemAccess]) -> Result<()> {
+/// 旧实现按固定 64 请求预算校验，从未读取设备实际上报的 packet_size；
+/// 全速 DAPLink 固件只有 64 字节包，超长命令被静默截断后读到垃圾数据。
+fn validate_config(accesses: &[MemAccess], packet_size: u16) -> Result<()> {
+    if accesses.is_empty() {
+        return Err(Error::Other("no sampling variables configured".into()));
+    }
     if accesses.len() > MAX_VALUES {
         return Err(Error::Other(format!(
             "Too many sampling variables: {} requested, max {} (sample slots would be silently truncated)",
@@ -75,12 +140,22 @@ fn validate_config(accesses: &[MemAccess]) -> Result<()> {
             MAX_VALUES
         )));
     }
-    let requests = read_block_requests(accesses);
-    let max_read_requests = MAX_TRANSFER_REQUESTS - WRITE_BUDGET_REQUESTS;
-    if requests > max_read_requests {
+    let max_words = max_words_per_cmd(packet_size);
+    if max_words == 0 {
         return Err(Error::Other(format!(
-            "Sampling variables need {} transfer requests per cycle, exceeding the {}-request budget ({} reserved for interactive writes). Remove some channels or use narrower variable types",
-            requests, max_read_requests, WRITE_BUDGET_REQUESTS
+            "Device packet size {} bytes is too small for sampling (need at least {} bytes per DAP_Transfer)",
+            packet_size,
+            RESPONSE_HEADER_BYTES + REQUESTS_PER_WORD * BYTES_PER_REQUEST
+        )));
+    }
+    if let Some((idx, acc)) = accesses
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.words as usize > max_words)
+    {
+        return Err(Error::Other(format!(
+            "Variable #{} needs {} 32-bit words in one sample, but the device packet size ({} bytes) allows at most {} per DAP_Transfer. Align the variable or use a smaller type",
+            idx, acc.words, packet_size, max_words
         )));
     }
     Ok(())
@@ -90,6 +165,7 @@ fn validate_config(accesses: &[MemAccess]) -> Result<()> {
 ///
 /// 读取块对所有采样周期完全相同，预先构造一次。切帧时按设备实际执行的
 /// 请求前缀模拟 posted-read 的数据产出，因此不能简单用 `count/2` 估算。
+#[cfg(test)]
 fn build_read_layout(accesses: &[MemAccess]) -> Vec<bool> {
     let mut layout = Vec::with_capacity(read_block_requests(accesses));
     for acc in accesses {
@@ -195,6 +271,22 @@ fn push_notice(notices: &Mutex<Vec<PipelineNotice>>, notice: PipelineNotice) {
     }
 }
 
+/// 单条已提交命令的元数据（提交线程入队、接收线程出队）
+///
+/// 一条采样周期在设备包受限时会拆成多条 DAP_Transfer 命令：读取块按
+/// 32 位字切分，各分片的响应必须按 `chunk_index` 归位到同一周期。
+#[derive(Debug, Clone, Copy)]
+struct CmdMeta {
+    /// 本条命令写入块的请求数（0..=4）
+    write_reqs: u8,
+    /// 本分片读取的 32 位字数
+    chunk_words: u16,
+    /// 本分片在周期内的序号（0-based）
+    chunk_index: u16,
+    /// 本周期共拆成几个分片
+    chunk_total: u16,
+}
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -205,13 +297,13 @@ pub struct PipelineEngine {
     dap: DapProtocol,
     /// 各变量的对齐访问信息（子字变量按所在对齐整字访问 + lane 提取）
     accesses: Vec<MemAccess>,
-    /// 读取块的请求类型序列（false = 写 TAR，true = 读 DRW）
+    /// 整个采样周期的读取字数（各变量展开后的 32 位字总数）
+    total_words: usize,
+    /// 目标采样率（Hz）
     ///
-    /// 与协议无关的纯布局描述：提交线程据此构造请求字节，接收线程据此
-    /// 模拟 DAPLink 的 posted-read 数据产出（切帧）。
-    read_layout: Vec<bool>,
-    /// 目标采样间隔（微秒）
-    interval_us: u64,
+    /// 时间戳与提交节奏都用 [`tick_ns`]（先乘后除）从它实时计算，
+    /// 不预存取整后的间隔——取整后的间隔乘 seq 会线性累积漂移。
+    rate_hz: u32,
     /// 停止标志（主线程设为 false 时，子线程退出）
     running: Arc<AtomicBool>,
     /// 写入请求队列（主线程推送，提交线程消费）
@@ -224,13 +316,14 @@ pub struct PipelineEngine {
     /// `0x2222_1111`，若存提取后的 `0x2222`，写回时会把相邻变量的
     /// 低半字覆盖成 0。
     last_words: Arc<Mutex<Vec<Option<[u32; 3]>>>>,
-    /// 每条已发出命令的**实际写请求数**（提交线程入队、接收线程出队）。
+    /// 每条已提交命令的元数据（提交线程入队、接收线程出队）。
     ///
-    /// 只统计真正编码进命令的写入：被跳过的写入（未采样到旧值、未对齐
-    /// 等）不占请求，若仍按队列长度计，切帧会把这些请求误当成读请求。
-    writes_per_cmd: Arc<Mutex<VecDeque<u8>>>,
+    /// 只统计真正编码进命令的写入：被跳过的写入（未采样到旧值、
+    /// 地址未对齐等）不占请求，若仍按队列长度计，切帧会把这些请求
+    /// 误当成读请求。
+    cmd_meta: Arc<Mutex<VecDeque<CmdMeta>>>,
     /// 在途命令计数（提交线程发出命令后 +1，接收线程解析对应响应后 -1）。
-    /// 背压控制：提交线程在途数达到 MAX_IN_FLIGHT 时跳过本轮
+    /// 背压控制：在途数达到上限（且受设备 packet_count 约束）时等待。
     in_flight: Arc<AtomicUsize>,
 }
 
@@ -249,7 +342,7 @@ impl PipelineEngine {
         types: &[ValueType],
         rate_hz: u32,
     ) -> Self {
-        let interval_us = (1_000_000.0 / rate_hz as f64) as u64;
+        let rate_hz = rate_hz.max(1);
         let accesses: Vec<MemAccess> = addresses
             .iter()
             .enumerate()
@@ -258,17 +351,17 @@ impl PipelineEngine {
                 MemAccess::from_addr_size(addr, size)
             })
             .collect();
-        let read_layout = build_read_layout(&accesses);
+        let total_words = accesses.iter().map(|a| a.words as usize).sum();
         Self {
             usb,
             dap,
             accesses,
-            read_layout,
-            interval_us,
+            total_words,
+            rate_hz,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
             last_words: Arc::new(Mutex::new(Vec::new())),
-            writes_per_cmd: Arc::new(Mutex::new(VecDeque::new())),
+            cmd_meta: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -281,13 +374,13 @@ impl PipelineEngine {
             usb: Arc::clone(&self.usb),
             dap: self.dap,
             accesses: self.accesses.clone(),
-            read_layout: self.read_layout.clone(),
-            interval_us: (1_000_000.0 / rate_hz as f64) as u64,
+            total_words: self.total_words,
+            rate_hz: rate_hz.max(1),
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
             last_words: Arc::clone(&self.last_words),
             // 独立计数器：新旧引擎互不干扰（背压信号各自独立）
-            writes_per_cmd: Arc::new(Mutex::new(VecDeque::new())),
+            cmd_meta: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -298,16 +391,16 @@ impl PipelineEngine {
     ///
     /// `capacity`：环形缓冲容量（采样点数）
     pub fn start(&self, capacity: usize) -> Result<PipelineHandle> {
-        // 配置校验（变量数 / 读块请求预算）：超限必须显式报错，
+        // 配置校验（变量数 / 单包字数预算）：超限必须显式报错，
         // 而不是静默截断采样值或损坏 USB 命令
-        validate_config(&self.accesses)?;
+        validate_config(&self.accesses, self.usb.packet_size())?;
 
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
         // 复位在途计数器
         self.in_flight.store(0, Ordering::SeqCst);
-        // 清空写入数队列（上一次运行的残留条目会污染本会话的切帧）
-        if let Ok(mut q) = self.writes_per_cmd.lock() {
+        // 清空命令元数据队列（上一次运行的残留条目会污染本会话的切帧）
+        if let Ok(mut q) = self.cmd_meta.lock() {
             q.clear();
         }
         // 清零旧值缓存：上一次运行的采样值可能已过期（目标重新烧录、
@@ -318,20 +411,31 @@ impl PipelineEngine {
         }
         // 排空 USB IN 端点残留响应（上一次运行的命令响应可能仍留在
         // 端点缓冲中，同一设备被快速 Stop→Start 重连时尤其如此）。
-        // 否则新会话会把旧响应当新数据消费，且写入数队列与响应失去
+        // 否则新会话会把旧响应当新数据消费，且元数据队列与响应失去
         // 对应关系，切帧从此错位。
         self.usb.flush_input();
 
         let ring = Arc::new(RingBuffer::new(capacity));
         let start_time = Instant::now();
 
-        // 异步 USB 会话：OUT 池深度 = 原有在途上限语义（背压由
-        // submit 返回 false 表达），IN 池常驻挂起以平滑响应到达。
+        // 异步 USB 会话：OUT 池深度 = 在途上限（背压由 submit 返回
+        // false 表达），IN 池常驻挂起以平滑响应到达。
+        //
+        // 在途上限必须 ≤ 设备 packet_count：固件响应队列满时会丢弃
+        // 命令（不产生响应），切帧与在途计数将永久失步。
+        let packet_count = self.usb.packet_count();
+        let in_flight_limit = in_flight_limit(packet_count);
         let session = Arc::new(AsyncSession::start(
             &self.usb,
-            MAX_IN_FLIGHT,
+            in_flight_limit,
             IN_POOL_SIZE,
         )?);
+        log::info!(
+            "pipeline session: packet_size={} B, packet_count={}, in-flight limit={}",
+            self.usb.packet_size(),
+            packet_count,
+            in_flight_limit
+        );
 
         // 子线程致命错误槽（USB 写失败、设备拔出等）。此前子线程直接
         // break 退出且无任何上报通道，UI 会永远显示 Running（原缺陷 ⑨）。
@@ -342,13 +446,16 @@ impl PipelineEngine {
         let notices: Arc<Mutex<Vec<PipelineNotice>>> = Arc::new(Mutex::new(Vec::new()));
 
         // 时间戳完全由接收线程的 seq 计算：
-        //   timestamp = seq * interval_us / 1_000_000
+        //   timestamp = seq * 1e9 / rate_hz（先乘后除，无累积漂移）
         // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
         // 保证显示的采样间隔严格一致。无需跨线程队列传递。
+        // （已知局限：背压跳过的周期也占一个 seq，低于目标采样率运行时
+        //  时间轴会系统性超前。此项本次不改。）
 
         let submit = self.spawn_submit_thread(
             Arc::clone(&session),
             start_time,
+            in_flight_limit,
             Arc::clone(&thread_error),
             Arc::clone(&notices),
         )?;
@@ -377,59 +484,93 @@ impl PipelineEngine {
         &self,
         session: Arc<AsyncSession>,
         start_time: Instant,
+        in_flight_limit: usize,
         thread_error: Arc<Mutex<Option<String>>>,
         notices: Arc<Mutex<Vec<PipelineNotice>>>,
     ) -> Result<JoinHandle<()>> {
-        let interval_us = self.interval_us;
+        let rate_hz = self.rate_hz;
         let accesses = self.accesses.clone();
+        let total_words = self.total_words;
         let running = Arc::clone(&self.running);
         let write_queue = Arc::clone(&self.write_queue);
         let last_words = Arc::clone(&self.last_words);
-        let writes_per_cmd = Arc::clone(&self.writes_per_cmd);
+        let cmd_meta = Arc::clone(&self.cmd_meta);
         let in_flight = Arc::clone(&self.in_flight);
 
-        // 预构建读取块请求（每次采样都一样）
+        // 每包可携带的读取字数（受设备上报的 packet_size 约束）
+        let packet_size = self.usb.packet_size();
+        let words_per_cmd = max_words_per_cmd(packet_size);
+        if total_words > words_per_cmd {
+            log::info!(
+                "sampling {} words per cycle requires {} DAP_Transfer packets (device packet_size={} B, {} words/packet)",
+                total_words,
+                total_words.div_ceil(words_per_cmd.max(1)),
+                packet_size,
+                words_per_cmd
+            );
+        }
+
+        // 预构建查询地址与分包布局（每次采样都一样）
         //
         // 每个 32 位字单独发一组 [写 TAR, 读 DRW]：不依赖 AHB-AP 的
-        // CSW.AddrInc 位自增。CSW 的复位值由目标与探针固件决定，本程序
-        // 从未配置过它；若 AddrInc 未使能，连续两次 DRW 访问会命中同一
-        // 地址，64 位变量的高字将恒等于低字（且不会产生任何错误，属于
-        // 静默错误）。多写一次 TAR 的代价远小于数据错误的代价。
-        // 子字变量（u8/u16）写对齐字地址，读回整字后按 lane 提取。
-        // AHB-AP 不支持非对齐访问：对非字对齐地址发起 32 位 DRW 读行为
-        // 不可预测（实际芯片通常回退到对齐字），必须对齐后 lane 提取。
-        let requests: Vec<TransferRequest> = accesses
+        // CSW.AddrInc 位自增（CSW 现在已在 init 中显式配置为 32 位访问，
+        // 但自增仍不依赖，避免不同 AP 实现的差异）。
+        // 子字变量（u8/u16/u32 非对齐）写对齐字地址，读回后按 lane 提取。
+        let word_addrs: Vec<u32> = accesses
             .iter()
             .flat_map(|acc| {
-                (0..acc.words).flat_map(move |i| {
-                    let addr = acc.aligned_addr.wrapping_add(4 * u32::from(i));
-                    [
-                        TransferRequest::write_ap(AP_REG_TAR, addr),
-                        TransferRequest::read_ap(AP_REG_DRW),
-                    ]
-                })
+                (0..u32::from(acc.words)).map(move |i| acc.aligned_addr.wrapping_add(4 * i))
             })
             .collect();
 
         let dap_index = self.dap.dap_index;
 
-        // 预构建读取请求字节（固定部分，每次采样都一样）
-        // 头部第 3 字节（total_requests）在循环内按写入数量重建。
-        let mut read_part: Vec<u8> = Vec::with_capacity(requests.len() * 5 + 3);
-        read_part.push(DAP_TRANSFER);
-        read_part.push(dap_index);
-        read_part.push(requests.len() as u8);
-        for req in &requests {
-            read_part.push(req.request_byte());
-            if !req.rnw {
-                let data = req.write_data.unwrap_or(0);
-                read_part.extend_from_slice(&data.to_le_bytes());
+        // 分包：准备两套布局
+        //
+        // - 无写入（绝大多数周期）：首包按满额读字数，吞吐最高
+        // - 有写入：首包为写入块预留 WRITE_BUDGET_REQUESTS 条请求，
+        //   否则命令长度超过 packet_size 会被固件静默截断
+        //
+        // 接收线程从命令元数据里读 chunk_words/chunk_total，两套布局
+        // 可以混用，无需额外同步。
+        let build_parts = |first_words: usize| -> (Vec<Vec<u8>>, Vec<u16>) {
+            let first_words = first_words.max(1).min(word_addrs.len());
+            let (first_slice, rest) = word_addrs.split_at(first_words);
+            let mut chunks: Vec<&[u32]> = vec![first_slice];
+            if !rest.is_empty() {
+                chunks.extend(rest.chunks(words_per_cmd.max(1)));
             }
-        }
+            let parts: Vec<Vec<u8>> = chunks
+                .iter()
+                .map(|chunk| {
+                    let mut part: Vec<u8> =
+                        Vec::with_capacity(chunk.len() * 2 * BYTES_PER_REQUEST + 3);
+                    part.push(DAP_TRANSFER);
+                    part.push(dap_index);
+                    part.push(0u8); // 请求数，提交前回填
+                    for &addr in chunk.iter() {
+                        part.push(TransferRequest::write_ap(AP_REG_TAR, addr).request_byte());
+                        part.extend_from_slice(&addr.to_le_bytes());
+                        part.push(TransferRequest::read_ap(AP_REG_DRW).request_byte());
+                    }
+                    part
+                })
+                .collect();
+            let words: Vec<u16> = chunks.iter().map(|c| c.len() as u16).collect();
+            (parts, words)
+        };
+
+        // 无写入：首包满额
+        let (read_parts_full, chunk_words_full) = build_parts(words_per_cmd);
+        // 有写入：首包预留写预算
+        let (read_parts_with_write, chunk_words_with_write) =
+            build_parts(first_chunk_words(packet_size));
+        // 首包能否容纳写入：预留后仍有读字空间才允许取写入
+        let writes_enabled = first_chunk_words(packet_size) > 0;
 
         // 循环外复用缓冲区，避免每采样周期堆分配
         let mut pending_writes: Vec<(usize, u64)> = Vec::with_capacity(24);
-        let mut cmd: Vec<u8> = Vec::with_capacity(read_part.len() + 24 * 10);
+        let mut cmd: Vec<u8> = Vec::with_capacity(packet_size as usize + 64);
 
         let handle = thread::Builder::new()
             .name("dap-submit".into())
@@ -451,9 +592,9 @@ impl PipelineEngine {
                     // 跳过本轮：实际采样率自动匹配 DAP-Link 吞吐，避免
                     // USB IN 端点无限堆积与响应延迟膨胀（Watch 值滞后）。
                     // 吞吐充足时在途数远小于上限，不影响目标采样率。
-                    if in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
+                    if in_flight.load(Ordering::Relaxed) >= in_flight_limit {
                         seq += 1;
-                        let target = start + Duration::from_micros(interval_us * seq);
+                        let target = start + Duration::from_nanos(tick_ns(seq, rate_hz));
                         let now = Instant::now();
                         if now < target {
                             spin_sleep::sleep(target - now);
@@ -461,53 +602,37 @@ impl PipelineEngine {
                         continue;
                     }
 
-                    // --- 构造 DAP_Transfer 命令 ---
-                    // 检查是否有待写入的请求，有则附加到命令前部。
-                    // 限制每轮消耗的写入数，确保 total_requests 不超过
-                    // MAX_TRANSFER_REQUESTS（避免 u8 截断 + USB 包超限）。
-                    // 每次写入最多占 4 条请求（64 位：TAR+DRW 各两次）
-                    let max_writes = MAX_TRANSFER_REQUESTS
-                        .saturating_sub(requests.len())
-                        / 4;
+                    // --- 取出待写入请求 ---
+                    // 一次最多取 1 条：最宽的写入（非对齐 64 位）占
+                    // WRITE_BUDGET_REQUESTS 条请求，正好等于首包预留量。
+                    let max_writes = if writes_enabled { 1 } else { 0 };
                     pending_writes.clear();
-                    if let Ok(mut wq) = write_queue.lock() {
-                        while pending_writes.len() < max_writes {
-                            if let Some((var_idx, value)) = wq.pop_front() {
-                                pending_writes.push((var_idx, value));
-                            } else {
-                                break;
+                    if max_writes > 0 {
+                        if let Ok(mut wq) = write_queue.lock() {
+                            while pending_writes.len() < max_writes {
+                                if let Some((var_idx, value)) = wq.pop_front() {
+                                    pending_writes.push((var_idx, value));
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
 
-                    // 构建 request 列表：[写入请求...] + [读取请求...]
-                    // 写入: write TAR + write DRW (2 requests, 无返回数据)
-                    // 读取: write TAR + read DRW (2 requests, 1 返回数据)
-                    // 子字变量：用最近采样到的整字做读-改-写，只写变量的
-                    // 字节 lane，不踩相邻变量。被跳过的写入不计入头部总数
-                    // （固件按头部计数逐条解析请求字节，计数必须与字节一致）。
-                    cmd.clear();
-                    cmd.push(DAP_TRANSFER);
-                    cmd.push(dap_index);
-                    let count_pos = cmd.len();
-                    cmd.push(0u8); // 头部第 3 字节：实际请求数，末尾回填
-
-                    // 子字写入的旧值快照：只在有待写入时才取，且取完立刻放锁。
-                    // 此前这里是长命的 MutexGuard——一直活到循环体末尾（横跨
-                    // write_nonblock + spin_sleep 整个采样间隔）。采集线程每
-                    // 解析一条响应都要抢同一把锁保存原始对齐字，锁几乎全程
-                    // 被提交线程持有，采集线程只能靠调度器偶尔抢占拿到，解析
-                    // 吞吐掉到目标采样率的 70-80%，USB IN 端点随后堵塞、设备
-                    // 无法及时发布响应，实际采样率随之下降（v1.3.0 无此锁，
-                    // 无此问题）。快照只有 ≤16×12 字节，仅写入时克隆一次。
+                    // 子字/非对齐写入的旧值快照：只在有待写入时才取，
+                    // 且取完立刻放锁（长命 guard 会让接收线程抢不到锁）。
                     let words_snapshot = if pending_writes.is_empty() {
                         None
                     } else {
                         last_words.lock().ok().map(|g| g.clone())
                     };
-                    let mut n_requests = 0usize;
-                    // 实际编码进命令的写请求数（TAR/DRW 各算一条）。
-                    // 切帧必须用这个值：被跳过的写入不占请求。
+
+                    // --- 构造写入块字节（并入首个读取分片）---
+                    // 写入: write TAR + write DRW（2 条请求，无返回数据）
+                    // 子字/非对齐变量：用最近采样到的对齐窗口做读-改-写，
+                    // 只覆盖变量的字节 lane，不踩相邻变量。
+                    // 被跳过的写入不计入请求数（固件按头部计数逐条解析）。
+                    let mut write_bytes: Vec<u8> = Vec::with_capacity(64);
                     let mut write_reqs = 0usize;
                     for &(var_idx, value) in &pending_writes {
                         let Some(acc) = accesses.get(var_idx) else {
@@ -522,58 +647,30 @@ impl PipelineEngine {
                             continue;
                         };
 
-                        if acc.words > 1 {
-                            // 64 位变量：AHB-AP 无 64 位访问，拆成低/高两个
-                            // 32 位字写。只有 4 字节对齐（变量独占完整的
-                            // 两个整字）才能安全写入；非 4 字节对齐时首尾字
-                            // 与相邻变量共享，需要跨字读-改-写，直接拒绝。
-                            if acc.aligned_addr & 3 != 0 {
-                                log::warn!(
-                                    "write request skipped: 8-byte data of variable {} is not 4-byte aligned (0x{:08X})",
-                                    var_idx, acc.aligned_addr
-                                );
-                                push_notice(
-                                    &notices,
-                                    PipelineNotice::WriteSkipped {
-                                        var_idx,
-                                        reason: format!(
-                                            "8-byte data is not 4-byte aligned (0x{:08X})",
-                                            acc.aligned_addr
-                                        ),
-                                    },
-                                );
-                                continue;
-                            }
+                        // 4 字节对齐的整字窗口：直接按字写（32 位整字或 64 位
+                        // 的低/高两字）。注意必须按 byte_size 判断而不是
+                        // words——非对齐 u32 也占 2 字，按 words 判断会把
+                        // 它误当 u64 拆分写入，破坏相邻内存。
+                        if acc.shift == 0 && acc.byte_size == 4 {
+                            append_write_word(&mut write_bytes, acc.aligned_addr, value as u32);
+                            write_reqs += 2;
+                            continue;
+                        }
+                        if acc.byte_size == 8 && acc.words == 2 {
+                            // 4 字节对齐的 64 位变量：拆成低/高两个 32 位字
                             let (low, high) = MemAccess::split_wide(value);
-                            // 每个字写前都重写 TAR：与读取路径同理，不依赖
-                            // CSW.AddrInc 自增
-                            for (i, word) in [low, high].into_iter().enumerate() {
-                                let addr = acc.aligned_addr.wrapping_add(4 * i as u32);
-                                cmd.push(TransferRequest::write_ap(AP_REG_TAR, addr).request_byte());
-                                cmd.extend_from_slice(&addr.to_le_bytes());
-                                cmd.push(TransferRequest::write_ap(AP_REG_DRW, word).request_byte());
-                                cmd.extend_from_slice(&word.to_le_bytes());
-                            }
-                            n_requests += 4;
+                            append_write_word(&mut write_bytes, acc.aligned_addr, low);
+                            append_write_word(
+                                &mut write_bytes,
+                                acc.aligned_addr.wrapping_add(4),
+                                high,
+                            );
                             write_reqs += 4;
                             continue;
                         }
 
-                        if acc.mask == u32::MAX {
-                            // 32 位整字：直接写，无需旧值
-                            let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
-                            let w_drw = TransferRequest::write_ap(AP_REG_DRW, value as u32);
-                            cmd.push(w_tar.request_byte());
-                            cmd.extend_from_slice(&acc.aligned_addr.to_le_bytes());
-                            cmd.push(w_drw.request_byte());
-                            cmd.extend_from_slice(&(value as u32).to_le_bytes());
-                            n_requests += 2;
-                            write_reqs += 2;
-                            continue;
-                        }
-
-                        // 子字变量（u8/u16）：用最近一次采样的**原始整字**
-                        // 合并，只覆盖本变量 lane，不踩相邻变量
+                        // 其余情况（子字 / 非对齐 4 字节 / 非对齐 8 字节）：
+                        // 读回对齐窗口后按字节拼接，逐字写回
                         let last = words_snapshot
                             .as_ref()
                             .and_then(|w| w.get(var_idx))
@@ -593,79 +690,164 @@ impl PipelineEngine {
                             );
                             continue;
                         };
-                        let write_data = acc.merge(old[0], value as u32);
-                        let w_tar = TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr);
-                        let w_drw = TransferRequest::write_ap(AP_REG_DRW, write_data);
-                        cmd.push(w_tar.request_byte());
-                        cmd.extend_from_slice(&acc.aligned_addr.to_le_bytes());
-                        cmd.push(w_drw.request_byte());
-                        cmd.extend_from_slice(&write_data.to_le_bytes());
-                        n_requests += 2;
-                        write_reqs += 2;
-                    }
-
-                    // 再读取请求（复用预构建字节，跳过头部）
-                    cmd.extend_from_slice(&read_part[3..]);
-                    n_requests += requests.len();
-                    debug_assert!(n_requests <= MAX_TRANSFER_REQUESTS);
-                    // 回填实际请求数
-                    cmd[count_pos] = n_requests as u8;
-
-                    // --- 提交命令（异步入队，≈2µs）---
-                    if !pending_writes.is_empty() {
-                        log::info!(
-                            "submit thread injecting {} write requests (seq={})",
-                            pending_writes.len(), seq
-                        );
-                    }
-                    match session.submit(&cmd) {
-                        Ok(true) => {} // 已挂入 OUT 槽位
-                        Ok(false) => {
-                            // 在途已满：设备吞吐跟不上。跳过本轮（与旧实现的
-                            // MAX_IN_FLIGHT 背压语义一致），未消费的写入重新入队。
-                            if !pending_writes.is_empty() {
-                                if let Ok(mut wq) = write_queue.lock() {
-                                    for (idx, v) in pending_writes.iter().rev() {
-                                        wq.push_front((*idx, *v));
-                                    }
-                                }
-                            }
-                            seq += 1;
-                            let target = start + Duration::from_micros(interval_us * seq);
-                            let now = Instant::now();
-                            if now < target {
-                                spin_sleep::sleep(target - now);
-                            }
-                            continue;
+                        let mut window = old;
+                        acc.splice_into(&mut window, value);
+                        for (i, &w) in window.iter().take(acc.words as usize).enumerate() {
+                            append_write_word(
+                                &mut write_bytes,
+                                acc.aligned_addr.wrapping_add(4 * i as u32),
+                                w,
+                            );
+                            write_reqs += 2;
                         }
-                        Err(e) => {
+                    }
+
+                    // --- 逐分片提交 ---
+                    // 写入块并入首包；后续分片只读。
+                    //
+                    // 布局按本周期是否有实际写入选择：有写入时用预留布局
+                    // （首包读字更少），否则用满额布局（吞吐最高）。
+                    //
+                    // 分片之间必须等在途腾出：设备 packet_count 可能只有 1
+                    // （如 lpc11u35 全速板），此时若直接检查上限就放弃，
+                    // 后续分片永远发不出去，该配置将采不到任何样本。
+                    // 这里阻塞等待接收线程消费响应，用超时兜底避免设备
+                    // 无响应时永久卡死（致命错误由接收线程上报）。
+                    let (read_parts, chunk_words) = if write_reqs > 0 {
+                        (&read_parts_with_write, &chunk_words_with_write)
+                    } else {
+                        (&read_parts_full, &chunk_words_full)
+                    };
+                    let chunk_total = read_parts.len().max(1);
+                    let mut submitted = 0usize;
+                    let mut aborted = false;
+                    for (chunk_index, part) in read_parts.iter().enumerate() {
+                        let wait_deadline = Instant::now() + Duration::from_secs(2);
+                        while in_flight.load(Ordering::Relaxed) >= in_flight_limit {
                             if !running.load(Ordering::Relaxed) {
-                                log::info!("submit thread received stop signal, exiting");
+                                aborted = true;
                                 break;
                             }
-                            let msg = format!("USB submit failed: {}", e);
-                            log::error!("submit thread {} (seq={}), exiting", msg, seq);
-                            if let Ok(mut slot) = thread_error.lock() {
-                                slot.get_or_insert(msg);
+                            if Instant::now() >= wait_deadline {
+                                log::warn!(
+                                    "submit thread waited 2s for in-flight slot (seq={}, chunk {}/{}), cycle abandoned",
+                                    seq, chunk_index, chunk_total
+                                );
+                                aborted = true;
+                                break;
                             }
+                            thread::sleep(Duration::from_micros(50));
+                        }
+                        if aborted {
                             break;
                         }
+
+                        cmd.clear();
+                        cmd.push(DAP_TRANSFER);
+                        cmd.push(dap_index);
+                        let count_pos = cmd.len();
+                        cmd.push(0u8);
+
+                        let (wreqs_this, chunk_reqs) = if chunk_index == 0 {
+                            cmd.extend_from_slice(&write_bytes);
+                            (
+                                write_reqs,
+                                write_reqs + 2 * chunk_words[chunk_index] as usize,
+                            )
+                        } else {
+                            (0, 2 * chunk_words[chunk_index] as usize)
+                        };
+                        // 读取请求（跳过 3 字节头，头部计数在下面回填）
+                        cmd.extend_from_slice(&part[3..]);
+                        cmd[count_pos] = chunk_reqs as u8;
+
+                        if chunk_index == 0 && !pending_writes.is_empty() {
+                            log::info!(
+                                "submit thread injecting {} write requests (seq={})",
+                                pending_writes.len(), seq
+                            );
+                        }
+
+                        // 包大小硬校验：超长命令会被固件静默截断，
+                        // 宁可本轮作废也不能发出（会污染后续切帧）
+                        if cmd.len() > packet_size as usize {
+                            log::error!(
+                                "submit thread built a {}-byte command exceeding packet size {} (seq={}, chunk {}/{}), cycle abandoned",
+                                cmd.len(), packet_size, seq, chunk_index, chunk_total
+                            );
+                            push_notice(
+                                &notices,
+                                PipelineNotice::DataDropped {
+                                    message: format!(
+                                        "Internal error: command of {} bytes exceeds device packet size {}",
+                                        cmd.len(), packet_size
+                                    ),
+                                },
+                            );
+                            aborted = true;
+                            break;
+                        }
+
+                        match session.submit(&cmd) {
+                            Ok(true) => {
+                                if let Ok(mut q) = cmd_meta.lock() {
+                                    q.push_back(CmdMeta {
+                                        write_reqs: wreqs_this as u8,
+                                        chunk_words: chunk_words[chunk_index],
+                                        chunk_index: chunk_index as u16,
+                                        chunk_total: chunk_total as u16,
+                                    });
+                                }
+                                in_flight.fetch_add(1, Ordering::SeqCst);
+                                submitted += 1;
+                            }
+                            Ok(false) => {
+                                // OUT 槽位用尽：设备吞吐跟不上，本轮剩余分片
+                                // 放弃（整个周期不完整，接收端会丢弃不完整
+                                // 周期的分片数据）。
+                                aborted = true;
+                                break;
+                            }
+                            Err(e) => {
+                                if !running.load(Ordering::Relaxed) {
+                                    log::info!("submit thread received stop signal, exiting");
+                                    break;
+                                }
+                                let msg = format!("USB submit failed: {}", e);
+                                log::error!("submit thread {} (seq={}), exiting", msg, seq);
+                                if let Ok(mut slot) = thread_error.lock() {
+                                    slot.get_or_insert(msg);
+                                }
+                                break;
+                            }
+                        }
                     }
-                    // 命令已发出：记录本条命令**实际**的写请求数（接收线程
-                    // 按它计算响应长度），在途 +1。必须用 write_reqs 而不是
-                    // pending_writes.len()——被跳过的写入（未采样到旧值、
-                    // 地址未对齐）没有编码进命令，若按队列长度计，切帧会把
-                    // 这些不存在的请求当成读请求处理。
-                    if let Ok(mut q) = writes_per_cmd.lock() {
-                        q.push_back(write_reqs as u8);
+
+                    // 未提交的写入重新入队（下次周期重试）
+                    if aborted && !pending_writes.is_empty() {
+                        if let Ok(mut wq) = write_queue.lock() {
+                            for (idx, v) in pending_writes.iter().rev() {
+                                wq.push_front((*idx, *v));
+                            }
+                        }
                     }
-                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    // 周期未完整提交：不推进 seq（该周期不会产出样本），
+                    // 但仍按节奏等待到下一个采样时刻，避免忙转
+                    if submitted < chunk_total {
+                        seq += 1;
+                        let target = start + Duration::from_nanos(tick_ns(seq, rate_hz));
+                        let now = Instant::now();
+                        if now < target {
+                            spin_sleep::sleep(target - now);
+                        }
+                        continue;
+                    }
 
                     seq += 1;
 
                     // --- 精确等间隔控制 ---
-                    // 下一个目标时刻 = start + interval_us * seq
-                    let target = start + Duration::from_micros(interval_us * seq);
+                    // 下一个目标时刻 = start + tick_ns(seq)
+                    let target = start + Duration::from_nanos(tick_ns(seq, rate_hz));
                     let now = Instant::now();
                     if now < target {
                         // spin_sleep 提供微秒级精度的混合睡眠
@@ -673,7 +855,7 @@ impl PipelineEngine {
                     }
                 }
 
-                log::info!("submit thread exited, {} requests submitted in total", seq);
+                log::info!("submit thread exited, {} sample periods submitted in total", seq);
             })
             .map_err(|e| Error::PipelineThread(e.to_string()))?;
 
@@ -691,10 +873,10 @@ impl PipelineEngine {
         let running = Arc::clone(&self.running);
         let accesses = self.accesses.clone();
         let num_vars = accesses.len();
-        let read_layout = self.read_layout.clone();
-        let interval_us = self.interval_us;
+        let total_words = self.total_words;
+        let rate_hz = self.rate_hz;
         let last_words = Arc::clone(&self.last_words);
-        let writes_per_cmd = Arc::clone(&self.writes_per_cmd);
+        let cmd_meta = Arc::clone(&self.cmd_meta);
         let in_flight = Arc::clone(&self.in_flight);
 
         let handle = thread::Builder::new()
@@ -709,6 +891,17 @@ impl PipelineEngine {
                 // 致命错误日志限频：拔线后每次读都会立即失败，不限频会
                 // 每秒打出数十万条 warn 刷爆日志文件（原缺陷 ⑩）
                 let mut last_err_log: Option<Instant> = None;
+
+                // 周期累积器：一条采样周期在设备包受限时会拆成多条
+                // DAP_Transfer 命令，各分片的读字按 word 偏移填回这里，
+                // 全部分片到齐后才产出一个 Sample（否则波形会缺通道、
+                // 或把半周期数据当成完整样本）。
+                let mut cycle_words: Vec<u32> = vec![0; total_words];
+                let mut cycle_next_chunk: u16 = 0;
+                let mut cycle_chunk_total: u16 = 0;
+                let mut cycle_written_words: usize = 0;
+                // 周期中途出现非 OK 状态 / 分片丢失 → 整个周期作废
+                let mut cycle_broken = false;
 
                 while running.load(Ordering::Relaxed) {
                     // 等待下一条完整响应（异步 IN 池在事件泵线程里收）
@@ -770,19 +963,21 @@ impl PipelineEngine {
                                 },
                             );
                             offset = data.len();
-                            if let Ok(mut q) = writes_per_cmd.lock() {
+                            if let Ok(mut q) = cmd_meta.lock() {
                                 q.clear();
                             }
                             in_flight.store(0, Ordering::SeqCst);
+                            // 字节流已失步，周期累积器也作废
+                            cycle_broken = true;
                             break;
                         }
                         let count = data[offset + 1] as usize;
                         let status = data[offset + 2];
-                        // 本条命令的写请求数：提交线程每发一条命令入队一条。
+                        // 本条命令的元数据：提交线程每发一条命令入队一条。
                         // 只 peek——响应可能跨多次 USB 读，完整消费后才出队。
-                        let write_reqs = write_counts_front(&writes_per_cmd);
-                        let Some(write_reqs) = write_reqs else {
-                            log::error!("collect thread write-count queue empty, dropping {} bytes to resync", data.len() - offset);
+                        let meta = cmd_meta_front(&cmd_meta);
+                        let Some(meta) = meta else {
+                            log::error!("collect thread command metadata queue empty, dropping {} bytes to resync", data.len() - offset);
                             push_notice(
                                 &notices,
                                 PipelineNotice::DataDropped {
@@ -793,14 +988,16 @@ impl PipelineEngine {
                                 },
                             );
                             offset = data.len();
-                            if let Ok(mut q) = writes_per_cmd.lock() {
+                            if let Ok(mut q) = cmd_meta.lock() {
                                 q.clear();
                             }
                             in_flight.store(0, Ordering::SeqCst);
+                            cycle_broken = true;
                             break;
                         };
-                        // 请求总数上限 = 写请求 + 读取块请求数
-                        let total_requests = write_reqs + read_layout.len();
+                        // 本分片的读取请求序列（布局固定：[写TAR, 读DRW] × 字数）
+                        let read_layout = chunk_layout(meta.chunk_words);
+                        let total_requests = meta.write_reqs as usize + read_layout.len();
                         if count > total_requests {
                             log::error!(
                                 "collect thread protocol desync: count={} exceeds command request count {}, dropping {} bytes to resync",
@@ -816,28 +1013,34 @@ impl PipelineEngine {
                                 },
                             );
                             offset = data.len();
-                            if let Ok(mut q) = writes_per_cmd.lock() {
+                            if let Ok(mut q) = cmd_meta.lock() {
                                 q.clear();
                             }
                             in_flight.store(0, Ordering::SeqCst);
+                            cycle_broken = true;
                             break;
                         }
-                        let need = transfer_frame_len(count, status, write_reqs, &read_layout);
+                        let need = transfer_frame_len(
+                            count,
+                            status,
+                            meta.write_reqs as usize,
+                            &read_layout,
+                        );
                         // 不完整响应 → 留给 carry，下次读取拼接后再解析
                         if data.len() - offset < need {
                             break;
                         }
-                        let chunk = &data[offset..offset + need];
+                        let frame = &data[offset..offset + need];
                         offset += need;
 
-                        // 完整消费一条响应：写入数出队 + 在途递减
-                        if let Ok(mut q) = writes_per_cmd.lock() {
+                        // 完整消费一条响应：元数据出队 + 在途递减
+                        if let Ok(mut q) = cmd_meta.lock() {
                             q.pop_front();
                         }
                         in_flight_dec(&in_flight);
 
                         // 解析单个响应
-                        let resp = match DapProtocol::parse_transfer_response(chunk) {
+                        let resp = match DapProtocol::parse_transfer_response(frame) {
                             Ok(r) => r,
                             Err(e) => {
                                 log::error!("collect thread parse failed (seq={}): {}", seq, e);
@@ -850,67 +1053,112 @@ impl PipelineEngine {
                                         ),
                                     },
                                 );
-                                seq += 1;
+                                cycle_broken = true;
                                 continue;
                             }
                         };
 
+                        // 分片序号必须严格递增：缺分片意味着该周期的字不完整
+                        if meta.chunk_index != cycle_next_chunk {
+                            log::error!(
+                                "collect thread chunk order mismatch (seq={}): expected {}, got {}",
+                                seq, cycle_next_chunk, meta.chunk_index
+                            );
+                            push_notice(
+                                &notices,
+                                PipelineNotice::DataDropped {
+                                    message: format!(
+                                        "Sampling cycle fell out of sync at chunk {} (expected {}), cycle dropped",
+                                        meta.chunk_index, cycle_next_chunk
+                                    ),
+                                },
+                            );
+                            cycle_broken = true;
+                        }
+                        if meta.chunk_index == 0 {
+                            // 新周期起点：清空累积器（可能覆盖上一周期
+                            // 未完整到达的残留分片）
+                            cycle_chunk_total = meta.chunk_total;
+                            cycle_written_words = 0;
+                            cycle_broken = false;
+                        }
+
                         if resp.status != TRANSFER_OK {
                             log::warn!(
-                                "collect thread got non-OK status (seq={}): status={}, count={}",
-                                seq, resp.status, resp.count
+                                "collect thread got non-OK status (seq={}, chunk {}/{}): status={}, count={}",
+                                seq, meta.chunk_index, meta.chunk_total, resp.status, resp.count
                             );
-                            seq += 1;
-                            continue;
-                        }
-
-                        // 时间戳完全由 seq 计算（理想网格时间戳），
-                        // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
-                        let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
-
-                        // 响应的数据区按“读请求的完成顺序”排列，每个 64 位
-                        // 变量占 2-3 个连续字（32 位及更窄占 1 个）。按
-                        // accesses.words 顺序把读回的 32 位字归组后再拼值。
-                        //
-                        // 注意：FAULT/WAIT 提前中止时，只有已完成的读请求
-                        // 携带数据，尾部变量缺失数据——用 0 填充并保持
-                        // 通道位置对齐（不做位移，否则波形通道会串号）。
-                        let mut vals = [0u64; MAX_VALUES];
-                        {
+                            cycle_broken = true;
+                        } else if !cycle_broken {
+                            // 把本分片的读字按偏移填进周期累积器。FAULT 时
+                            // 响应可能少字，尾部通道保持 0（不做位移，否则
+                            // 波形通道串号）。
                             let words = resp.values();
-                            let mut wi = 0usize;
-                            let mut lw_guard = last_words.lock().ok();
-                            if let Some(lw) = lw_guard.as_mut() {
-                                lw.resize(num_vars, None);
+                            let base = cycle_written_words;
+                            let take = words.len().min(meta.chunk_words as usize);
+                            let end = (base + take).min(cycle_words.len());
+                            if base < end {
+                                cycle_words[base..end].copy_from_slice(&words[..end - base]);
                             }
-                            for (vi, acc) in accesses.iter().enumerate().take(MAX_VALUES) {
-                                let need = acc.words as usize;
-                                if wi + need > words.len() {
-                                    // 数据不完整：本变量及其后的变量都缺失。
-                                    // 必须 break 而不是 continue——continue 不
-                                    // 推进 wi，会让后续窄变量误吃本变量残留的
-                                    // 字（通道串号）。
-                                    break;
-                                }
-                                let buf = &words[wi..wi + need];
-                                wi += need;
-                                vals[vi] = acc.extract_wide(buf);
-                                // 旧值保存**原始对齐字**（不是 lane 提取后
-                                // 的值）：子字变量写回时要做读-改-写合并
-                                // 整字中的其它 lane。
-                                if let Some(lw) = lw_guard.as_mut() {
-                                    let mut raw = [0u32; 3];
-                                    raw[..need].copy_from_slice(buf);
-                                    lw[vi] = Some(raw);
-                                }
-                            }
+                            cycle_written_words = base + take;
                         }
 
-                        let n = accesses.len().min(MAX_VALUES);
-                        let sample = Sample::new(seq, timestamp_sec, &vals[..n]);
+                        cycle_next_chunk = meta.chunk_index.saturating_add(1);
 
-                        ring.push(sample);
-                        seq += 1;
+                        // 周期完整（所有分片都到齐且未损坏）→ 产出样本
+                        if !cycle_broken
+                            && cycle_next_chunk >= cycle_chunk_total
+                            && cycle_chunk_total > 0
+                        {
+                            // 时间戳完全由 seq 计算（理想网格时间戳），
+                            // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
+                            let timestamp_sec = tick_ns(seq, rate_hz) as f64 / 1_000_000_000.0;
+
+                            // 按 accesses.words 顺序把读回的字归组后再拼值
+                            let mut vals = [0u64; MAX_VALUES];
+                            {
+                                let words = &cycle_words[..];
+                                let mut wi = 0usize;
+                                let mut lw_guard = last_words.lock().ok();
+                                if let Some(lw) = lw_guard.as_mut() {
+                                    lw.resize(num_vars, None);
+                                }
+                                for (vi, acc) in accesses.iter().enumerate().take(MAX_VALUES) {
+                                    let need = acc.words as usize;
+                                    if wi + need > words.len() {
+                                        // 数据不完整：本变量及其后的变量都缺失。
+                                        // 必须 break 而不是 continue——continue 不
+                                        // 推进 wi，会让后续窄变量误吃本变量残留的
+                                        // 字（通道串号）。
+                                        break;
+                                    }
+                                    let buf = &words[wi..wi + need];
+                                    wi += need;
+                                    vals[vi] = acc.extract_wide(buf);
+                                    // 旧值保存**原始对齐字**（不是 lane 提取后
+                                    // 的值）：写入时要做读-改-写合并整字中的
+                                    // 其它 lane。
+                                    if let Some(lw) = lw_guard.as_mut() {
+                                        let mut raw = [0u32; 3];
+                                        raw[..need].copy_from_slice(buf);
+                                        lw[vi] = Some(raw);
+                                    }
+                                }
+                            }
+
+                            let n = accesses.len().min(MAX_VALUES);
+                            let sample = Sample::new(seq, timestamp_sec, &vals[..n]);
+
+                            ring.push(sample);
+                            seq += 1;
+                            // 周期结束：重置累积器（下一分片应为 chunk 0）
+                            cycle_next_chunk = 0;
+                            cycle_chunk_total = 0;
+                            cycle_written_words = 0;
+                            cycle_broken = false;
+                        } else {
+                            cycle_next_chunk = meta.chunk_index.saturating_add(1);
+                        }
                     }
 
                     // 保存不完整的尾部到 carry，下次读取时拼接
@@ -931,9 +1179,29 @@ impl PipelineEngine {
     }
 }
 
-/// 读取写入数队首（不消费）；队列为空返回 None
-fn write_counts_front(queue: &Mutex<VecDeque<u8>>) -> Option<usize> {
-    queue.lock().ok().and_then(|q| q.front().copied()).map(|v| v as usize)
+/// 读取命令元数据队首（不消费）；队列为空返回 None
+fn cmd_meta_front(queue: &Mutex<VecDeque<CmdMeta>>) -> Option<CmdMeta> {
+    queue.lock().ok().and_then(|q| q.front().copied())
+}
+
+/// 单个分片的请求类型序列：每个字一组 [写 TAR, 读 DRW]
+fn chunk_layout(words: u16) -> Vec<bool> {
+    let mut layout = Vec::with_capacity(2 * words as usize);
+    for _ in 0..words {
+        layout.push(false);
+        layout.push(true);
+    }
+    layout
+}
+
+/// 追加一组 [写 TAR, 写 DRW] 请求字节
+///
+/// 每个字写前都重写 TAR：不依赖 AHB-AP 的 CSW.AddrInc 自增。
+fn append_write_word(cmd: &mut Vec<u8>, addr: u32, value: u32) {
+    cmd.push(TransferRequest::write_ap(AP_REG_TAR, addr).request_byte());
+    cmd.extend_from_slice(&addr.to_le_bytes());
+    cmd.push(TransferRequest::write_ap(AP_REG_DRW, value).request_byte());
+    cmd.extend_from_slice(&value.to_le_bytes());
 }
 
 /// 流水线控制句柄
@@ -1250,19 +1518,18 @@ mod tests {
 
     #[test]
     fn validate_config_accepts_budget_fitting_configs() {
-        // 16 个 32 位变量 = 32 条请求；15 个 64 位变量 = 60 条请求，
-        // 恰好用满读块预算（64 - 4 条写预留）且留出每周期一条宽写入
+        // 16 个 32 位变量 = 32 条请求，按设备包拆分即可
         let narrow: Vec<MemAccess> = (0..MAX_VALUES as u32)
             .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 4, 4))
             .collect();
         assert_eq!(read_block_requests(&narrow), 32);
-        assert!(validate_config(&narrow).is_ok());
+        assert!(validate_config(&narrow, 64).is_ok(), "64-byte packet must work via chunking");
 
         let wide: Vec<MemAccess> = (0..15u32)
             .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 8, 8))
             .collect();
         assert_eq!(read_block_requests(&wide), 60);
-        assert!(validate_config(&wide).is_ok());
+        assert!(validate_config(&wide, 64).is_ok(), "64-byte packet must work via chunking");
     }
 
     #[test]
@@ -1271,7 +1538,7 @@ mod tests {
         let accesses: Vec<MemAccess> = (0..=(MAX_VALUES as u32))
             .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 4, 4))
             .collect();
-        let err = validate_config(&accesses).unwrap_err().to_string();
+        let err = validate_config(&accesses, 512).unwrap_err().to_string();
         assert!(
             err.contains("Too many sampling variables")
                 && err.contains(&MAX_VALUES.to_string()),
@@ -1280,18 +1547,43 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_rejects_read_block_eating_write_budget() {
-        // 16 个 64 位变量 = 64 条请求：读块吃满 64 条会把每周期写预算
-        // 压到 0，交互式写入永远饿死——必须显式报错（读块上限实为 60 条）
-        let accesses: Vec<MemAccess> = (0..16u32)
-            .map(|i| MemAccess::from_addr_size(0x2000_0000 + i * 8, 8))
-            .collect();
-        assert_eq!(read_block_requests(&accesses), 64);
-        let err = validate_config(&accesses).unwrap_err().to_string();
-        assert!(
-            err.contains("exceeding the") && err.contains("interactive writes"),
-            "错误信息应说明请求预算与写预留，实际 {err:?}"
-        );
+    fn validate_config_rejects_single_variable_larger_than_packet() {
+        // 单变量跨 3 字（非对齐 64 位）需要 6 条请求 + 响应 12 字节；
+        // packet_size 小到放不下时无法拆分（拆开就不是同一时刻采样），
+        // 必须显式报错而不是下发被固件截断的命令
+        let accesses = vec![MemAccess::from_addr_size(0x2000_0002, 8)];
+        assert_eq!(accesses[0].words, 3);
+        let err = validate_config(&accesses, 16).unwrap_err().to_string();
+        assert!(err.contains("needs 3 32-bit words"), "actual: {err:?}");
+    }
+
+    #[test]
+    fn max_words_per_cmd_respects_packet_and_response_size() {
+        // 64 字节包：命令侧 12 条请求上限 → 6 字；响应侧 61 字节 → 15 字。
+        // 取小 = 6 字。
+        assert_eq!(max_words_per_cmd(64), 6);
+        // 512 字节包：命令侧 (512-3)/5 = 101 条请求 → 50 字，封顶
+        // MAX_TRANSFER_REQUESTS=64 条请求 → 32 字；响应侧 (512-3)/4=127。
+        // 取小 = 32 字。
+        assert_eq!(max_words_per_cmd(512), 32);
+    }
+
+    #[test]
+    fn in_flight_limit_never_exceeds_device_buffer_count() {
+        // 固件响应队列满会丢弃命令且不产生响应（切帧永久错位），
+        // 在途上限必须受 packet_count 约束
+        assert_eq!(in_flight_limit(1), 1);
+        assert_eq!(in_flight_limit(2), 2);
+        assert_eq!(in_flight_limit(4), 4);
+        assert_eq!(in_flight_limit(255), MAX_IN_FLIGHT);
+        assert_eq!(in_flight_limit(0), 1, "0 must be clamped, never unlimited");
+    }
+
+    #[test]
+    fn chunk_layout_matches_word_count() {
+        let layout = chunk_layout(3);
+        assert_eq!(layout, vec![false, true, false, true, false, true]);
+        assert!(chunk_layout(0).is_empty());
     }
 
     #[test]
@@ -1443,5 +1735,378 @@ mod tests {
         // join 回收线程资源（join 消费句柄，故放在断言之后）
         let _ = handle.submit_handle.join();
         let _ = handle.collect_handle.join();
+    }
+
+    // ---- 分包：多包响应必须拼回同一周期 ----
+
+    /// 模拟接收线程的周期拼装：喂入分片响应，产出完整周期的字
+    #[derive(Default)]
+    struct CycleAssembler {
+        words: Vec<u32>,
+        next_chunk: u16,
+        total: u16,
+        written: usize,
+        broken: bool,
+    }
+
+    impl CycleAssembler {
+        fn new(total_words: usize) -> Self {
+            Self { words: vec![0; total_words], ..Default::default() }
+        }
+
+        /// 返回 Some(words) = 一个完整周期产出
+        ///
+        /// `status_ok=false` 模拟非 OK 响应（FAULT/WAIT）：该周期作废
+        fn feed(&mut self, meta: CmdMeta, data: &[u32], status_ok: bool) -> Option<Vec<u32>> {
+            if meta.chunk_index != self.next_chunk {
+                self.broken = true;
+            }
+            if meta.chunk_index == 0 {
+                self.total = meta.chunk_total;
+                self.written = 0;
+                self.broken = false;
+            }
+            if !status_ok {
+                self.broken = true;
+            }
+            if !self.broken {
+                let base = self.written;
+                let take = data.len().min(meta.chunk_words as usize);
+                let end = (base + take).min(self.words.len());
+                if base < end {
+                    self.words[base..end].copy_from_slice(&data[..end - base]);
+                }
+                self.written = base + take;
+            }
+            self.next_chunk = meta.chunk_index + 1;
+            if !self.broken && self.next_chunk >= self.total && self.total > 0 {
+                self.next_chunk = 0;
+                self.total = 0;
+                self.written = 0;
+                self.broken = false;
+                return Some(self.words.clone());
+            }
+            None
+        }
+    }
+
+    fn meta(write_reqs: u8, chunk_words: u16, chunk_index: u16, chunk_total: u16) -> CmdMeta {
+        CmdMeta { write_reqs, chunk_words, chunk_index, chunk_total }
+    }
+
+    #[test]
+    fn multi_packet_cycle_assembles_in_order() {
+        // 16 个 float = 16 字，64 字节包每包 6 字 → 3 个分片（6+6+4）
+        let mut asm = CycleAssembler::new(16);
+        assert_eq!(asm.feed(meta(0, 6, 0, 3), &[10, 11, 12, 13, 14, 15], true), None);
+        assert_eq!(asm.feed(meta(0, 6, 1, 3), &[16, 17, 18, 19, 20, 21], true), None);
+        let out = asm.feed(meta(0, 4, 2, 3), &[22, 23, 24, 25], true).expect("last chunk completes cycle");
+        assert_eq!(out, (10..26).collect::<Vec<u32>>(), "chunks must land at their own offsets");
+    }
+
+    #[test]
+    fn multi_packet_cycle_with_write_in_first_chunk() {
+        // 首包带 2 条写请求（一条 32 位写入），读取数据仍从偏移 0 开始
+        let mut asm = CycleAssembler::new(8);
+        assert_eq!(asm.feed(meta(2, 6, 0, 2), &[1, 2, 3, 4, 5, 6], true), None);
+        let out = asm.feed(meta(0, 2, 1, 2), &[7, 8], true).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn missing_chunk_breaks_cycle_without_emitting_partial() {
+        // 中间分片丢失：周期必须作废，不能把半份数据当成完整样本
+        let mut asm = CycleAssembler::new(12);
+        assert_eq!(asm.feed(meta(0, 6, 0, 2), &[1, 2, 3, 4, 5, 6], true), None);
+        // 直接来了第 2 分片（缺第 1）
+        let out = asm.feed(meta(0, 6, 2, 3), &[7, 8, 9, 10, 11, 12], true);
+        assert!(out.is_none(), "broken cycle must not emit");
+        // 下一周期从头开始，必须能正常恢复
+        assert_eq!(asm.feed(meta(0, 6, 0, 2), &[21, 22, 23, 24, 25, 26], true), None);
+        let out = asm.feed(meta(0, 6, 1, 2), &[27, 28, 29, 30, 31, 32], true).unwrap();
+        assert_eq!(out[..6], [21, 22, 23, 24, 25, 26]);
+        assert_eq!(out[6..], [27, 28, 29, 30, 31, 32]);
+    }
+
+    #[test]
+    fn short_chunk_keeps_tail_channels_zero() {
+        // FAULT 导致末分片少字：尾部通道保持 0，位置不位移（不串号）
+        let mut asm = CycleAssembler::new(8);
+        assert_eq!(asm.feed(meta(0, 6, 0, 2), &[1, 2, 3, 4, 5, 6], true), None);
+        let out = asm.feed(meta(0, 2, 1, 2), &[7], true).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 0], "missing word must stay 0, not shift");
+    }
+
+    #[test]
+    fn single_packet_cycle_unchanged() {
+        // 包足够大时每周期一个分片：行为与旧实现一致
+        let mut asm = CycleAssembler::new(4);
+        let out = asm.feed(meta(0, 4, 0, 1), &[5, 6, 7, 8], true).unwrap();
+        assert_eq!(out, vec![5, 6, 7, 8]);
+    }
+
+    // ---- 纳秒采样间隔 ----
+
+    #[test]
+    fn nanosecond_interval_has_no_rate_distortion() {
+        // 旧实现用微秒取整：44100 Hz → 22 µs（隐含 45454 Hz，偏 +3.1%），
+        // 30000 Hz → 33 µs（隐含 30303 Hz，偏 +1.0%）。先乘后除必须把
+        // 单个周期的误差压到远小于 0.01%。
+        for rate in [1_000u32, 5_000, 7_000, 30_000, 44_100, 100_000] {
+            let period_ns = tick_ns(1, rate) as f64;
+            let implied = 1_000_000_000.0 / period_ns;
+            let err_pct = (implied - rate as f64) / rate as f64 * 100.0;
+            assert!(
+                err_pct.abs() < 0.01,
+                "rate={rate} period_ns={period_ns} implied={implied:.3} err={err_pct:.4}%"
+            );
+        }
+    }
+
+    #[test]
+    fn nanosecond_timestamps_stay_on_grid_over_long_runs() {
+        // 10 分钟的 30 kHz 采样：时间戳累积漂移必须远小于一个采样周期。
+        // tick_ns 先乘后除，漂移不随运行时长线性增长。
+        let rate = 30_000u32;
+        let samples = 30_000u64 * 600; // 600 s
+        let last_ts = tick_ns(samples - 1, rate) as f64 / 1_000_000_000.0;
+        let expected = (samples - 1) as f64 / rate as f64;
+        let drift = (last_ts - expected).abs();
+        let period = 1.0 / rate as f64;
+        assert!(drift < period, "drift {drift} must stay below one period {period}");
+    }
+
+    #[test]
+    fn tick_ns_does_not_accumulate_integer_nanosecond_error() {
+        // 回归：44100 Hz 的 1e9/rate = 22675 ns（截断），乘 seq 后
+        // 600 秒会偏 6 ms。tick_ns 必须让误差停留在单个周期内。
+        let rate = 44_100u32;
+        let samples = 44_100u64 * 600;
+        let naive_interval = 1_000_000_000u64 / u64::from(rate);
+        let naive_last = (naive_interval * (samples - 1)) as f64 / 1_000_000_000.0;
+        let exact_last = tick_ns(samples - 1, rate) as f64 / 1_000_000_000.0;
+        let expected = (samples - 1) as f64 / rate as f64;
+        assert!(
+            (naive_last - expected).abs() > 0.001,
+            "naive interval*seq should drift (this is what we fixed)"
+        );
+        assert!(
+            (exact_last - expected).abs() < 1e-6,
+            "tick_ns must be drift-free, got {} vs {}",
+            exact_last,
+            expected
+        );
+    }
+
+    #[test]
+    fn packet_size_bounds_command_bytes() {
+        // 每条命令（含头与写数据）必须 ≤ 设备 packet_size，
+        // 否则固件会静默截断（DAP_queue_execute_buf 里的 len 钳制）
+        for packet in [64u16, 128, 512, 1024] {
+            let words = max_words_per_cmd(packet);
+            // 纯读取命令：3 字节头 + 2 请求/字 × 5 字节
+            let cmd_bytes = RESPONSE_HEADER_BYTES + words * REQUESTS_PER_WORD * BYTES_PER_REQUEST;
+            assert!(
+                cmd_bytes <= packet as usize,
+                "packet={packet} words={words} cmd={cmd_bytes} exceeds packet size"
+            );
+            // 响应：3 字节头 + 4 字节/字
+            let resp_bytes = RESPONSE_HEADER_BYTES + words * 4;
+            assert!(
+                resp_bytes <= packet as usize,
+                "packet={packet} words={words} resp={resp_bytes} exceeds packet size"
+            );
+        }
+    }
+
+    #[test]
+    fn max_words_per_cmd_is_zero_only_for_tiny_packets() {
+        assert_eq!(max_words_per_cmd(3), 0, "no room for any request");
+        assert_eq!(max_words_per_cmd(12), 0, "3B header + 10B request = 13 > 12");
+        assert_eq!(max_words_per_cmd(13), 1, "exactly one word fits");
+    }
+
+    #[test]
+    fn first_chunk_leaves_room_for_write_budget() {
+        // 首包要并入写入块，预留后读字数必须减少（除非 u8 请求数上限
+        // 已经先起作用——此时总量仍远小于包大小）
+        for packet in [64u16, 128, 512, 1024] {
+            let full = max_words_per_cmd(packet);
+            let first = first_chunk_words(packet).max(1);
+            assert!(first <= full, "first chunk cannot exceed full chunk");
+            let request_capped = max_requests_per_cmd(packet) == MAX_TRANSFER_REQUESTS;
+            if !request_capped {
+                assert!(first < full, "packet={packet}: first chunk must shrink to fit writes");
+            }
+            // 首包 + 预留写入预算后的总字节数必须 ≤ packet_size
+            let bytes = RESPONSE_HEADER_BYTES
+                + WRITE_BUDGET_REQUESTS * BYTES_PER_REQUEST
+                + first * REQUESTS_PER_WORD * BYTES_PER_REQUEST;
+            assert!(
+                bytes <= packet as usize,
+                "packet={packet} first={first} bytes={bytes} exceeds packet size"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_command_with_writes_stays_within_packet() {
+        // 端到端核算：最宽写入（非对齐 64 位 = 6 条写请求）并入首包后，
+        // 命令长度必须 ≤ 64 字节（全速 DAPLink 的 DAP_PACKET_SIZE）
+        let packet = 64usize;
+        let first = first_chunk_words(packet as u16).max(1);
+        let write_bytes = WRITE_BUDGET_REQUESTS * BYTES_PER_REQUEST;
+        let read_bytes = first * REQUESTS_PER_WORD * BYTES_PER_REQUEST;
+        let total = RESPONSE_HEADER_BYTES + write_bytes + read_bytes;
+        assert!(total <= packet, "total={total} must fit in {packet}-byte packet");
+
+        // 响应侧：首包读字数对应的数据 + 3 字节头也必须 ≤ 包大小
+        let resp = RESPONSE_HEADER_BYTES + first * 4;
+        assert!(resp <= packet, "resp={resp} must fit");
+    }
+
+    #[test]
+    fn write_budget_covers_widest_variable() {
+        // 最宽写入 = 非对齐 64 位：3 字 × 2 请求/字 = 6 条请求。
+        // 预留不足会让首包超包（固件静默截断）。
+        let widest = MemAccess::from_addr_size(0x2000_0002, 8);
+        assert_eq!(widest.words, 3);
+        assert!(
+            WRITE_BUDGET_REQUESTS >= widest.words as usize * REQUESTS_PER_WORD,
+            "write budget {} must cover {}-request write",
+            WRITE_BUDGET_REQUESTS,
+            widest.words as usize * REQUESTS_PER_WORD
+        );
+    }
+
+    // ---- 端到端：真实 DAPLink 字节流 → 分包 → 拼装 ----
+
+    /// 按 DAPLink 固件行为生成一条响应帧
+    ///
+    /// 复用被测的 `transfer_frame_len` 计算长度，但数据区独立按
+    /// posted-read 语义产生：每个读请求挂起，下一个请求前取回。
+    fn daplink_response(write_reqs: usize, layout: &[bool], values: &[u32], status: u8) -> Vec<u8> {
+        // 全 OK：执行完所有请求
+        let count = write_reqs + layout.len();
+        let mut data = Vec::new();
+        let mut posted = false;
+        let mut it = values.iter();
+        for _ in 0..write_reqs {
+            if posted {
+                data.push(*it.next().unwrap());
+                posted = false;
+            }
+        }
+        for &is_read in layout {
+            if is_read {
+                if posted {
+                    data.push(*it.next().unwrap());
+                }
+                posted = true;
+            } else if posted {
+                data.push(*it.next().unwrap());
+                posted = false;
+            }
+        }
+        if status == TRANSFER_OK && posted {
+            data.push(*it.next().unwrap());
+        }
+        let mut frame = vec![DAP_TRANSFER, count as u8, status];
+        for v in data {
+            frame.extend_from_slice(&v.to_le_bytes());
+        }
+        frame
+    }
+
+    #[test]
+    fn end_to_end_multi_packet_stream_reassembles_correctly() {
+        // 16 个 32 位通道 @ 64 字节包，本周期带一条写入（用预留布局）：
+        // 首包为写块留 6 条请求 → 3 字；后续 6 字/包
+        let packet = 64u16;
+        let words_per_cmd = max_words_per_cmd(packet);
+        let first_words = first_chunk_words(packet).max(1);
+        let total = 16usize;
+
+        // 构造与提交线程一致的分片布局
+        let mut chunk_sizes = vec![first_words.min(total)];
+        let mut remaining = total.saturating_sub(chunk_sizes[0]);
+        while remaining > 0 {
+            let n = words_per_cmd.min(remaining);
+            chunk_sizes.push(n);
+            remaining -= n;
+        }
+        assert_eq!(
+            chunk_sizes,
+            vec![3, 6, 6, 1],
+            "6-request write budget leaves 3 words in the first packet"
+        );
+        // 每包命令长度都必须在 64 字节内（含首包写入块）
+        for (i, &n) in chunk_sizes.iter().enumerate() {
+            let wr = if i == 0 { 2 } else { 0 };
+            let bytes = RESPONSE_HEADER_BYTES + wr * BYTES_PER_REQUEST + n * 2 * BYTES_PER_REQUEST;
+            assert!(bytes <= packet as usize, "chunk {i} command {bytes}B exceeds packet");
+        }
+
+        // 模拟设备：每个分片返回该分片对应的字（值 = 100 + 全局字索引）
+        let mut stream = Vec::new();
+        let mut global = 0usize;
+        for (i, &n) in chunk_sizes.iter().enumerate() {
+            let values: Vec<u32> = (0..n).map(|k| 100 + (global + k) as u32).collect();
+            // 首包含一条 32 位写入（2 条写请求）
+            let wr = if i == 0 { 2 } else { 0 };
+            let layout = [false, true].repeat(n);
+            stream.extend_from_slice(&daplink_response(wr, &layout, &values, TRANSFER_OK));
+            global += n;
+        }
+
+        // 按接收线程的算法切帧 + 拼装
+        let mut asm = CycleAssembler::new(total);
+        let mut offset = 0;
+        let mut produced = None;
+        for (i, &n) in chunk_sizes.iter().enumerate() {
+            let count = stream[offset + 1] as usize;
+            let status = stream[offset + 2];
+            let wr = if i == 0 { 2 } else { 0 };
+            let layout = [false, true].repeat(n);
+            let need = transfer_frame_len(count, status, wr, &layout);
+            let frame = &stream[offset..offset + need];
+            offset += need;
+
+            let resp = DapProtocol::parse_transfer_response(frame).unwrap();
+            assert_eq!(resp.status, TRANSFER_OK);
+            let out = asm.feed(meta(wr as u8, n as u16, i as u16, chunk_sizes.len() as u16), resp.values(), resp.status == TRANSFER_OK);
+            if let Some(v) = out {
+                produced = Some(v);
+            }
+        }
+        assert_eq!(offset, stream.len(), "all bytes consumed, no desync");
+        let got = produced.expect("cycle must complete");
+        assert_eq!(got, (100..116).collect::<Vec<u32>>(), "channels must keep their positions");
+    }
+
+    #[test]
+    fn end_to_end_fault_in_middle_chunk_drops_only_that_cycle() {
+        // 第 2 个分片 FAULT：该周期作废，下一个周期必须恢复正常
+        let layout = [false, true].repeat(3);
+        let cycle1_chunk1 = daplink_response(0, &layout, &[1, 2, 3], TRANSFER_OK);
+        // 第 2 分片 FAULT：执行到第 2 条请求（DRW 挂起但未取回→无数据）
+        let mut fault = vec![DAP_TRANSFER, 2u8, TRANSFER_FAULT];
+        assert_eq!(transfer_frame_len(2, TRANSFER_FAULT, 0, &layout), 3);
+        fault.clear();
+        fault.extend_from_slice(&[DAP_TRANSFER, 2, TRANSFER_FAULT]);
+
+        let mut asm = CycleAssembler::new(6);
+        assert!(asm.feed(meta(0, 3, 0, 2), &[1, 2, 3], true).is_none());
+
+        // FAULT 响应：receiver 标记 cycle_broken 并继续消费
+        let out = asm.feed(meta(0, 3, 1, 2), &[], false);
+        assert!(out.is_none(), "broken cycle must not emit");
+
+        // 下一周期完整：必须正常产出
+        let next = daplink_response(0, &layout, &[7, 8, 9], TRANSFER_OK);
+        let resp = DapProtocol::parse_transfer_response(&next).unwrap();
+        let out = asm.feed(meta(0, 3, 0, 1), resp.values(), true).expect("next cycle must emit");
+        assert_eq!(out, vec![7, 8, 9, 0, 0, 0]);
+        assert_eq!(cycle1_chunk1[0], DAP_TRANSFER);
     }
 }

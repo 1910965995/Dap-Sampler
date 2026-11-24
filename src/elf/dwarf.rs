@@ -34,6 +34,12 @@ pub enum DwarfTypeInfo {
     Struct { name: String, byte_size: u32, members: Vec<StructMember> },
     Array { element_type_offset: u64, element_count: u32, byte_size: u32 },
     Pointer { byte_size: u32 },
+    /// 枚举类型：按底层整数类型解释（DW_AT_type），无底层类型时按有符号整数
+    ///
+    /// 不能当成 Base：枚举名（如 `MotorState`）不参与 `map_dwarf_type`
+    /// 的名称映射，会落到「按宽度猜类型」的回退分支把 4 字节猜成 float，
+    /// 波形上显示成一串无意义浮点数。
+    Enum { name: String, byte_size: u32, base_type_offset: Option<u64> },
 }
 
 #[derive(Debug)]
@@ -250,10 +256,20 @@ fn process_raw_dies(raw_dies: &[RawDie], result: &mut DwarfResult) {
             }
 
             DW_TAG_enumeration_type => {
-                // 枚举类型：按底层整数大小处理，等同于 base_type
+                // 枚举：保留底层整数类型引用（DW_AT_type，通常是
+                // unsigned int / int）。它的名字（如 MotorState）不在
+                // map_dwarf_type 的名称表里，不能当 Base 处理，否则会
+                // 按宽度猜成 float，波形显示乱码。
                 let name = die.name.clone().unwrap_or_else(|| "enum".to_string());
                 let byte_size = die.byte_size.unwrap_or(4);
-                result.types.insert(die.offset, DwarfTypeInfo::Base { name, byte_size });
+                result.types.insert(
+                    die.offset,
+                    DwarfTypeInfo::Enum {
+                        name,
+                        byte_size,
+                        base_type_offset: die.type_ref,
+                    },
+                );
             }
 
             DW_TAG_structure_type | DW_TAG_union_type => {

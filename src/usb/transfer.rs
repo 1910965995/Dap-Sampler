@@ -1,8 +1,17 @@
 use rusb;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use crate::error::*;
 use crate::usb::device;
+
+/// 设备未上报包大小时的保守默认值
+///
+/// CMSIS-DAP 全速 Bulk 端点最大包长就是 64 字节（USB 2.0 规范），
+/// 固件侧 DAP_PACKET_SIZE 在多数全速板上也是 64。宁可少发请求
+/// （多包拼接）也不能超长——超长命令会被固件静默截断。
+pub const DEFAULT_PACKET_SIZE: u16 = 64;
+/// 设备未上报包数量时假设只有 1 个响应缓冲（最保守）
+pub const DEFAULT_PACKET_COUNT: u8 = 1;
 
 /// USB Bulk 传输封装
 pub struct BulkTransfer {
@@ -16,6 +25,16 @@ pub struct BulkTransfer {
     /// 原子类型使 release() 可以只借 &self——经 Arc 直接调用，不再依赖
     /// Arc::try_unwrap（旧实现在还有其他 Arc 引用时静默跳过释放）。
     released: AtomicBool,
+    /// 设备上报的单包最大字节数（DAP_Info PACKET_SIZE）
+    ///
+    /// 采样引擎据此决定一条 DAP_Transfer 命令最多能带多少请求：
+    /// 命令与响应都必须 ≤ 该值，否则固件会截断（Silent data corruption）。
+    packet_size: AtomicU16,
+    /// 设备上报的响应缓冲数量（DAP_Info PACKET_COUNT）
+    ///
+    /// 在途命令数超过它时设备会丢命令（固件队列满则丢弃请求），
+    /// 因此引擎的在途上限不得超过此值。
+    packet_count: AtomicU8,
 }
 
 impl BulkTransfer {
@@ -31,6 +50,8 @@ impl BulkTransfer {
             timeout: Duration::from_millis(1000),
             interface_num,
             released: AtomicBool::new(false),
+            packet_size: AtomicU16::new(DEFAULT_PACKET_SIZE),
+            packet_count: AtomicU8::new(DEFAULT_PACKET_COUNT),
         };
         // 清空 USB IN 端点缓冲区中可能残留的数据
         // （流水线非阻塞写入后可能残留未读响应）
@@ -187,6 +208,42 @@ impl BulkTransfer {
     /// OUT 端点地址（异步传输层需要）
     pub fn ep_out(&self) -> u8 {
         self.ep_out
+    }
+
+    /// 设备上报的单包最大字节数
+    ///
+    /// 未查询过 DAP_Info 时为保守默认值 64。采样引擎必须保证
+    /// 每条命令及每条响应都不超过该值。
+    pub fn packet_size(&self) -> u16 {
+        self.packet_size
+            .load(Ordering::Relaxed)
+            .clamp(1, super::async_bulk::MAX_PACKET_SIZE_HARD_LIMIT)
+    }
+
+    /// 设备上报的响应缓冲数量（在途命令上限）
+    pub fn packet_count(&self) -> u8 {
+        self.packet_count.load(Ordering::Relaxed).max(1)
+    }
+
+    /// 记录设备上报的 DAP_Info 能力值
+    ///
+    /// 在 SWD 初始化查询完 DAP_Info 后调用。非法值（0 或超过硬上限）
+    /// 退回保守默认值：错误的包大小会导致命令被截断，必须稳住。
+    pub fn set_packet_info(&self, packet_size: u16, packet_count: u8) {
+        let size = if packet_size == 0 || packet_size > super::async_bulk::MAX_PACKET_SIZE_HARD_LIMIT {
+            log::warn!(
+                "device reported implausible packet size {} (using {})",
+                packet_size,
+                DEFAULT_PACKET_SIZE
+            );
+            DEFAULT_PACKET_SIZE
+        } else {
+            packet_size
+        };
+        let count = packet_count.max(1);
+        log::info!("device packet info: size={} bytes, count={}", size, count);
+        self.packet_size.store(size, Ordering::Relaxed);
+        self.packet_count.store(count, Ordering::Relaxed);
     }
 
     /// IN 端点地址（异步传输层需要）

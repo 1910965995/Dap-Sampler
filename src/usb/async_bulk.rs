@@ -41,13 +41,20 @@ use rusb::ffi;
 use super::transfer::BulkTransfer;
 use crate::error::*;
 
-/// 单条 OUT 命令的最大字节数
+/// 单条 OUT 命令的最大字节数（硬上限）
 ///
-/// 引擎最宽的命令是 64 条请求 × 5 字节 + 3 字节头 = 323 字节，
-/// 留一倍余量以容纳未来扩展。
-const OUT_BUF_SIZE: usize = 1024;
-/// IN 读取缓冲：CMSIS-DAP v2 单包上限 512 字节
-const IN_BUF_SIZE: usize = 512;
+/// 引擎按设备上报的 packet_size 分包后，单包不会超过 packet_size；
+/// 这里只是 libusb 槽位缓冲的物理上限，取 CMSIS-DAP 规范允许的最大
+/// 包长（32768，见 DAP.c 的 `DAP_PACKET_SIZE > 32768` 校验）。
+pub const MAX_PACKET_SIZE_HARD_LIMIT: u16 = 32768;
+
+/// OUT 槽位缓冲实际分配大小
+///
+/// 取硬上限：设备上报 512/1024 时也要能装下整条命令。槽位数很少
+/// （= MAX_IN_FLIGHT），1KB 级别的分配对内存无影响。
+const OUT_BUF_SIZE: usize = MAX_PACKET_SIZE_HARD_LIMIT as usize;
+/// IN 读取缓冲：必须 ≥ 设备上报的 packet_size，否则长响应会被截断
+const IN_BUF_SIZE: usize = MAX_PACKET_SIZE_HARD_LIMIT as usize;
 
 const SLOT_FREE: u8 = 0;
 const SLOT_PENDING: u8 = 1;
@@ -238,7 +245,6 @@ impl AsyncSession {
 
         let out_slots = alloc_slots(out_pool.max(1), usb.ep_out(), OUT_BUF_SIZE)?;
         let in_slots = alloc_slots(in_pool.max(1), usb.ep_in(), IN_BUF_SIZE)?;
-
         // 配置 OUT（暂不提交）与 IN（立即常驻挂起）
         for s in &out_slots {
             unsafe { s.configure(handle, 2000, out_callback) };

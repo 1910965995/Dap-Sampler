@@ -232,15 +232,28 @@ impl DapProtocol {
     }
 
     /// 便捷方法：执行一次 DAP_Transfer
+    /// 便捷方法：执行一次 DAP_Transfer
+    ///
+    /// 会按设备 packet_size 校验命令长度：超过包大小的命令会被 DAPLink
+    /// 固件静默截断（`DAP_queue_execute_buf` 里的 `len` 钳制），必须
+    /// 显式报错而不是解析出残缺数据。
     pub fn execute_transfer(
         &self,
         usb: &BulkTransfer,
         requests: &[TransferRequest],
     ) -> Result<TransferResponse> {
         let cmd = self.build_transfer_request(requests);
+        let packet_size = usb.packet_size() as usize;
+        if cmd.len() > packet_size {
+            return Err(Error::InvalidResponse(format!(
+                "DAP_Transfer request is {} bytes, exceeding device packet size {} (the firmware would silently truncate it)",
+                cmd.len(),
+                packet_size
+            )));
+        }
         log::debug!(">>> DAP_Transfer request ({} bytes): {:02X?}", cmd.len(), cmd);
         usb.write(&cmd)?;
-        let mut buf = vec![0u8; 1024];
+        let mut buf = vec![0u8; packet_size.max(64)];
         let n = usb.read(&mut buf)?;
         log::debug!("<<< DAP_Transfer response ({} bytes): {:02X?}", n, &buf[..n]);
         DapProtocol::parse_transfer_response(&buf[..n])

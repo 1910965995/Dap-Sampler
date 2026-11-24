@@ -86,7 +86,24 @@ pub fn req_write_dp(addr: u8) -> u8 {
 pub const AP_REG_CSW: u8 = 0x00;
 pub const AP_REG_TAR: u8 = 0x04;
 pub const AP_REG_DRW: u8 = 0x0C;
-pub const AP_REG_IDR: u8 = 0x0C; // 同 DRW (CSW=0 时返回 IDR)
+/// AP Identification Register（只读）
+///
+/// 注意是 **0xFC** 而不是 0x0C：0x0C 是 DRW，读它返回内存数据；
+/// 只有 CSW.SIZE=0（8 位）时 DRW 才别名到 IDR，而这个前提不成立
+/// （CSW 现已显式配置为 32 位）。旧代码用 0x0C 读 IDR，实际读的是
+/// 地址相关的内存内容，AP 扫描的「成功」是假阳性。
+pub const AP_REG_IDR: u8 = 0xFC;
+
+/// AHB-AP CSW 配置值（32 位传输 + privileged + debug master）
+///
+/// - SIZE = 0b010（32 位访问）
+/// - AddrInc = 0（每次访问前由软件重写 TAR，不依赖自增）
+/// - HPROT[1] = 1（privileged，bit25）
+/// - MasterType = 1（debug，bit29）
+///
+/// CSW.SIZE 复位值是 0（8 位）：不配置就写 32 位变量只会更新低字节，
+/// 读 32 位也依赖 AHB-AP 的未定义行为。
+pub const AHB_AP_CSW_32BIT: u32 = 0x2300_0002;
 
 /// 读 AP 寄存器请求字节
 pub fn req_read_ap(addr: u8) -> u8 {

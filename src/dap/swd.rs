@@ -63,6 +63,9 @@ impl SwdLink {
         let dap_info = self.dap.query_info(self.usb())?;
         info!("DAP-Link: {} {} v{}",
             dap_info.vendor, dap_info.product, dap_info.fw_version);
+        // 记录设备包大小/缓冲数：采集引擎据此分包与限制在途命令。
+        // 不记录就会按 64 字节硬编码，超过固件包大小的命令会被静默截断。
+        self.usb.set_packet_info(dap_info.packet_size, dap_info.packet_count);
 
         // 2. SWD 连接
         self.swd_connect()?;
@@ -123,6 +126,13 @@ impl SwdLink {
         if resp.status != TRANSFER_OK {
             return Err(Error::Swd("failed to write DP SELECT".into()));
         }
+
+        // 11b. 配置 AHB-AP CSW：32 位传输 + privileged + debug master
+        //
+        // CSW.SIZE 复位值是 0（8 位访问）：不配置的话写 32 位变量只会
+        // 更新低字节，读 32 位依赖 AHB-AP 的未定义行为（多数实现会回绕
+        // 到对齐字，但写一定只写 8 位）。这一步必须在任何内存访问之前。
+        self.configure_ahb_ap_csw()?;
 
         // 12. 扫描 AP
         let ap_idr = self.scan_ap()?;
@@ -252,14 +262,50 @@ impl SwdLink {
         Ok(())
     }
 
+    /// 配置 AHB-AP 的 CSW 为 32 位访问
+    ///
+    /// CSW 是带 bank 的 AP 寄存器，需要 DP SELECT.APBANKSEL=0；
+    /// 当前 AP 已在 init 中通过 SELECT=0 选中，直接写即可。
+    /// 写后读回校验：某些 AP 不支持某些位组合，读回不符时明确告警
+    /// （否则后续所有 32 位读写都会静默只作用于低 8 位）。
+    fn configure_ahb_ap_csw(&self) -> Result<()> {
+        let req = TransferRequest::write_ap(AP_REG_CSW, AHB_AP_CSW_32BIT);
+        let resp = self.dap.execute_transfer(self.usb(), &[req])?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::Swd(format!(
+                "failed to configure AHB-AP CSW: status={}, count={}",
+                resp.status, resp.count
+            )));
+        }
+
+        // 读回校验 SIZE 字段（bits[2:0]）
+        let read_req = TransferRequest::read_ap(AP_REG_CSW);
+        let resp = self.dap.execute_transfer(self.usb(), &[read_req])?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::Swd(format!(
+                "failed to read back AHB-AP CSW: status={}, count={}",
+                resp.status, resp.count
+            )));
+        }
+        let csw = resp.values().first().copied().unwrap_or(0);
+        if csw & 0x7 != 0x2 {
+            return Err(Error::Swd(format!(
+                "AHB-AP rejected 32-bit CSW (read back 0x{:08X}): memory access would be limited to 8-bit, aborting",
+                csw
+            )));
+        }
+        info!("AHB-AP CSW = 0x{:08X} (32-bit transfers)", csw);
+        Ok(())
+    }
+
     /// 扫描 AP 端口
     fn scan_ap(&mut self) -> Result<u32> {
         // 选择 AP0 并读取 IDR
         self.select_ap(0)?;
 
-        // 通过读 AP IDR 来验证 AP 是否存在
-        // CSW 默认配置下，读 DRW 寄存器返回的是 IDR
-        // 需要先写 CSW 设置 32-bit 访问，简化处理使用默认值
+        // AP IDR 位于 0xFC（只读）。旧实现读 0x0C（DRW），那只有在
+        // CSW.SIZE=0 时才别名到 IDR；现在 CSW 已是 32 位访问，读 0x0C
+        // 会返回 TAR 指向的内存内容——校验形同虚设。
         let req = TransferRequest::read_ap(AP_REG_IDR);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
 
@@ -267,8 +313,14 @@ impl SwdLink {
             return Err(Error::Swd("AP scan failed".into()));
         }
 
+        let idr = resp.values()[0];
+        // IDR 全 0 或全 1 说明 AP 不存在 / 总线错误（常见于读错寄存器）
+        if idr == 0 || idr == u32::MAX {
+            log::warn!("AP{} IDR = 0x{:08X} looks invalid", self.ap_index, idr);
+        }
+
         self.ap_index = 0;
-        Ok(resp.data[0])
+        Ok(idr)
     }
 
     // --------------------------------------------------------
@@ -296,23 +348,31 @@ impl SwdLink {
     }
 
     /// 批量读取多个地址
+    ///
+    /// 按设备 packet_size 分批：全速 DAPLink 固件只有 64 字节包，
+    /// 8 个变量一次读需要 83 字节命令，会被静默截断。
     pub fn read_memory_batch(&self, addresses: &[u32]) -> Result<Vec<u32>> {
-        let max_vars = addresses.len().min(8);
-        let mut requests = Vec::with_capacity(max_vars * 2);
-
-        for &addr in &addresses[..max_vars] {
-            requests.push(TransferRequest::write_ap(AP_REG_TAR, addr));
-            requests.push(TransferRequest::read_ap(AP_REG_DRW));
+        let packet_size = self.usb.packet_size() as usize;
+        // 每字 2 条请求 × 5 字节 + 3 字节头
+        let max_words = packet_size
+            .saturating_sub(3)
+            .checked_div(2 * 5)
+            .unwrap_or(0)
+            .max(1);
+        let mut out = Vec::with_capacity(addresses.len());
+        for chunk in addresses.chunks(max_words) {
+            let mut requests = Vec::with_capacity(chunk.len() * 2);
+            for &addr in chunk {
+                requests.push(TransferRequest::write_ap(AP_REG_TAR, addr));
+                requests.push(TransferRequest::read_ap(AP_REG_DRW));
+            }
+            let resp = self.dap.execute_transfer(self.usb(), &requests)?;
+            if resp.status != TRANSFER_OK {
+                return Err(Error::TransferFailed(resp.status, resp.count));
+            }
+            out.extend_from_slice(resp.values());
         }
-
-        let resp = self.dap.execute_transfer(self.usb(), &requests)?;
-
-        if resp.status != TRANSFER_OK {
-            return Err(Error::TransferFailed(resp.status, resp.count));
-        }
-
-        // 返回实际携带的读取值（非热路径，转为 Vec 以保持 API 不变）
-        Ok(resp.data[..resp.len].to_vec())
+        Ok(out)
     }
 
     /// 写入 32 位内存值（单地址）
@@ -338,21 +398,21 @@ impl SwdLink {
     /// 写入一个变量（按字节大小 1/2/4/8）
     ///
     /// AHB-AP 不支持非对齐访问，也没有 64 位访问：
-    /// - 子字变量（1/2 字节）读-改-写其所在的对齐整字，只更新变量的
-    ///   字节 lane，不破坏相邻变量
-    /// - 8 字节变量拆成低/高两个 32 位字写；每个字之前都重写 TAR，
-    ///   不依赖 CSW.AddrInc 自增（CSW 复位值由目标/探针固件决定）
+    /// - 4 字节对齐的 32 位变量：直接写整字
+    /// - 4 字节对齐的 64 位变量：拆成低/高两个 32 位字写
+    /// - 其余情况（子字 / 非对齐 32 位 / 非对齐 64 位）：读回对齐窗口
+    ///   后按字节拼接再写回，不破坏相邻变量
+    ///
+    /// 每个字之前都重写 TAR，不依赖 CSW.AddrInc 自增。
     pub fn write_variable(&self, address: u32, byte_size: u32, value: u64) -> Result<()> {
         let acc = MemAccess::from_addr_size(address, byte_size);
-        if acc.words > 1 {
-            // 非 4 字节对齐时变量跨三个字，首尾字与相邻变量共享，
-            // 无法安全写入（需要跨字读-改-写）
-            if acc.aligned_addr & 3 != 0 {
-                return Err(Error::Other(format!(
-                    "8-byte variable at 0x{:08X} is not 4-byte aligned, cannot write",
-                    address
-                )));
-            }
+
+        // 4 字节对齐的 32 位整字：直接写，无需旧值
+        if acc.shift == 0 && acc.byte_size == 4 {
+            return self.write_memory(acc.aligned_addr, value as u32);
+        }
+        // 4 字节对齐的 64 位变量：拆成低/高两个 32 位字
+        if acc.byte_size == 8 && acc.words == 2 {
             let (low, high) = MemAccess::split_wide(value);
             let requests = [
                 TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
@@ -366,12 +426,43 @@ impl SwdLink {
             }
             return Ok(());
         }
-        if acc.mask == u32::MAX {
-            return self.write_memory(address, value as u32);
+
+        // 子字 / 非对齐变量：读回对齐窗口 → 按字节拼接 → 写回
+        let words = acc.words as usize;
+        let mut requests = Vec::with_capacity(words * 4);
+        for i in 0..words as u32 {
+            let addr = acc.aligned_addr.wrapping_add(4 * i);
+            requests.push(TransferRequest::write_ap(AP_REG_TAR, addr));
+            requests.push(TransferRequest::read_ap(AP_REG_DRW));
         }
-        let current = self.read_memory(acc.aligned_addr)?;
-        let merged = acc.merge(current, value as u32);
-        self.write_memory(acc.aligned_addr, merged)
+        let resp = self.dap.execute_transfer(self.usb(), &requests)?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
+        let read = resp.values();
+        if read.len() < words {
+            return Err(Error::Other(format!(
+                "read-modify-write for 0x{:08X} got {} words, expected {}",
+                address,
+                read.len(),
+                words
+            )));
+        }
+        let mut window = [0u32; 3];
+        window[..words].copy_from_slice(&read[..words]);
+        acc.splice_into(&mut window, value);
+
+        let mut writes = Vec::with_capacity(words * 4);
+        for (i, &w) in window.iter().take(words).enumerate() {
+            let addr = acc.aligned_addr.wrapping_add(4 * i as u32);
+            writes.push(TransferRequest::write_ap(AP_REG_TAR, addr));
+            writes.push(TransferRequest::write_ap(AP_REG_DRW, w));
+        }
+        let resp = self.dap.execute_transfer(self.usb(), &writes)?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
+        Ok(())
     }
 
     /// 读取内存并解析为 float
@@ -404,14 +495,16 @@ pub fn write_variable_on_session(
         Ok(())
     };
     let acc = MemAccess::from_addr_size(address, byte_size);
-    if acc.words > 1 {
-        // 非 4 字节对齐时首尾字与相邻变量共享，无法安全写入
-        if acc.aligned_addr & 3 != 0 {
-            return Err(Error::Other(format!(
-                "8-byte variable at 0x{:08X} is not 4-byte aligned, cannot write",
-                address
-            )));
-        }
+
+    // 4 字节对齐的 32 位整字：直接写
+    if acc.shift == 0 && acc.byte_size == 4 {
+        return execute(&[
+            TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
+            TransferRequest::write_ap(AP_REG_DRW, value as u32),
+        ]);
+    }
+    // 4 字节对齐的 64 位变量：拆成低/高两个 32 位字
+    if acc.byte_size == 8 && acc.words == 2 {
         let (low, high) = MemAccess::split_wide(value);
         return execute(&[
             TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
@@ -420,27 +513,41 @@ pub fn write_variable_on_session(
             TransferRequest::write_ap(AP_REG_DRW, high),
         ]);
     }
-    if acc.mask == u32::MAX {
-        return execute(&[
-            TransferRequest::write_ap(AP_REG_TAR, address),
-            TransferRequest::write_ap(AP_REG_DRW, value as u32),
-        ]);
+
+    // 子字 / 非对齐变量：读回对齐窗口 → 按字节拼接 → 写回
+    let words = acc.words as usize;
+    let mut reads = Vec::with_capacity(words * 2);
+    for i in 0..words as u32 {
+        reads.push(TransferRequest::write_ap(
+            AP_REG_TAR,
+            acc.aligned_addr.wrapping_add(4 * i),
+        ));
+        reads.push(TransferRequest::read_ap(AP_REG_DRW));
     }
-    // 子字变量：读对齐整字 → 合并 lane → 写回
-    let resp = dap.execute_transfer(
-        usb,
-        &[
-            TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
-            TransferRequest::read_ap(AP_REG_DRW),
-        ],
-    )?;
+    let resp = dap.execute_transfer(usb, &reads)?;
     if resp.status != TRANSFER_OK {
         return Err(Error::TransferFailed(resp.status, resp.count));
     }
-    let current = resp.data.first().copied().unwrap_or(0);
-    let merged = acc.merge(current, value as u32);
-    execute(&[
-        TransferRequest::write_ap(AP_REG_TAR, acc.aligned_addr),
-        TransferRequest::write_ap(AP_REG_DRW, merged),
-    ])
+    let read = resp.values();
+    if read.len() < words {
+        return Err(Error::Other(format!(
+            "read-modify-write for 0x{:08X} got {} words, expected {}",
+            address,
+            read.len(),
+            words
+        )));
+    }
+    let mut window = [0u32; 3];
+    window[..words].copy_from_slice(&read[..words]);
+    acc.splice_into(&mut window, value);
+
+    let mut writes = Vec::with_capacity(words * 2);
+    for (i, &w) in window.iter().take(words).enumerate() {
+        writes.push(TransferRequest::write_ap(
+            AP_REG_TAR,
+            acc.aligned_addr.wrapping_add(4 * i as u32),
+        ));
+        writes.push(TransferRequest::write_ap(AP_REG_DRW, w));
+    }
+    execute(&writes)
 }

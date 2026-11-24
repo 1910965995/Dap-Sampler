@@ -25,6 +25,8 @@ enum ResolvedType {
     Struct(u64),
     Array(u64),
     Pointer(u32),
+    /// 枚举：底层整数类型（None = DWARF 未提供 DW_AT_type）
+    Enum { byte_size: u32, base: Option<Box<ResolvedType>> },
     Unknown,
 }
 
@@ -103,16 +105,27 @@ pub fn build_from_symbols_only(
     elf_symbols: &[ElfSymbolRaw],
 ) -> Result<Vec<ElfVariable>, String> {
     let mut result = Vec::new();
+    let mut skipped = 0usize;
     for sym in elf_symbols {
         if sym.address == 0 || sym.size == 0 {
             continue;
         }
+        // 只支持 1/2/4/8 字节（AHB-AP 以 32 位字访问，8 字节占两个字）。
+        // 其它宽度没有可靠的解释方式，跳过并汇总告警——旧实现会对任意
+        // 宽度都给一个猜测类型，读出来是垃圾值。
+        if !matches!(sym.size, 1 | 2 | 4 | 8) {
+            skipped += 1;
+            continue;
+        }
         let value_type = match sym.size {
-            8 => ValueType::Float,
-            4 => ValueType::Float,   // 嵌入式常见 float
+            // 无类型信息时只能按大小猜。4/8 字节最常见的是 float/double，
+            // 但整型同样常见——这里沿用历史行为选浮点。关键是 8 字节
+            // 必须映射成 Float64（占两个 32 位字），否则只读到低半字。
+            8 => ValueType::Float64,
+            4 => ValueType::Float,
             2 => ValueType::Uint16,
             1 => ValueType::Uint8,
-            _ => ValueType::Uint32,
+            _ => unreachable!(),
         };
         result.push(ElfVariable {
             name: sym.name.clone(),
@@ -123,6 +136,12 @@ pub fn build_from_symbols_only(
             parent_path: None,
             source_file: None,
         });
+    }
+    if skipped > 0 {
+        log::warn!(
+            "symbol-table mode: skipped {} symbols with unsupported size (only 1/2/4/8 bytes supported)",
+            skipped
+        );
     }
     // 先按 (path, address) 排序去重（符号表可能含同名同地址的重复条目），
     // 再对同 path 不同地址的残留冲突消歧
@@ -201,6 +220,12 @@ fn resolve_type(offset: u64, types: &HashMap<u64, DwarfTypeInfo>) -> ResolvedTyp
             }
             Some(DwarfTypeInfo::Pointer { byte_size }) => {
                 return ResolvedType::Pointer(*byte_size);
+            }
+            Some(DwarfTypeInfo::Enum { byte_size, base_type_offset, .. }) => {
+                // 枚举按底层整数类型解释（DW_AT_type）。不能把它当 Base：
+                // 枚举名不在名称映射表里，4 字节会被猜成 float。
+                let base = base_type_offset.map(|off| Box::new(resolve_type(off, types)));
+                return ResolvedType::Enum { byte_size: *byte_size, base };
             }
             None => {
                 return ResolvedType::Unknown;
@@ -336,6 +361,56 @@ fn expand_variable(
             false
         }
 
+        ResolvedType::Enum { byte_size, base } => {
+            // 枚举按底层整数类型解释。底层类型可用时用它（通常是
+            // unsigned int / int）；不可用时按宽度给有符号整数
+            // （C 枚举默认底层是 int，不是 float）。
+            if output.len() >= MAX_EXPANDED_LEAVES {
+                return true;
+            }
+            let (value_type, size) = match base.as_deref() {
+                Some(ResolvedType::Base(name, base_size)) => {
+                    let vt = map_dwarf_type(name, *base_size);
+                    // 只有当映射结果确实是整数类型时才采用（防止底层被
+                    // 误判成 float）
+                    if matches!(
+                        vt,
+                        ValueType::Int8
+                            | ValueType::Uint8
+                            | ValueType::Int16
+                            | ValueType::Uint16
+                            | ValueType::Int32
+                            | ValueType::Uint32
+                            | ValueType::Int64
+                            | ValueType::Uint64
+                    ) {
+                        (vt, *base_size)
+                    } else {
+                        (enum_by_width(*byte_size), *byte_size)
+                    }
+                }
+                _ => (enum_by_width(*byte_size), *byte_size),
+            };
+            // 不支持的宽度：显式跳过（与 Base 分支一致）
+            if !matches!(size, 1 | 2 | 4 | 8) {
+                log::warn!(
+                    "skipping enum variable '{}': unsupported width {} bytes",
+                    dv.name, size
+                );
+                return false;
+            }
+            output.push(ElfVariable {
+                name: dv.name.clone(),
+                path,
+                address: dv.address,
+                byte_size: size,
+                value_type,
+                parent_path: if parent_path.is_empty() { None } else { Some(parent_path.to_string()) },
+                source_file: dv.source_file.clone(),
+            });
+            false
+        }
+
         ResolvedType::Unknown => {
             // 无法解析类型，使用默认 uint32 保留变量（不丢弃）
             if output.len() >= MAX_EXPANDED_LEAVES {
@@ -352,6 +427,19 @@ fn expand_variable(
             });
             false
         }
+    }
+}
+
+/// 枚举在缺少底层类型时的回退：按宽度给有符号整数
+///
+/// C 枚举默认底层类型是 int（有符号）。绝不能按宽度猜 float——那会让
+/// 波形显示成无意义浮点数。
+fn enum_by_width(byte_size: u32) -> ValueType {
+    match byte_size {
+        1 => ValueType::Int8,
+        2 => ValueType::Int16,
+        8 => ValueType::Int64,
+        _ => ValueType::Int32,
     }
 }
 
@@ -374,6 +462,7 @@ fn get_type_byte_size(resolved: &ResolvedType, types: &HashMap<u64, DwarfTypeInf
             }
         }
         ResolvedType::Pointer(size) => *size,
+        ResolvedType::Enum { byte_size, .. } => *byte_size,
         ResolvedType::Unknown => 4,
     }
 }
@@ -588,5 +677,122 @@ mod tests {
         assert_eq!(status.len(), 2, "同名同地址去重后剩 2 个不同地址实例");
         let paths: Vec<&str> = status.iter().map(|v| v.path.as_str()).collect();
         assert!(paths[0] != paths[1], "两个实例的 path 必须可区分: {:?}", paths);
+    }
+
+    #[test]
+    fn symbols_only_maps_eight_byte_to_float64() {
+        // 旧实现把 size==8 映射成 Float（4 字节），只读一个 32 位字：
+        // double 只拿到低半部分，显示为无意义浮点
+        use crate::elf::parser::ElfSymbolRaw;
+        let symbols = vec![
+            ElfSymbolRaw { name: "d".to_string(), address: 0x2000_0000, size: 8 },
+            ElfSymbolRaw { name: "i".to_string(), address: 0x2000_0008, size: 4 },
+        ];
+        let vars = build_from_symbols_only(&symbols).unwrap();
+        let d = vars.iter().find(|v| v.name == "d").unwrap();
+        assert_eq!(d.value_type, ValueType::Float64);
+        assert_eq!(d.value_type.byte_size(), 8, "must read two 32-bit words");
+        assert_eq!(d.byte_size, 8);
+        let i = vars.iter().find(|v| v.name == "i").unwrap();
+        assert_eq!(i.value_type.byte_size(), 4);
+    }
+
+    #[test]
+    fn symbols_only_skips_unsupported_widths() {
+        // 3/16/24 字节符号没有可靠解释方式：跳过而不是猜一个类型读出垃圾
+        use crate::elf::parser::ElfSymbolRaw;
+        let symbols = vec![
+            ElfSymbolRaw { name: "arr3".to_string(), address: 0x10, size: 3 },
+            ElfSymbolRaw { name: "big".to_string(), address: 0x20, size: 16 },
+            ElfSymbolRaw { name: "ok".to_string(), address: 0x30, size: 4 },
+        ];
+        let vars = build_from_symbols_only(&symbols).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "ok");
+    }
+
+    // ---- 枚举类型 ----
+
+    /// 构造 enum 类型并展开一个枚举变量
+    fn expand_enum(byte_size: u32, base: Option<(u64, DwarfTypeInfo)>) -> Vec<ElfVariable> {
+        let mut types = HashMap::new();
+        let mut base_offset = None;
+        if let Some((off, info)) = base {
+            types.insert(off, info);
+            base_offset = Some(off);
+        }
+        types.insert(
+            100u64,
+            DwarfTypeInfo::Enum {
+                name: "MotorState".to_string(),
+                byte_size,
+                base_type_offset: base_offset,
+            },
+        );
+        let resolved = resolve_type(100, &types);
+        let mut out = Vec::new();
+        let mut budget = MAX_EXPAND_NODES;
+        expand_variable(&dv("state", 0x2000_0000, 100), &resolved, &types, "", &mut out, 0, &mut budget);
+        out
+    }
+
+    #[test]
+    fn enum_uses_underlying_integer_type() {
+        // DWARF: enum MotorState : unsigned int
+        let out = expand_enum(
+            4,
+            Some((200, DwarfTypeInfo::Base { name: "unsigned int".to_string(), byte_size: 4 })),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value_type, ValueType::Uint32, "enum must follow base type, not float");
+        assert_eq!(out[0].byte_size, 4);
+    }
+
+    #[test]
+    fn enum_without_base_type_falls_back_to_signed_int() {
+        // 无 DW_AT_type：C 枚举默认底层是 int（有符号）——绝不能猜 float
+        let out = expand_enum(4, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value_type, ValueType::Int32);
+        // 1/2 字节枚举同理
+        assert_eq!(expand_enum(1, None)[0].value_type, ValueType::Int8);
+        assert_eq!(expand_enum(2, None)[0].value_type, ValueType::Int16);
+    }
+
+    #[test]
+    fn enum_with_non_integer_base_falls_back_by_width() {
+        // 畸形 DWARF：枚举底层类型指向 float。不能用 float 解释枚举值
+        // （会显示成极小的反规范化数），退回按宽度给有符号整数
+        let out = expand_enum(
+            4,
+            Some((200, DwarfTypeInfo::Base { name: "float".to_string(), byte_size: 4 })),
+        );
+        assert_eq!(out[0].value_type, ValueType::Int32);
+    }
+
+    #[test]
+    fn enum_through_typedef_resolves() {
+        // typedef enum MotorState State_t; —— resolve_type 必须穿过 Alias
+        let mut types = HashMap::new();
+        types.insert(
+            200u64,
+            DwarfTypeInfo::Base { name: "unsigned char".to_string(), byte_size: 1 },
+        );
+        types.insert(
+            100u64,
+            DwarfTypeInfo::Enum {
+                name: "MotorState".to_string(),
+                byte_size: 1,
+                base_type_offset: Some(200),
+            },
+        );
+        types.insert(300u64, DwarfTypeInfo::Alias { name: "State_t".to_string(), target_offset: 100 });
+        let resolved = resolve_type(300, &types);
+        let mut out = Vec::new();
+        let mut budget = MAX_EXPAND_NODES;
+        expand_variable(&dv("st", 0x2000_0000, 300), &resolved, &types, "", &mut out, 0, &mut budget);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value_type, ValueType::Uint8);
+        assert_eq!(out[0].byte_size, 1);
     }
 }

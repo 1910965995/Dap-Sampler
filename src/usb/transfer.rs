@@ -41,7 +41,7 @@ impl BulkTransfer {
     /// 创建 BulkTransfer 实例（自动发现并连接设备）
     pub fn open() -> Result<Self> {
         let (handle, interface_num) = device::open_first_device()?;
-        let (ep_out, ep_in) = device::find_bulk_endpoints(&handle)?;
+        let (ep_out, ep_in) = device::find_bulk_endpoints(&handle, interface_num)?;
         log::info!("bulk endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
         let transfer = Self {
             handle,

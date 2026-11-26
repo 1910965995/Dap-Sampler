@@ -120,12 +120,8 @@ impl SwdLink {
         // 10. 调试电源上电（写 CTRL/STAT = CSYSPWRUPREQ | CDBGPWRUPREQ）
         self.power_up_debug()?;
 
-        // 11. 写 DP SELECT = 0
-        let select_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
-        let resp = self.dap.execute_transfer(self.usb(), &[select_req])?;
-        if resp.status != TRANSFER_OK {
-            return Err(Error::Swd("failed to write DP SELECT".into()));
-        }
+        // 11. 写 DP SELECT = 0（APSEL=0、APBANKSEL=0）
+        self.select_ap(0, 0)?;
 
         // 11b. 配置 AHB-AP CSW：32 位传输 + privileged + debug master
         //
@@ -222,11 +218,18 @@ impl SwdLink {
     }
 
     /// 调试电源上电
+    ///
+    /// 不需要读 RDBUFF 冲刷流水线：DAPLink 固件的 `DAP_SWD_Transfer`
+    /// 对 AP 读会先 post 再读 DP_RDBUFF 取出数据后才组响应，DP 读直接
+    /// 返回；一条 `DAP_Transfer` 结束时 RDBUFF 里不会残留待取数据。
     fn power_up_debug(&self) -> Result<()> {
-        // SWD 读操作有流水线延迟：前一个读的数据在 RDBUFF 中。
-        // 两次 DPIDR 读后，需要先读 RDBUFF 清空流水线，再做写操作。
-        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
-        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
+        // 清除残留的 sticky 错误（STICKYERR/STICKYORUN/WDATAERR/STICKYCMP），
+        // 否则上一次会话遗留的标志会让本次所有 DP/AP 访问持续返回 FAULT。
+        let abort_req = TransferRequest::write_dp(DP_REG_ABORT, DP_ABORT_CLEAR_STICKY);
+        let abort_resp = self.dap.execute_transfer(self.usb(), &[abort_req])?;
+        if abort_resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(abort_resp.status, abort_resp.count));
+        }
 
         // 请求系统调试电源（写 CTRL/STAT）
         let req1 = TransferRequest::write_dp(DP_REG_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ);
@@ -235,14 +238,15 @@ impl SwdLink {
             return Err(Error::Swd(format!("debug power-up request failed: status={}, count={}", resp.status, resp.count)));
         }
 
-        // 读 CTRL/STAT 确认电源就绪（此 DAP-Link 无流水线延迟，直接返回）
+        // 读 CTRL/STAT 确认电源就绪
+        // 先校验 status：FAULT 时 data 无意义，直接判 ACK 位会报成
+        // 「电源没起来」，掩盖真正的总线访问失败
         let req2 = TransferRequest::read_dp(DP_REG_CTRL_STAT);
         let resp = self.dap.execute_transfer(self.usb(), &[req2])?;
-        let ctrl_stat = resp.data.first().copied().unwrap_or(0);
-
-        // 读 RDBUFF 消耗流水线中的残留数据
-        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
-        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
+        let ctrl_stat = resp.values().first().copied().unwrap_or(0);
 
         if (ctrl_stat & (CSYSPWRUPACK | CDBGPWRUPACK)) != (CSYSPWRUPACK | CDBGPWRUPACK) {
             return Err(Error::Swd(format!("debug power not ready: CTRL/STAT=0x{:08X}", ctrl_stat)));
@@ -251,21 +255,23 @@ impl SwdLink {
         Ok(())
     }
 
-    /// 选择 AP 端口
-    fn select_ap(&self, ap: u8) -> Result<()> {
-        // DP SELECT 寄存器: APSEL=[31:24], APBANKSEL=[7:4]
-        let req = TransferRequest::write_dp(DP_REG_SELECT, (ap as u32) << 24);
+    /// 选择 AP 端口及其寄存器 bank
+    ///
+    /// DP SELECT: APSEL=[31:24]、APBANKSEL=[7:4]。请求字节只带 A[3:2]，
+    /// A[7:4] 全靠 APBANKSEL，所以访问 bank 0 以外的寄存器必须先切。
+    fn select_ap(&self, ap: u8, bank: u8) -> Result<()> {
+        let req = TransferRequest::write_dp(DP_REG_SELECT, dp_select_value(ap, bank));
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
         if resp.status != TRANSFER_OK {
-            return Err(Error::Swd(format!("failed to select AP{}", ap)));
+            return Err(Error::Swd(format!("failed to select AP{} bank{}", ap, bank)));
         }
         Ok(())
     }
 
     /// 配置 AHB-AP 的 CSW 为 32 位访问
     ///
-    /// CSW 是带 bank 的 AP 寄存器，需要 DP SELECT.APBANKSEL=0；
-    /// 当前 AP 已在 init 中通过 SELECT=0 选中，直接写即可。
+    /// 前置条件：DP SELECT 已指向 APSEL=0、APBANKSEL=0（init 流程先写
+    /// SELECT=0 再调用本函数；scan_ap 结束后也会还原 bank 0）。
     /// 写后读回校验：某些 AP 不支持某些位组合，读回不符时明确告警
     /// （否则后续所有 32 位读写都会静默只作用于低 8 位）。
     fn configure_ahb_ap_csw(&self) -> Result<()> {
@@ -299,22 +305,27 @@ impl SwdLink {
     }
 
     /// 扫描 AP 端口
+    ///
+    /// IDR 位于 AP 空间偏移 0xFC（bank 0xF + 页内 0xC），必须先把
+    /// DP SELECT.APBANKSEL 切到 0xF；读完立刻还原 bank 0，因为后续
+    /// CSW/TAR/DRW 访问全部依赖 bank 0。
     fn scan_ap(&mut self) -> Result<u32> {
-        // 选择 AP0 并读取 IDR
-        self.select_ap(0)?;
+        self.select_ap(0, AP_BANK_IDR)?;
 
-        // AP IDR 位于 0xFC（只读）。旧实现读 0x0C（DRW），那只有在
-        // CSW.SIZE=0 时才别名到 IDR；现在 CSW 已是 32 位访问，读 0x0C
-        // 会返回 TAR 指向的内存内容——校验形同虚设。
         let req = TransferRequest::read_ap(AP_REG_IDR);
         let resp = self.dap.execute_transfer(self.usb(), &[req])?;
 
         if resp.status != TRANSFER_OK || resp.len == 0 {
+            // 还原 bank 0 再返回错误，避免上层拿到一个 bank 停在 0xF 的链接
+            let _ = self.select_ap(0, 0);
             return Err(Error::Swd("AP scan failed".into()));
         }
 
         let idr = resp.values()[0];
-        // IDR 全 0 或全 1 说明 AP 不存在 / 总线错误（常见于读错寄存器）
+        // 还原 bank 0：下面的 CSW/TAR/DRW 访问都假定 APBANKSEL=0
+        self.select_ap(0, 0)?;
+
+        // IDR 全 0 或全 1 说明 AP 不存在 / 总线错误
         if idr == 0 || idr == u32::MAX {
             log::warn!("AP{} IDR = 0x{:08X} looks invalid", self.ap_index, idr);
         }

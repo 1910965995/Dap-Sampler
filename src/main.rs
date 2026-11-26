@@ -299,13 +299,26 @@ fn cmd_list() -> anyhow::Result<()> {
         println!("  Note: the device must support CMSIS-DAP v2 (bulk transfers)");
         println!("  Check Device Manager to see whether it is recognized as a WinUSB device");
     } else {
-        println!("🔍 Found {} CMSIS-DAP v2 device(s):\n", devices.len());
+        let connectable = devices.iter().filter(|d| d.confidence.auto_connectable()).count();
+        println!("🔍 Found {} device(s) with a CMSIS-DAP v2 bulk interface:\n", devices.len());
         for (i, dev) in devices.iter().enumerate() {
-            println!("  [{}] {:04X}:{:04X}  bus={} addr={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
+            let marker = if dev.confidence.auto_connectable() { " " } else { "!" };
+            println!(
+                " {}[{}] {:04X}:{:04X}  bus={} addr={}  [{}]",
+                marker, i, dev.vid, dev.pid, dev.bus_number, dev.address, dev.confidence.label()
+            );
             println!("       Manufacturer: {}", if dev.manufacturer.is_empty() { "(none)" } else { &dev.manufacturer });
             println!("       Product:      {}", if dev.product.is_empty() { "(none)" } else { &dev.product });
             println!("       Serial:       {}", if dev.serial.is_empty() { "(none)" } else { &dev.serial });
+            println!("       Interface:    {} ({})", dev.interface.interface_number,
+                if dev.interface.name.is_empty() { "no interface string" } else { &dev.interface.name });
+            println!("       Endpoints:    OUT=0x{:02X} IN=0x{:02X}", dev.interface.ep_out, dev.interface.ep_in);
+            println!("       Evidence:     {}", dev.evidence);
             println!();
+        }
+        if connectable < devices.len() {
+            println!("  Devices marked ! have no CMSIS-DAP evidence and will not be connected automatically.");
+            println!("  If one of them is your probe, run `diag` and report its VID/PID and interface string.\n");
         }
     }
     Ok(())
@@ -318,48 +331,51 @@ fn cmd_diag(claim: bool) -> anyhow::Result<()> {
     println!("   claim test: {}", if claim { "enabled" } else { "disabled (use --claim to check driver/permissions/occupancy)" });
     println!();
 
-    if diagnostics.is_empty() {
-        println!("⚠️  No CMSIS-DAP candidate device found");
+    // 两段展示：能自动连接的（confirmed/likely）在前，只有结构特征的在后。
+    // 后者不是错误——很多新探针第一插上就落在这里，正是需要用户反馈的场景。
+    let (connectable, structural): (Vec<_>, Vec<_>) =
+        diagnostics.iter().partition(|d| d.confidence.auto_connectable());
+
+    if connectable.is_empty() {
+        println!("⚠️  No CMSIS-DAP device recognized");
         println!("   Check the USB connection and whether the DAP-Link shows up in Device Manager;");
         println!("   if the device is CMSIS-DAP v1 HID, this tool only supports CMSIS-DAP v2 bulk.\n");
-        return Ok(());
+    } else {
+        println!("Recognized CMSIS-DAP device(s):");
+        println!();
+        for (i, dev) in connectable.iter().enumerate() {
+            print_diagnostic(i, dev);
+        }
     }
 
-    for (i, dev) in diagnostics.iter().enumerate() {
-        println!("[{}] {:04X}:{:04X}  bus={} addr={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
-        println!("    known VID/PID: {}", yes_no(dev.known_vid_pid));
-        println!("    open:          {}", yes_no(dev.open_ok));
-        if let Some(e) = &dev.open_error {
-            println!("      error: {}", e);
-            println!("      hint:  {}", usb_error_hint(e));
-        }
-        println!("    Manufacturer:  {}", empty_or(&dev.manufacturer));
-        println!("    Product:       {}", empty_or(&dev.product));
-        println!("    Serial:        {}", empty_or(&dev.serial));
-        println!("    product CMSIS: {}", yes_no(dev.product_has_cmsis_dap));
-        println!("    Bulk interface:{}", yes_no(dev.has_bulk_candidate));
-        if let Some(e) = &dev.config_error {
-            println!("      config error: {}", e);
-            println!("      hint:         {}", usb_error_hint(e));
-        }
-        match (dev.interface_number, dev.ep_out, dev.ep_in) {
-            (Some(iface), Some(ep_out), Some(ep_in)) => {
-                println!("      interface: {}", iface);
-                println!("      endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
-            }
-            _ => {
-                println!("      interface: (no CMSIS-DAP v2 bulk interface found)");
-            }
-        }
-
-        if let Some(ok) = dev.claim_ok {
-            println!("    claim:         {}", yes_no(ok));
-            if let Some(e) = &dev.claim_error {
-                println!("      error: {}", e);
-                println!("      hint:  {}", usb_error_hint(e));
-            }
-        }
+    if !structural.is_empty() {
+        println!("Devices with a Bulk interface but no CMSIS-DAP evidence:");
+        println!("  These are not connected automatically. If one of them is your probe,");
+        println!("  the interface string below is the key detail to report.");
         println!();
+        for dev in &structural {
+            println!(
+                "  {:04X}:{:04X}  bus={} addr={}  open={}",
+                dev.vid, dev.pid, dev.bus_number, dev.address, yes_no(dev.open_ok)
+            );
+            if let Some(e) = &dev.open_error {
+                println!("      open error: {}", e);
+                println!("      hint:       {}", usb_error_hint(e));
+            }
+            println!("      Manufacturer:  {}", empty_or(&dev.manufacturer));
+            println!("      Product:       {}", empty_or(&dev.product));
+            println!(
+                "      Interface:     {} {}",
+                dev.interface_number.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                if dev.interface_name.is_empty() {
+                    "(no interface string)"
+                } else {
+                    dev.interface_name.as_str()
+                }
+            );
+            println!("      Evidence:      {}", dev.evidence);
+            println!();
+        }
     }
 
     println!("Diagnostics summary:");
@@ -369,6 +385,55 @@ fn cmd_diag(claim: bool) -> anyhow::Result<()> {
     println!("  - USB/claim OK but GUI still fails to init: check target power, SWDIO/SWCLK/GND/RESET wiring, chip read protection, and the SWD clock.\n");
 
     Ok(())
+}
+
+/// 打印一台已识别设备的完整诊断信息
+fn print_diagnostic(i: usize, dev: &dap_sampler::usb::device::UsbDeviceDiagnostic) {
+    println!("[{}] {:04X}:{:04X}  bus={} addr={}", i, dev.vid, dev.pid, dev.bus_number, dev.address);
+    println!("    known VID/PID: {}", yes_no(dev.known_vid_pid));
+    println!("    open:          {}", yes_no(dev.open_ok));
+    if let Some(e) = &dev.open_error {
+        println!("      error: {}", e);
+        println!("      hint:  {}", usb_error_hint(e));
+    }
+    println!("    Manufacturer:  {}", empty_or(&dev.manufacturer));
+    println!("    Product:       {}", empty_or(&dev.product));
+    println!("    Serial:        {}", empty_or(&dev.serial));
+    println!(
+        "    Interface:     {} {}",
+        dev.interface_number.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+        if dev.interface_name.is_empty() {
+            "(no interface string)"
+        } else {
+            dev.interface_name.as_str()
+        }
+    );
+    println!("    confidence:    {} ({})", dev.confidence.label(), dev.evidence);
+    println!("    product CMSIS: {}", yes_no(dev.product_has_cmsis_dap));
+    println!("    iface CMSIS:   {}", yes_no(dev.interface_has_cmsis_dap));
+    println!("    Bulk interface:{}", yes_no(dev.has_bulk_candidate));
+    if let Some(e) = &dev.config_error {
+        println!("      config error: {}", e);
+        println!("      hint:         {}", usb_error_hint(e));
+    }
+    match (dev.interface_number, dev.ep_out, dev.ep_in) {
+        (Some(iface), Some(ep_out), Some(ep_in)) => {
+            println!("      interface: {}", iface);
+            println!("      endpoints: OUT=0x{:02X}, IN=0x{:02X}", ep_out, ep_in);
+        }
+        _ => {
+            println!("      interface: (no CMSIS-DAP v2 bulk interface found)");
+        }
+    }
+
+    if let Some(ok) = dev.claim_ok {
+        println!("    claim:         {}", yes_no(ok));
+        if let Some(e) = &dev.claim_error {
+            println!("      error: {}", e);
+            println!("      hint:  {}", usb_error_hint(e));
+        }
+    }
+    println!();
 }
 
 fn yes_no(v: bool) -> &'static str {

@@ -66,9 +66,32 @@ fn reg_a3(addr: u8) -> bool { (addr >> 3) & 0x01 != 0 }
 // ============================================================
 /// DP 寄存器地址: bits[3:2] = A3,A2
 pub const DP_REG_DPIDR: u8 = 0x00;
+/// DP ABORT 寄存器（只写），与 DPIDR 同地址 0x00，靠 RnW 区分读写
+pub const DP_REG_ABORT: u8 = 0x00;
 pub const DP_REG_CTRL_STAT: u8 = 0x04;
 pub const DP_REG_SELECT: u8 = 0x08;
 pub const DP_REG_RDBUFF: u8 = 0x0C;
+
+/// DP ABORT 写值：清除全部 sticky 错误标志
+///
+/// - DAPABORT(0x01) 不置位——那是主动中止传输，不是清错
+/// - STKCMPCLR(0x02)：清 STICKYCMP
+/// - STKERRCLR(0x04)：清 STICKYERR
+/// - WDERRCLR(0x08)：清 WDATAERR
+/// - ORUNERRCLR(0x10)：清 STICKYORUN
+///
+/// 调试会话残留的 sticky 标志会让后续所有 DP/AP 访问持续返回 FAULT，
+/// 必须在配置 AP 之前清掉（OpenOCD `swd_clear_sticky_errors()` 同值）。
+pub const DP_ABORT_CLEAR_STICKY: u32 = 0x1E;
+
+/// 构造 DP SELECT 写值（ADIv5）：APSEL=[31:24]，APBANKSEL=[7:4]
+///
+/// DAP_Transfer 请求字节只能携带 A[3:2] 两位（见 `make_request`），
+/// AP 地址空间的 A[7:4] 必须经由 APBANKSEL 下发。访问 IDR(0xFC) 这类
+/// 高 bank 寄存器前必须先切 bank。
+pub fn dp_select_value(ap: u8, bank: u8) -> u32 {
+    ((ap as u32) << 24) | (((bank as u32) & 0x0F) << 4)
+}
 
 /// 读 DP 寄存器请求字节
 pub fn req_read_dp(addr: u8) -> u8 {
@@ -86,13 +109,17 @@ pub fn req_write_dp(addr: u8) -> u8 {
 pub const AP_REG_CSW: u8 = 0x00;
 pub const AP_REG_TAR: u8 = 0x04;
 pub const AP_REG_DRW: u8 = 0x0C;
-/// AP Identification Register（只读）
+/// AP Identification Register（只读），位于 AP 空间偏移 **0xFC**
 ///
-/// 注意是 **0xFC** 而不是 0x0C：0x0C 是 DRW，读它返回内存数据；
-/// 只有 CSW.SIZE=0（8 位）时 DRW 才别名到 IDR，而这个前提不成立
-/// （CSW 现已显式配置为 32 位）。旧代码用 0x0C 读 IDR，实际读的是
-/// 地址相关的内存内容，AP 扫描的「成功」是假阳性。
-pub const AP_REG_IDR: u8 = 0xFC;
+/// 0xFC = bank 0xF + 页内偏移 0xC：请求字节只能带 A[3:2]，所以常量取
+/// 页内偏移 0x0C，bank 部分另由 [`AP_BANK_IDR`] 经 DP SELECT 下发。
+///
+/// 只写 0x0C 而不切 bank 是最容易犯的错：那会落到 bank 0 的 DRW，
+/// 读回的是 TAR 指向的内存内容，AP 扫描「成功」是假阳性。
+pub const AP_REG_IDR: u8 = 0x0C;
+
+/// AP IDR 所在的 APBANKSEL（0xFC 的高 4 位）
+pub const AP_BANK_IDR: u8 = 0x0F;
 
 /// AHB-AP CSW 配置值（32 位传输 + privileged + debug master）
 ///

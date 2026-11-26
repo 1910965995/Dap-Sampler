@@ -192,10 +192,76 @@ fn ap_register_addresses() {
     assert_eq!(AP_REG_CSW, 0x00);
     assert_eq!(AP_REG_TAR, 0x04);
     assert_eq!(AP_REG_DRW, 0x0C);
-    // IDR 是 0xFC（只读寄存器），不是 DRW 的 0x0C：
-    // 仅当 CSW.SIZE=0（8 位）时 DRW 才别名到 IDR，而 CSW 已显式配置
-    // 为 32 位访问，不能依赖该别名
-    assert_eq!(AP_REG_IDR, 0xFC);
+    // IDR 在 AP 空间偏移 0xFC = bank 0xF + 页内偏移 0xC。
+    // 请求字节只携带 A[3:2]，所以常量取页内偏移，bank 由 AP_BANK_IDR
+    // 经 DP SELECT 下发；两者必须同时使用，只写 0x0C 会落到 DRW。
+    assert_eq!(AP_REG_IDR, 0x0C);
+    assert_eq!(AP_BANK_IDR, 0x0F);
+}
+
+#[test]
+fn ap_idr_requires_bank_f_select() {
+    // 请求字节只编码 A[3:2]：0x0C 与 0xFC 编码相同，靠 SELECT 区分 bank
+    assert_eq!(req_read_ap(AP_REG_IDR), 0x0F);
+    assert_eq!(req_read_ap(0xFC), 0x0F);
+    // APBANKSEL 必须落在 bits[7:4]
+    assert_eq!(dp_select_value(0, AP_BANK_IDR), 0xF0);
+    // 还原 bank 0 才是干净的后续内存访问状态
+    assert_eq!(dp_select_value(0, 0), 0x0000_0000);
+    // APSEL 在 bits[31:24]，与 bank 位互不干扰
+    assert_eq!(dp_select_value(1, AP_BANK_IDR), 0x0100_00F0);
+}
+
+/// 模拟目标侧如何把 (DP SELECT 写值, AP 请求字节) 解析成 AP 空间偏移。
+///
+/// 请求字节只有 A[3:2]；A[7:4] 来自 SELECT.APBANKSEL。这个函数让我们
+/// 能在无硬件的情况下验证「到底读到了哪个寄存器」。
+fn resolve_ap_offset(select: u32, request_byte: u8) -> u32 {
+    let bank = ((select >> 4) & 0x0F) << 4;
+    let a32 = u32::from((request_byte >> 2) & 0b11) << 2;
+    bank | a32
+}
+
+#[test]
+fn ap_bank_select_resolves_idr_offset() {
+    let idr_read = req_read_ap(AP_REG_IDR);
+
+    // 正确做法：先切 bank 0xF，同一请求字节才真正落到偏移 0xFC
+    let select_idr = dp_select_value(0, AP_BANK_IDR);
+    assert_eq!(resolve_ap_offset(select_idr, idr_read), 0xFC);
+
+    // 只把常量从 0x0C 改成 0xFC 而不切 bank，线上效果完全一样：
+    // 解析结果仍是 0x0C（DRW），读到的是 TAR 指向的内存而不是 IDR。
+    let select_bank0 = dp_select_value(0, 0);
+    assert_eq!(resolve_ap_offset(select_bank0, idr_read), 0x0C);
+    assert_ne!(resolve_ap_offset(select_bank0, idr_read), 0xFC);
+
+    // 还原 bank 0 后，CSW/TAR/DRW 的解析结果才是它们自己
+    assert_eq!(
+        resolve_ap_offset(select_bank0, req_write_ap(AP_REG_CSW)),
+        0x00
+    );
+    assert_eq!(
+        resolve_ap_offset(select_bank0, req_write_ap(AP_REG_TAR)),
+        0x04
+    );
+    assert_eq!(
+        resolve_ap_offset(select_bank0, req_read_ap(AP_REG_DRW)),
+        0x0C
+    );
+}
+
+#[test]
+fn dp_abort_clear_sticky_bit_layout() {
+    // 0x1E = STKCMPCLR | STKERRCLR | WDERRCLR | ORUNERRCLR
+    assert_eq!(DP_ABORT_CLEAR_STICKY, 0x1E);
+    // 清错写值不得包含 DAPABORT（0x01），那是主动中止而非清错
+    assert_eq!(DP_ABORT_CLEAR_STICKY & 0x01, 0);
+    // ABORT 与 DPIDR 同地址，靠 RnW 方向区分
+    assert_eq!(DP_REG_ABORT, DP_REG_DPIDR);
+    let abort_req = TransferRequest::write_dp(DP_REG_ABORT, DP_ABORT_CLEAR_STICKY);
+    assert!(!abort_req.rnw, "ABORT is write-only");
+    assert_eq!(abort_req.request_byte(), req_write_dp(DP_REG_DPIDR));
 }
 
 // ================================================================

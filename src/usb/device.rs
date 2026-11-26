@@ -14,6 +14,7 @@ pub const KNOWN_DEVICES: &[(u16, u16)] = &[
     (0x0483, 0x374e),  // ST-Link v3 (CMSIS-DAP mode alt 3)
     (0xc251, 0x1001),  // JLink (CMSIS-DAP mode)
     (0xc251, 0x1002),  // JLink (CMSIS-DAP mode alt)
+    (0x28e9, 0x0698),  // GigaDevice GD-Link (CMSIS-DAP)
 ];
 
 /// USB 设备信息

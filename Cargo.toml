@@ -1,6 +1,6 @@
 [package]
 name = "dap-sampler"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "CMSIS-DAP v2 High-Speed Variable Sampler"
 license = "Apache-2.0"
